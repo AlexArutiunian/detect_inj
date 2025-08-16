@@ -1,0 +1,8 @@
+numpy
+pandas
+tqdm
+joblib
+scikit-learn
+xgboost
+orjson
+tensorflow==2.15.*
