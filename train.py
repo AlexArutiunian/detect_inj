@@ -295,7 +295,6 @@ def build_lstm(input_shape):
     model = k["Sequential"]([
         k["Masking"](mask_value=0.0, input_shape=input_shape),
         k["LSTM"](128, return_sequences=True),
-        k ,                     # ← здесь вторая LSTM
         k["Dense"](64, activation='relu'),
         k["Dropout"](0.3),
         k["Dense"](1, activation='sigmoid')
@@ -779,13 +778,11 @@ if __name__ == "__main__":
         input_shape = (X_sample.shape[1], X_sample.shape[2])
 
         # Баланс классов по train
-        y_train_tmp = np.concatenate([yb for _, yb in train_seq]) if len(train_seq) > 0 else None
-        if y_train_tmp is None or len(y_train_tmp) == 0:
-            raise RuntimeError("Не удалось собрать метки для train.")
         classes = np.array([0, 1])
-        w = compute_class_weight(class_weight="balanced", classes=classes, y=y_train_tmp)
+        w = compute_class_weight(class_weight="balanced", classes=classes, y=labels[idx_train])
         class_weight = {0: float(w[0]), 1: float(w[1])}
         print("Class weights (train):", class_weight)
+       
 
         dev_metrics, test_metrics, thr, model = train_deep(
             args.model, train_seq, dev_seq, test_seq, class_weight, args.epochs, out_dir, input_shape

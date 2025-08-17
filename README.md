@@ -16,7 +16,7 @@
 ## Upload dataset
 
 ```bash
-pip install gdown
+pip install kaggle
 ```
 
 Upload [running.zip](https://drive.google.com/file/d/163iij4KxowSRwIFtdFZ-Uc2KkxoqRcv0)
