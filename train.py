@@ -289,19 +289,24 @@ def _lazy_tf():
             "Для 'lstm'/'tcn' установите совместимый TF или используйте классические модели. "
             f"Ошибка: {e}"
         )
-
+    
 def build_lstm(input_shape):
     k = _lazy_tf()
     model = k["Sequential"]([
         k["Masking"](mask_value=0.0, input_shape=input_shape),
         k["LSTM"](128, return_sequences=True),
-        k,
+        k ,                     # ← здесь вторая LSTM
         k["Dense"](64, activation='relu'),
         k["Dropout"](0.3),
         k["Dense"](1, activation='sigmoid')
     ])
-    model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
+    model.compile(
+        optimizer='adam',
+        loss='binary_crossentropy',
+        metrics=['accuracy']
+    )
     return model
+    
 
 def build_tcn(input_shape, dilations=(1, 2, 4, 8)):
     k = _lazy_tf()

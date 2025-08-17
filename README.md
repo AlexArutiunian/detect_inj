@@ -23,14 +23,14 @@ Upload [running.zip](https://drive.google.com/file/d/163iij4KxowSRwIFtdFZ-Uc2Kkx
 
 ```bash
 gdown 163iij4KxowSRwIFtdFZ-Uc2KkxoqRcv0
-
+unzip running.zip
 ```
 
 Upload [walking.zip](https://drive.google.com/file/d/1CDlCb95Xuy5A3ZWUkuBM2cjf1o4F99zY)
 
 ```bash
 gdown 1CDlCb95Xuy5A3ZWUkuBM2cjf1o4F99zY
-
+unzip walking.zip
 ```
 
 ## Train
@@ -85,3 +85,7 @@ Or using the ready-trained models
 ```bash
 python predict.py --model_dir models/classic_walk/rf  --motion_key walking --input_dir walk_my_test --out_csv preds_rf.csv
 ```
+
+## Google Colab examples
+
+[gpu-trained GRU on the running data](https://colab.research.google.com/drive/1FMXT6evpgevoWK_hIyTztyvKdsg9AznN?usp=sharing)
