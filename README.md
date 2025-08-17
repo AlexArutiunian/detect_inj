@@ -22,14 +22,14 @@ pip install gdown
 Upload [running.zip](https://drive.google.com/file/d/163iij4KxowSRwIFtdFZ-Uc2KkxoqRcv0)
 
 ```bash
-gdown 'https://drive.google.com/file/d/163iij4KxowSRwIFtdFZ-Uc2KkxoqRcv0'
+gdown 163iij4KxowSRwIFtdFZ-Uc2KkxoqRcv0
 
 ```
 
 Upload [walking.zip](https://drive.google.com/file/d/1CDlCb95Xuy5A3ZWUkuBM2cjf1o4F99zY)
 
 ```bash
-gdown 'https://drive.google.com/file/d/1CDlCb95Xuy5A3ZWUkuBM2cjf1o4F99zY'
+gdown 1CDlCb95Xuy5A3ZWUkuBM2cjf1o4F99zY
 
 ```
 
