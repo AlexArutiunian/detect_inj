@@ -74,27 +74,77 @@ def compute_metrics(y_true, y_pred, y_prob):
     }
 
 # ---------------------- чтение индекса ----------------------
+def build_items(csv_path: str, data_dir: str,
+                filename_col="filename", label_col="No inj/ inj",
+                debug_index: bool=False) -> Tuple[List[str], List[int], Dict[str,int], List[Tuple[str,str]]]:
+    df = pd.read_csv(csv_path)
+    # строго придерживаемся ваших имён колонок, но с fallback на похожие
+    cols = {c.lower().strip(): c for c in df.columns}
+    fn_col = cols.get(filename_col.lower(), filename_col)
+    if fn_col not in df.columns:
+        for c in df.columns:
+            if "file" in c.lower() or "name" in c.lower():
+                fn_col = c; break
+    lb_col = cols.get(label_col.lower(), label_col)
+    if lb_col not in df.columns:
+        for c in df.columns:
+            if "inj" in c.lower() or "label" in c.lower() or "target" in c.lower():
+                lb_col = c; break
 
-def build_items(csv_path: str, data_dir: str, filename_col="filename", label_col="No inj/ inj") -> List[Tuple[str,int]]:
-    meta = pd.read_csv(csv_path, usecols=[filename_col, label_col])
-    items = []
-    for _, row in meta.iterrows():
-        fn = str(row[filename_col]).strip() if pd.notnull(row.get(filename_col)) else ""
-        y  = label_to_int(row.get(label_col))
-        if not fn or y is None: continue
-        p = os.path.join(data_dir, fn)
-        if not p.endswith(".npy"): p += ".npy"
-        if os.path.exists(p):
-            # сразу отбрасываем пустышки
-            try:
-                with np.load(p, mmap_mode="r") as arr:  # context ok для npy
-                    pass
-            except Exception:
-                # np.load поддерживает контекст только для .npz, поэтому повторно:
-                arr = np.load(p, allow_pickle=False, mmap_mode="r")
-            if arr.ndim == 2 and arr.shape[0] >= 2:
-                items.append((p, int(y)))
-    return items
+    # Сообщим, какие колонки выбраны
+    print(f"Using columns: filename_col='{fn_col}', label_col='{lb_col}'")
+
+    items_x, items_y = [], []
+    stats = {"ok":0, "no_file":0, "bad_label":0, "too_short":0, "error":0}
+    skipped_examples = []
+
+    for i, row in tqdm(df.iterrows(), total=len(df), desc="Indexing"):
+        rel = str(row.get(fn_col, "")).strip()
+        lab_raw = row.get(lb_col, None)
+        lab = label_to_int(lab_raw)
+
+        status = ""
+        resolved = None
+        shape_txt = ""
+
+        if not rel:
+            stats["no_file"] += 1
+            status = "empty-filename"
+            if len(skipped_examples)<10: skipped_examples.append((status, str(row.to_dict())))
+        elif lab is None:
+            stats["bad_label"] += 1
+            status = f"bad-label:{lab_raw}"
+            if len(skipped_examples)<10: skipped_examples.append((status, rel))
+        else:
+            path = pick_existing_path(possible_npy_paths(data_dir, rel))
+            if not path:
+                stats["no_file"] += 1
+                status = "not-found"
+                if len(skipped_examples)<10: skipped_examples.append((status, rel))
+            else:
+                try:
+                    arr = np.load(path, allow_pickle=False, mmap_mode="r")
+                    if arr.ndim != 2 or arr.shape[0] < 2:
+                        stats["too_short"] += 1
+                        status = "too-short"
+                        if len(skipped_examples)<10: skipped_examples.append((status, os.path.basename(path)))
+                    else:
+                        items_x.append(path)
+                        items_y.append(int(lab))
+                        stats["ok"] += 1
+                        status = "OK"
+                        resolved = path
+                        shape_txt = f"shape={tuple(arr.shape)}"
+                except Exception as e:
+                    stats["error"] += 1
+                    status = f"np-load:{type(e).__name__}"
+                    if len(skipped_examples)<10: skipped_examples.append((status, os.path.basename(path) if path else rel))
+
+        if debug_index:
+            print(f"[{i:05d}] csv='{rel}' | label_raw='{lab_raw}' -> {status}"
+                  + (f" | path='{resolved}' {shape_txt}" if resolved else ""))
+
+    return items_x, items_y, stats, skipped_examples
 
 def probe_stats(items: List[Tuple[str,int]], downsample: int = 1, pctl: int = 95):
     lengths = []
@@ -212,6 +262,13 @@ def main():
     ap.add_argument("--max_len", default="auto")              # "auto" -> 95 перцентиль
     ap.add_argument("--gpus", default="all")                  # "all" | "cpu" | "0,1"
     ap.add_argument("--mixed_precision", action="store_true")
+    ap.add_argument("--print_csv_preview", action="store_true",
+    help="Показать первые 5 строк CSV и частоты меток")
+    ap.add_argument("--debug_index", action="store_true",
+    help="Печатать статус каждой строки при индексации")
+    ap.add_argument("--peek", type=int, default=0,
+    help="Показать N успешно сопоставленных путей (форма массива)")
+
     args = ap.parse_args()
 
     # Видимость GPU до импорта TF
@@ -221,12 +278,38 @@ def main():
         os.environ["CUDA_VISIBLE_DEVICES"] = args.gpus
 
     # Индекс
-    items_y = build_items(args.csv, args.data_dir, args.filename_col, args.label_col)
+    items_x, items_y, stats, skipped = build_items(
+        args.csv, args.data_dir,
+        filename_col=args.filename_col,
+        label_col=args.label_col,
+        debug_index=args.debug_index
+    )
     assert items_y, "Не найдено валидных .npy и меток"
     paths = [p for p, _ in items_y]
     labels_all = np.array([y for _, y in items_y], dtype=np.int32)
 
+    
     # Статы по длине/размеру признака
+    
+    if args.print_csv_preview:
+        print("\n=== CSV preview (first 5 rows) ===")
+        df_preview = pd.read_csv(args.csv)
+        print(df_preview.head(5).to_string(index=False))
+        if "No inj/ inj" in df_preview.columns:
+            print("\nLabel value counts in 'No inj/ inj':")
+            print(df_preview["No inj/ inj"].value_counts(dropna=False))
+
+    
+    if args.peek > 0:
+        print(f"\n=== Peek first {min(args.peek, len(items_x))} matched items ===")
+        for pth, lab in list(zip(items_x, items_y))[:args.peek]:
+            try:
+                arr = np.load(pth, allow_pickle=False, mmap_mode="r")
+                print(f"OK  label={lab} | {pth} | shape={arr.shape}")
+            except Exception as e:
+                print(f"FAIL to load for peek: {pth} -> {type(e).__name__}")
+
+    
     if args.max_len.strip().lower() == "auto":
         max_len, feat_dim = probe_stats(items_y, downsample=args.downsample, pctl=95)
         max_len = int(max(8, min(max_len, 20000)))
