@@ -719,17 +719,30 @@ if __name__ == "__main__":
             else: raise ValueError("Unknown deep model")
 
         cb = [k_tf["EarlyStopping"](monitor="val_loss", patience=5, restore_best_weights=True)]
-        model.fit(
-            train_seq,
-            validation_data=dev_seq,
-            epochs=args.epochs,
-            class_weight=class_weight,
-            callbacks=cb,
-            verbose=1,
-            workers=args.loader_workers,
-            use_multiprocessing=args.mp,
-            max_queue_size=args.queue_size,
-        )
+        try:
+            # Если среда поддерживает параметры очереди/процессов (Keras 2.x)
+            model.fit(
+                train_seq,
+                validation_data=dev_seq,
+                epochs=args.epochs,
+                class_weight=class_weight,
+                callbacks=cb,
+                verbose=1,
+                workers=args.loader_workers,
+                use_multiprocessing=args.mp,
+                max_queue_size=args.queue_size,
+            )
+        except TypeError:
+            # Keras 3.x — без этих аргументов
+            model.fit(
+                train_seq,
+                validation_data=dev_seq,
+                epochs=args.epochs,
+                class_weight=class_weight,
+                callbacks=cb,
+                verbose=1,
+            )
+
 
         # DEV
         prob_dev, y_dev = [], []
