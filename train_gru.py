@@ -1,24 +1,23 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 from typing import List, Tuple, Dict
-
+from tqdm import tqdm
 import os, json, argparse, math, random
-from typing import List, Tuple
 import numpy as np
 import pandas as pd
 import matplotlib
-matplotlib.use("Agg")           # чтобы сохранять картинки без GUI
+matplotlib.use("Agg")           # сохраняем графики без GUI
 import matplotlib.pyplot as plt
 from sklearn.metrics import roc_curve, auc
 
+# ---------------------- графики ----------------------
 def save_plots(history, out_dir, y_test, prob_test):
     os.makedirs(out_dir, exist_ok=True)
 
-    # loss / accuracy по эпохам
     for metric in ["loss", "accuracy"]:
         train = history.history.get(metric, [])
         val   = history.history.get(f"val_{metric}", [])
-        if not train: 
+        if not train:
             continue
         plt.figure()
         plt.plot(range(1, len(train)+1), train, label=f"train_{metric}")
@@ -28,7 +27,6 @@ def save_plots(history, out_dir, y_test, prob_test):
         plt.savefig(os.path.join(out_dir, f"{metric}.png"), dpi=150)
         plt.close()
 
-    # ROC-кривая на тесте
     if y_test is not None and prob_test is not None and len(np.unique(y_test)) == 2:
         fpr, tpr, _ = roc_curve(y_test, prob_test)
         roc_auc = auc(fpr, tpr)
@@ -40,9 +38,7 @@ def save_plots(history, out_dir, y_test, prob_test):
         plt.savefig(os.path.join(out_dir, "roc_test.png"), dpi=150)
         plt.close()
 
-
 # ---------------------- утилиты ----------------------
-
 def ensure_dir(p: str): os.makedirs(p, exist_ok=True)
 
 def label_to_int(v):
@@ -53,7 +49,6 @@ def label_to_int(v):
     return None
 
 def sanitize_seq(a: np.ndarray) -> np.ndarray:
-    # заменяем nan/inf и приводим к float32
     a = np.nan_to_num(a, nan=0.0, posinf=0.0, neginf=0.0)
     return a.astype(np.float32, copy=False)
 
@@ -74,12 +69,55 @@ def compute_metrics(y_true, y_pred, y_prob):
         "report": classification_report(y_true, y_pred, digits=3),
     }
 
+# ---------------------- маппинг путей ----------------------
+def possible_npy_paths(data_dir: str, rel: str) -> List[str]:
+    """Генерирует все разумные варианты путей (учёт .json, .npy, .json.npy, базовое имя)."""
+    rel = (rel or "").strip().replace("\\", "/").lstrip("/")
+    cands = []
+
+    def push(x):
+        if x not in cands:
+            cands.append(x)
+
+    # как есть и с .npy
+    push(os.path.join(data_dir, rel))
+    if not rel.endswith(".npy"):
+        push(os.path.join(data_dir, rel + ".npy"))
+
+    # варианты с .json → .npy и .json.npy
+    if rel.endswith(".json"):
+        base_nojson = rel[:-5]
+        push(os.path.join(data_dir, base_nojson + ".npy"))
+        push(os.path.join(data_dir, rel + ".npy"))          # .json.npy
+
+    # если уже .json.npy — попробуем без .json
+    if rel.endswith(".json.npy"):
+        push(os.path.join(data_dir, rel.replace(".json.npy", ".npy")))
+
+    # только базовое имя
+    b = os.path.basename(rel)
+    push(os.path.join(data_dir, b))
+    if not b.endswith(".npy"):
+        push(os.path.join(data_dir, b + ".npy"))
+    if b.endswith(".json"):
+        push(os.path.join(data_dir, b[:-5] + ".npy"))
+        push(os.path.join(data_dir, b + ".npy"))
+    if b.endswith(".json.npy"):
+        push(os.path.join(data_dir, b.replace(".json.npy", ".npy")))
+
+    return cands
+
+def pick_existing_path(cands: List[str]) -> str | None:
+    for p in cands:
+        if os.path.exists(p):
+            return p
+    return None
+
 # ---------------------- чтение индекса ----------------------
 def build_items(csv_path: str, data_dir: str,
                 filename_col="filename", label_col="No inj/ inj",
                 debug_index: bool=False) -> Tuple[List[str], List[int], Dict[str,int], List[Tuple[str,str]]]:
     df = pd.read_csv(csv_path)
-    # строго придерживаемся ваших имён колонок, но с fallback на похожие
     cols = {c.lower().strip(): c for c in df.columns}
     fn_col = cols.get(filename_col.lower(), filename_col)
     if fn_col not in df.columns:
@@ -92,7 +130,6 @@ def build_items(csv_path: str, data_dir: str,
             if "inj" in c.lower() or "label" in c.lower() or "target" in c.lower():
                 lb_col = c; break
 
-    # Сообщим, какие колонки выбраны
     print(f"Using columns: filename_col='{fn_col}', label_col='{lb_col}'")
 
     items_x, items_y = [], []
@@ -160,17 +197,15 @@ def probe_stats(items: List[Tuple[str,int]], downsample: int = 1, pctl: int = 95
     return max_len, feat or 1
 
 def compute_norm_stats(items: List[Tuple[str,int]], feat_dim: int, downsample: int, max_len_cap: int, sample_items: int = 512):
-    # Стриминговая оценка mean/std по train без загрузки всего в память
     rng = random.Random(42)
     pool = items if len(items) <= sample_items else rng.sample(items, sample_items)
     count = 0
     mean = np.zeros(feat_dim, dtype=np.float64)
-    m2   = np.zeros(feat_dim, dtype=np.float64)  # для дисперсии (Welford)
+    m2   = np.zeros(feat_dim, dtype=np.float64)
     for p, _ in pool:
         arr = np.load(p, allow_pickle=False, mmap_mode="r")
         x = sanitize_seq(arr[::max(1, downsample)])
         if x.shape[0] > max_len_cap: x = x[:max_len_cap]
-        # сворачиваем по времени
         for t in range(x.shape[0]):
             count += 1
             delta = x[t] - mean
@@ -181,7 +216,6 @@ def compute_norm_stats(items: List[Tuple[str,int]], feat_dim: int, downsample: i
     return mean.astype(np.float32), std
 
 # ---------------------- TF часть ----------------------
-
 def lazy_tf():
     import tensorflow as tf
     from tensorflow.keras import layers, models
@@ -198,13 +232,10 @@ def make_datasets(items, labels, max_len, feat_dim, bs, downsample, mean, std, r
                 y = labels[i]
                 arr = np.load(p, allow_pickle=False, mmap_mode="r")
                 x = sanitize_seq(arr[::max(1, downsample)])
-                # отбросим совсем короткие (редко, но попадались)
                 if x.shape[0] < 2:
                     continue
-                # обрезка по времени
                 if x.shape[0] > max_len:
                     x = x[:max_len]
-                # нормализация
                 x = (x - mean) / std
                 yield x, np.int32(y)
         return _g
@@ -217,9 +248,9 @@ def make_datasets(items, labels, max_len, feat_dim, bs, downsample, mean, std, r
     def pad_map(x, y):
         T = tf.shape(x)[0]
         pad_t = tf.maximum(0, max_len - T)
-        x = tf.pad(x, [[0, pad_t], [0, 0]])          # pad до max_len
-        x = x[:max_len]                               # защита
-        x.set_shape([max_len, feat_dim])              # статическая форма
+        x = tf.pad(x, [[0, pad_t], [0, 0]])
+        x = x[:max_len]
+        x.set_shape([max_len, feat_dim])
         return x, y
 
     def make(indices, shuffle=False, drop_remainder=False):
@@ -235,13 +266,13 @@ def make_datasets(items, labels, max_len, feat_dim, bs, downsample, mean, std, r
 
 def build_gru_model(input_shape, learning_rate=1e-3, mixed_precision=False):
     tf, layers, models = lazy_tf()
-    inp = layers.Input(shape=input_shape)              # (max_len, D)
-    x = layers.Masking(mask_value=0.0)(inp)           # паддинг нулями маскируется (см. гайд по RNN). :contentReference[oaicite:2]{index=2}
+    inp = layers.Input(shape=input_shape)
+    x = layers.Masking(mask_value=0.0)(inp)
     x = layers.GRU(128, return_sequences=True)(x)
     x = layers.GRU(64)(x)
     x = layers.Dropout(0.3)(x)
     x = layers.Dense(64, activation="relu")(x)
-    out = layers.Dense(1, activation="sigmoid", dtype="float32")(x)  # float32 выход даже при AMP
+    out = layers.Dense(1, activation="sigmoid", dtype="float32")(x)
 
     model = models.Model(inp, out)
     opt = tf.keras.optimizers.Adam(learning_rate=learning_rate, clipnorm=1.0)
@@ -249,7 +280,6 @@ def build_gru_model(input_shape, learning_rate=1e-3, mixed_precision=False):
     return model
 
 # ---------------------- main ----------------------
-
 def main():
     ap = argparse.ArgumentParser("GRU binary classifier over NPY sequences")
     ap.add_argument("--csv", required=True)
@@ -258,18 +288,17 @@ def main():
     ap.add_argument("--label_col", default="No inj/ inj")
     ap.add_argument("--out_dir", default="output_run_gru")
     ap.add_argument("--epochs", type=int, default=20)
-    ap.add_argument("--batch_size", type=int, default=16)     # локальный BS (будет умножен на число GPU)
+    ap.add_argument("--batch_size", type=int, default=16)  # локальный BS (умножается на #GPU)
     ap.add_argument("--downsample", type=int, default=1)
-    ap.add_argument("--max_len", default="auto")              # "auto" -> 95 перцентиль
-    ap.add_argument("--gpus", default="all")                  # "all" | "cpu" | "0,1"
+    ap.add_argument("--max_len", default="auto")           # "auto" -> 95 перцентиль
+    ap.add_argument("--gpus", default="all")               # "all" | "cpu" | "0,1"
     ap.add_argument("--mixed_precision", action="store_true")
     ap.add_argument("--print_csv_preview", action="store_true",
-    help="Показать первые 5 строк CSV и частоты меток")
+                    help="Показать первые 5 строк CSV и частоты меток")
     ap.add_argument("--debug_index", action="store_true",
-    help="Печатать статус каждой строки при индексации")
+                    help="Печатать статус каждой строки при индексации")
     ap.add_argument("--peek", type=int, default=0,
-    help="Показать N успешно сопоставленных путей (форма массива)")
-
+                    help="Показать N успешно сопоставленных путей (форма массива)")
     args = ap.parse_args()
 
     # Видимость GPU до импорта TF
@@ -285,13 +314,11 @@ def main():
         label_col=args.label_col,
         debug_index=args.debug_index
     )
-    assert items_y, "Не найдено валидных .npy и меток"
-    paths = [p for p, _ in items_y]
-    labels_all = np.array([y for _, y in items_y], dtype=np.int32)
+    assert items_x and items_y, "Не найдено валидных .npy и меток"
+    items = list(zip(items_x, items_y))
+    paths = items_x
+    labels_all = np.array(items_y, dtype=np.int32)
 
-    
-    # Статы по длине/размеру признака
-    
     if args.print_csv_preview:
         print("\n=== CSV preview (first 5 rows) ===")
         df_preview = pd.read_csv(args.csv)
@@ -300,23 +327,21 @@ def main():
             print("\nLabel value counts in 'No inj/ inj':")
             print(df_preview["No inj/ inj"].value_counts(dropna=False))
 
-    
     if args.peek > 0:
-        print(f"\n=== Peek first {min(args.peek, len(items_x))} matched items ===")
-        for pth, lab in list(zip(items_x, items_y))[:args.peek]:
+        print(f"\n=== Peek first {min(args.peek, len(items))} matched items ===")
+        for (pth, lab) in items[:args.peek]:
             try:
                 arr = np.load(pth, allow_pickle=False, mmap_mode="r")
                 print(f"OK  label={lab} | {pth} | shape={arr.shape}")
             except Exception as e:
                 print(f"FAIL to load for peek: {pth} -> {type(e).__name__}")
 
-    
+    # Статы по длине/размеру признака
     if args.max_len.strip().lower() == "auto":
-        max_len, feat_dim = probe_stats(items_y, downsample=args.downsample, pctl=95)
+        max_len, feat_dim = probe_stats(items, downsample=args.downsample, pctl=95)
         max_len = int(max(8, min(max_len, 20000)))
     else:
         max_len = int(args.max_len)
-        # определим feat_dim по первому файлу
         aa = np.load(paths[0], allow_pickle=False, mmap_mode="r")
         feat_dim = int(aa.shape[1])
     print(f"max_len={max_len} | feat_dim={feat_dim}")
@@ -328,7 +353,8 @@ def main():
     idx_train, idx_dev = train_test_split(idx_train_full, test_size=0.125, random_state=42, stratify=labels_all[idx_train_full])
 
     # Норм-статы по train
-    mean, std = compute_norm_stats([items_y[i] for i in idx_train], feat_dim, args.downsample, max_len)
+    ensure_dir(args.out_dir)
+    mean, std = compute_norm_stats([items[i] for i in idx_train], feat_dim, args.downsample, max_len)
     np.savez_compressed(os.path.join(args.out_dir, "norm_stats.npz"), mean=mean, std=std, max_len=max_len)
 
     # TF / стратегия
@@ -350,7 +376,6 @@ def main():
     # Датасеты
     make_ds = make_datasets(paths, labels_all, max_len, feat_dim, global_bs,
                             args.downsample, mean, std, replicas)
-    # Drop remainder только на train при multi-GPU
     train_ds = make_ds(idx_train, shuffle=True,  drop_remainder=(replicas > 1))
     dev_ds   = make_ds(idx_dev,   shuffle=False, drop_remainder=False)
     test_ds  = make_ds(idx_test,  shuffle=False, drop_remainder=False)
@@ -362,7 +387,6 @@ def main():
     class_weight = {0: float(w[0]), 1: float(w[1])}
     print("class_weight:", class_weight)
 
-    ensure_dir(args.out_dir)
     # Строим модель
     ctx = strategy.scope() if strategy else contextlib_null()
     with ctx:
@@ -379,6 +403,7 @@ def main():
                      validation_data=dev_ds,
                      epochs=args.epochs,
                      class_weight=class_weight,
+                     callbacks=cb,
                      verbose=1)
 
     # Предсказания и метрики
@@ -409,7 +434,7 @@ def main():
     print(test_metrics["report"])
     print("Saved to:", args.out_dir)
 
-# простая заглушка контекста, если нет стратегии
+# заглушка контекста, если нет стратегии
 class contextlib_null:
     def __enter__(self): return None
     def __exit__(self, *exc): return False
