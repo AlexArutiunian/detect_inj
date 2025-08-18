@@ -3,11 +3,11 @@
 
 """
 top_joints_from_model.py
-Агрегация важностей по суставам для классических моделей (RF/XGB),
-натренированных на фичах из train3.py (6 статистик × 3 оси × |joints|),
-+ построение горизонтальной диаграммы важностей (показывается в ячейке и сохраняется как PNG).
+Aggregates feature importances by joints for classical models (RF/XGB),
+trained on features from train3.py (6 statistics × 3 axes × |joints|),
++ builds a horizontal bar chart of importances (shown inline and saved as PNG).
 
-Пример:
+Example:
     python top_joints_from_model.py \
         --npy_dir /path/to/npy \
         --model_joblib /path/to/outputs/rf/model.joblib \
@@ -25,7 +25,7 @@ import joblib
 import pandas as pd
 import matplotlib.pyplot as plt
 
-# --- Встроенная схема суставов (можно заменить через --schema_json)
+# --- Default joints schema (can be overridden via --schema_json)
 DEFAULT_JOINTS = [
   "L_foot_1","L_foot_2","L_foot_3","L_foot_4",
   "L_shank_1","L_shank_2","L_shank_3","L_shank_4",
@@ -36,8 +36,8 @@ DEFAULT_JOINTS = [
   "pelvis_1","pelvis_2","pelvis_3","pelvis_4"
 ]
 
-STAT_NAMES = ["mean","std","min","max","dmean","dstd"]  # как в train3.py
-AXES = ["x","y","z"]                                   # 3 координаты
+STAT_NAMES = ["mean","std","min","max","dmean","dstd"]  # as in train3.py
+AXES = ["x","y","z"]                                   
 FEATS_PER_JOINT = len(STAT_NAMES) * len(AXES)          # 6*3 = 18
 
 def load_joints(schema_json: str | None):
@@ -63,8 +63,8 @@ def get_importances(model):
     imp = getattr(model, "feature_importances_", None)
     if imp is None:
         raise RuntimeError(
-            "У модели нет feature_importances_. "
-            "Нужен RandomForest/XGBoost, обученный на классических фичах."
+            "The model has no feature_importances_. "
+            "You need RandomForest/XGBoost trained on classical features."
         )
     return np.asarray(imp, dtype=float)
 
@@ -72,22 +72,22 @@ def sanity_check_with_npy(npy_dir: str, joints: list[str], verbose: bool=True):
     sample = find_first_npy(npy_dir)
     if not sample:
         if verbose:
-            print("[WARN] В папке npy не найдено .npy — пропускаю проверку формы.")
+            print("[WARN] No .npy file found in npy_dir — skipping shape check.")
         return
     try:
         arr = np.load(sample, allow_pickle=False, mmap_mode="r")
         if arr.ndim != 2 or arr.shape[0] < 2:
-            print(f"[WARN] '{sample}' имеет форму {arr.shape}, ожидалась (T, F) с T>=2.")
+            print(f"[WARN] '{sample}' has shape {arr.shape}, expected (T, F) with T>=2.")
         else:
             F_seq = arr.shape[1]
             expect_coords = 3 * len(joints)
             if F_seq % 3 != 0:
-                print(f"[WARN] Число признаков в последовательности = {F_seq}, не кратно 3.")
+                print(f"[WARN] Number of features per frame = {F_seq}, not divisible by 3.")
             if F_seq != expect_coords:
-                print(f"[INFO] В последовательности на кадр F={F_seq}, ожидалось 3*|joints|={expect_coords}. "
-                      "Это не критично для агрегации важностей, но проверьте соответствие схемы.")
+                print(f"[INFO] Sequence has F={F_seq} features per frame, expected 3*|joints|={expect_coords}. "
+                      "This is not critical for importance aggregation, but check schema consistency.")
     except Exception as e:
-        print(f"[WARN] Не удалось открыть NPY для проверки: {e}")
+        print(f"[WARN] Failed to open NPY for check: {e}")
 
 def build_feature_name_map(joints: list[str]):
     names = []
@@ -101,9 +101,8 @@ def aggregate_joint_importance(importances: np.ndarray, joints: list[str]) -> pd
     expected = FEATS_PER_JOINT * len(joints)
     if importances.size != expected:
         raise ValueError(
-            f"Длина importances = {importances.size}, а по схеме ожидается {expected} "
-            f"(18 признаков × {len(joints)} суставов). Проверьте, что модель обучалась "
-            "на классических фичах из train3.py и схема совпадает."
+            f"Len of importances = {importances.size}, expected by schema: {expected} "
+            f"(18 features × {len(joints)} joints). Check if model was trained correctly."
         )
     joint_scores = []
     for j_idx, jname in enumerate(joints):
@@ -118,87 +117,78 @@ def aggregate_joint_importance(importances: np.ndarray, joints: list[str]) -> pd
 
 def plot_joint_importance(df: pd.DataFrame, topn: int, title: str, plot_path: str, show: bool=True, dpi: int=160):
     """
-    Строит горизонтальную диаграмму для topn суставов.
-    Показывает в ячейке (если show=True) и сохраняет в PNG.
+    Builds a horizontal bar chart for topn joints.
+    Displays inline (if show=True) and saves to PNG.
     """
     top = df.head(max(1, int(topn))).copy()
-    # для красивого порядка сверху-вниз
+    # reverse order for nicer top-down display
     top = top.iloc[::-1]
 
-       # нормируем в проценты
+    # normalize to percentages
     top["importance_pct"] = 100 * top["importance_sum"]
 
-    h = max(3.5, 0.3 * len(top))       # делаем столбцы ниже (коэф. 0.3 вместо 0.4)
+    h = max(3.5, 0.3 * len(top))       
     plt.figure(figsize=(8, h))
     plt.barh(top["joint"], top["importance_pct"])
     plt.xlabel("Importance (%)")
     plt.title(title)
 
-    # подписи значений справа от баров
+    # add text labels to bars
     for i, v in enumerate(top["importance_pct"]):
         plt.text(v, i, f" {v:.1f}%", va="center")
 
-    # добавляем запас справа, чтобы подписи не съезжали
     plt.xlim(0, top["importance_pct"].max() * 1.1)
-
     plt.tight_layout()
     plt.savefig(plot_path, dpi=dpi)
     if show:
         plt.show()
     plt.close()
 
-    print(f"[OK] Диаграмма сохранена: {plot_path}")
+    print(f"[OK] Plot saved: {plot_path}")
 
 def main():
-    ap = argparse.ArgumentParser(description="Вывод топ-значимых суставов и построение диаграммы важностей.")
-    ap.add_argument("--npy_dir", required=True, help="Папка с *.npy (для быстрой проверки формы).")
-    ap.add_argument("--model_joblib", required=True, help="Путь к model.joblib (RF/XGB, обученная на классических фичах).")
-    ap.add_argument("--schema_json", default="", help="JSON со списком суставов (если не задан — встроенный список).")
-    ap.add_argument("--topn", type=int, default=15, help="Сколько суставов показать текстом.")
-    ap.add_argument("--save_csv", default="", help="Куда сохранить CSV с важностями (опционально).")
+    ap = argparse.ArgumentParser(description="Show top joints by importance and plot horizontal bar chart.")
+    ap.add_argument("--npy_dir", required=True, help="Folder with *.npy (for quick shape check).")
+    ap.add_argument("--model_joblib", required=True, help="Path to model.joblib (RF/XGB trained on classical features).")
+    ap.add_argument("--schema_json", default="", help="JSON with list of joints (if not set — built-in default list).")
+    ap.add_argument("--topn", type=int, default=15, help="How many joints to print in text output.")
+    ap.add_argument("--save_csv", default="", help="Optional path to save CSV with importances.")
 
-    # Параметры графика
-    ap.add_argument("--topn_plot", type=int, default=20, help="Сколько верхних суставов рисовать на диаграмме.")
-    ap.add_argument("--plot_path", default="top_joints_importance.png", help="Куда сохранить PNG диаграммы.")
-    ap.add_argument("--title", default="Joint Importance (sum over 18 features per joint)", help="Заголовок диаграммы.")
-    ap.add_argument("--no_show", action="store_true", help="Не показывать график в ячейке/окне, только сохранить.")
+    # Plot options
+    ap.add_argument("--topn_plot", type=int, default=20, help="How many top joints to plot in chart.")
+    ap.add_argument("--plot_path", default="top_joints_importance.png", help="Where to save PNG chart.")
+    ap.add_argument("--title", default="Joint Importance (sum over 18 features per joint)", help="Chart title.")
+    ap.add_argument("--no_show", action="store_true", help="Do not display the chart, only save.")
 
     args = ap.parse_args()
 
     joints = load_joints(args.schema_json)
-    print(f"[INFO] Суставов в схеме: {len(joints)} (ожидается, что в модели фич = 18×|joints| = {FEATS_PER_JOINT*len(joints)})")
+    print(f"[INFO] Joints in schema: {len(joints)} (expected features in model = 18×|joints| = {FEATS_PER_JOINT*len(joints)})")
 
-    # Быстрая проверка формата одного npy (не влияет на вычисление важностей, лишь sanity-check)
     sanity_check_with_npy(args.npy_dir, joints, verbose=True)
 
-    # Модель и её важности
     model = load_model(args.model_joblib)
     importances = get_importances(model)
 
-    # Карта имён фич (проверка размерности)
     feat_names = build_feature_name_map(joints)
     if len(feat_names) != importances.size:
         raise ValueError(
-            f"Размерности не совпадают: len(feat_names)={len(feat_names)} "
-            f"vs len(importances)={importances.size}. Проверьте схему суставов."
+            f"Shape mismatch: len(feat_names)={len(feat_names)} vs len(importances)={importances.size}. Check schema consistency."
         )
 
-    # Агрегация до суставов
     df = aggregate_joint_importance(importances, joints)
 
-    # Текстовый вывод TOP-N
+    # Print TOP-N
     topn = max(1, int(args.topn))
-    print("\n=== TOP суставов (сумма важностей по 18 фичам каждого сустава) ===")
+    print("\n=== TOP joints (sum of importances over 18 features per joint) ===")
     for i, row in df.head(topn).iterrows():
         print(f"{i+1:2d}. {row['joint']:>12s}  importance_sum={row['importance_sum']:.6f}  "
               f"(norm={row['importance_norm']:.4f})")
 
-    # Сохранить CSV (опционально)
     if args.save_csv:
         df.to_csv(args.save_csv, index=False)
-        print(f"[OK] Сохранено: {args.save_csv}")
+        print(f"[OK] Saved CSV: {args.save_csv}")
 
-    # Диаграмма (показываем в ячейке и сохраняем)
     plot_joint_importance(
         df=df,
         topn=args.topn_plot,
