@@ -57,11 +57,11 @@ def print_split_stats(name, y):
     print(f"[{name}] total={n} | Injury=1: {n1} ({p1:.1f}%) | No Injury=0: {n0} ({p0:.1f}%)")
 
 def _sanitize_seq(a: np.ndarray) -> np.ndarray:
-    # заменяем nan/inf и ограничиваем экстремумы (на всякий случай)
+    # заменяем nan/inf -> 0.0
     a = np.nan_to_num(a, nan=0.0, posinf=0.0, neginf=0.0)
     return a.astype(np.float32, copy=False)
 
-# ===================== JSON utils (для input_format=json) =====================
+# ===================== JSON utils =====================
 
 def _safe_json_load(path):
     try:
@@ -82,7 +82,7 @@ def _stack_motion_frames_with_schema(md, schema_joints):
         if j in md:
             arr = np.asarray(md[j], dtype=np.float32)[:T]   # (T,3)
         else:
-            arr = np.full((T, 3), np.nan, dtype=np.float32) # отсутствующий сустав
+            arr = np.full((T, 3), np.nan, dtype=np.float32)
         cols.append(arr)
     return np.concatenate(cols, axis=1)  # (T, 3*|schema|)
 
@@ -119,7 +119,6 @@ def discover_joint_schema(csv_path, data_dir, motion_key,
 # ===================== ФИЧИ ДЛЯ "КЛАССИКИ" =====================
 
 def _features_from_seq(seq_np):
-    """seq_np: (T, F=3*|schema|) -> агрегированные статистики для классики."""
     seq = _sanitize_seq(seq_np)
     dif = np.diff(seq, axis=0)
     stat = np.concatenate([
@@ -273,10 +272,9 @@ def _probe_max_len_npy(file_label_pairs, pctl=95, sample_max=None):
     if not L: return None
     return int(np.percentile(L, pctl))
 
-# ===================== МОДЕЛИ (TF/Keras) — ленивый импорт =====================
+# ===================== МОДЕЛИ (TF/Keras) =====================
 
 def _lazy_tf():
-    """Импортирует TF только при необходимости (для нейросетей)."""
     try:
         import tensorflow as tf
         from tensorflow.keras.models import Sequential
@@ -309,10 +307,10 @@ def _compile_with_adam(model, lr=1e-3):
     model.compile(optimizer=opt, loss="binary_crossentropy", metrics=["accuracy"])
     return model
 
-def build_lstm(input_shape):
+def build_lstm(input_shape, pad_value=0.0):
     k = _lazy_tf()
     model = k["Sequential"]([
-        k["Masking"](mask_value=0.0, input_shape=input_shape),
+        k["Masking"](mask_value=pad_value, input_shape=input_shape),
         k["LSTM"](128, return_sequences=False),
         k["Dense"](64, activation='relu'),
         k["Dropout"](0.3),
@@ -320,15 +318,15 @@ def build_lstm(input_shape):
     ])
     return _compile_with_adam(model)
 
-def build_tcn(input_shape, dilations=(1, 2, 4, 8)):
+def build_tcn(input_shape):
     k = _lazy_tf()
     from tensorflow.keras.layers import Conv1D
     model = k["Sequential"]()
-    for i, d in enumerate(dilations):
+    for i in range(4):
         if i == 0:
-            model.add(Conv1D(64, 3, padding='causal', dilation_rate=d, activation='relu', input_shape=input_shape))
+            model.add(Conv1D(64, 3, padding='causal', dilation_rate=2**i, activation='relu', input_shape=input_shape))
         else:
-            model.add(Conv1D(64, 3, padding='causal', dilation_rate=d, activation='relu'))
+            model.add(Conv1D(64, 3, padding='causal', dilation_rate=2**i, activation='relu'))
         model.add(k["BatchNormalization"]()); model.add(k["Dropout"](0.2))
     model.add(k["GlobalAveragePooling1D"]()); model.add(k["Dense"](64, activation='relu')); model.add(k["Dropout"](0.3))
     model.add(k["Dense"](1, activation='sigmoid', dtype="float32"))
@@ -338,19 +336,19 @@ def build_cnn_lstm(input_shape):
     k = _lazy_tf()
     from tensorflow.keras import layers, models
     inp = layers.Input(shape=input_shape)
-    x = layers.Masking(mask_value=0.0)(inp)
-    x = layers.Conv1D(128, 5, padding="same", activation="relu")(x); x = layers.BatchNormalization()(x); x = layers.MaxPooling1D(2)(x)
-    x = layers.Conv1D(128, 3, padding="same", activation="relu")(x); x = layers.BatchNormalization()(x); x = layers.MaxPooling1D(2)(x)
+    # Без Masking: Conv1D не поддерживает маску, паддинг = нули
+    x = layers.Conv1D(128, 5, padding="same", activation="relu")(inp); x = layers.BatchNormalization()(x); x = layers.MaxPooling1D(2)(x)
+    x = layers.Conv1D(128, 3, padding="same", activation="relu")(x);  x = layers.BatchNormalization()(x); x = layers.MaxPooling1D(2)(x)
     x = layers.LSTM(128)(x); x = layers.Dropout(0.3)(x); x = layers.Dense(64, activation="relu")(x)
     out = layers.Dense(1, activation="sigmoid", dtype="float32")(x)
     model = models.Model(inp, out)
     return _compile_with_adam(model)
 
-def build_gru(input_shape):
+def build_gru(input_shape, pad_value=0.0):
     k = _lazy_tf()
     from tensorflow.keras import layers, models
     inp = layers.Input(shape=input_shape)
-    x = layers.Masking(mask_value=0.0)(inp)
+    x = layers.Masking(mask_value=pad_value)(inp)
     x = layers.GRU(128, return_sequences=True)(x)
     x = layers.GRU(64)(x)
     x = layers.Dropout(0.3)(x); x = layers.Dense(64, activation="relu")(x)
@@ -358,28 +356,18 @@ def build_gru(input_shape):
     model = models.Model(inp, out)
     return _compile_with_adam(model)
 
-def build_transformer(input_shape, d_model=128, num_heads=4, ff_dim=256, num_layers=2, dropout=0.1):
+def build_transformer(input_shape):
     _ = _lazy_tf()
     from tensorflow.keras import layers, models
     inp = layers.Input(shape=input_shape)
-    x = layers.Masking(mask_value=0.0)(inp)
-    x = layers.Dense(d_model)(x)
-    def add_positional_encoding(x_):
-        import tensorflow as tf
-        T = tf.shape(x_)[1]; d = int(x_.shape[-1])
-        pos = tf.cast(tf.range(T)[:, None], tf.float32)
-        i   = tf.cast(tf.range(d)[None, :], tf.float32)
-        angle = pos / tf.pow(10000.0, (2*(i//2))/d)
-        pe = tf.where(tf.equal(tf.cast(i % 2, tf.int32), 0), tf.sin(angle), tf.cos(angle))
-        pe = tf.expand_dims(pe, 0)
-        return x_ + pe
-    x = layers.Lambda(add_positional_encoding)(x)
-    for _ in range(num_layers):
-        a = layers.MultiHeadAttention(num_heads=num_heads, key_dim=d_model//num_heads, dropout=dropout)(x, x)
+    # Без Masking: используем усреднение по времени
+    x = layers.Dense(128)(inp)
+    for _ in range(2):
+        a = layers.MultiHeadAttention(num_heads=4, key_dim=32)(x, x)
         x = layers.LayerNormalization(epsilon=1e-6)(x + a)
-        f = layers.Dense(ff_dim, activation="relu")(x); f = layers.Dropout(dropout)(f); f = layers.Dense(d_model)(f)
+        f = layers.Dense(256, activation="relu")(x); f = layers.Dense(128)(f)
         x = layers.LayerNormalization(epsilon=1e-6)(x + f)
-    x = layers.GlobalAveragePooling1D()(x); x = layers.Dropout(dropout)(x); x = layers.Dense(64, activation="relu")(x)
+    x = layers.GlobalAveragePooling1D()(x); x = layers.Dropout(0.3)(x); x = layers.Dense(64, activation="relu")(x)
     out = layers.Dense(1, activation="sigmoid", dtype="float32")(x)
     model = models.Model(inp, out)
     return _compile_with_adam(model)
@@ -387,10 +375,10 @@ def build_transformer(input_shape, d_model=128, num_heads=4, ff_dim=256, num_lay
 def build_timesnet(input_shape):
     _ = _lazy_tf()
     from tensorflow.keras import layers, models
-    inp = layers.Input(shape=input_shape); x = layers.Masking(mask_value=0.0)(inp)
-    b1 = layers.Conv1D(64, 3, padding="same", activation="relu")(x)
-    b2 = layers.Conv1D(64, 5, padding="same", activation="relu")(x)
-    b3 = layers.Conv1D(64, 7, padding="same", activation="relu")(x)
+    inp = layers.Input(shape=input_shape)
+    b1 = layers.Conv1D(64, 3, padding="same", activation="relu")(inp)
+    b2 = layers.Conv1D(64, 5, padding="same", activation="relu")(inp)
+    b3 = layers.Conv1D(64, 7, padding="same", activation="relu")(inp)
     x = layers.Concatenate()([b1, b2, b3]); x = layers.BatchNormalization()(x)
     x = layers.Conv1D(128, 3, padding="same", activation="relu")(x)
     x = layers.GlobalAveragePooling1D()(x); x = layers.Dropout(0.3)(x); x = layers.Dense(64, activation="relu")(x)
@@ -398,32 +386,32 @@ def build_timesnet(input_shape):
     model = models.Model(inp, out)
     return _compile_with_adam(model)
 
-def build_patchtst(input_shape, patch_len=16, stride=8, d_model=128, num_layers=2, num_heads=4, ff_dim=256):
+def build_patchtst(input_shape):
     _ = _lazy_tf()
     from tensorflow.keras import layers, models
-    inp = layers.Input(shape=input_shape); x = layers.Masking(mask_value=0.0)(inp)
-    x = layers.Conv1D(filters=d_model, kernel_size=patch_len, strides=stride, padding="valid")(x)
-    for _ in range(num_layers):
-        a = layers.MultiHeadAttention(num_heads=num_heads, key_dim=d_model//num_heads)(x, x)
+    inp = layers.Input(shape=input_shape)
+    x = layers.Conv1D(filters=128, kernel_size=16, strides=8, padding="valid")(inp)
+    for _ in range(2):
+        a = layers.MultiHeadAttention(num_heads=4, key_dim=32)(x, x)
         x = layers.LayerNormalization(epsilon=1e-6)(x + a)
-        f = layers.Dense(ff_dim, activation="relu")(x); f = layers.Dense(d_model)(f)
+        f = layers.Dense(256, activation="relu")(x); f = layers.Dense(128)(f)
         x = layers.LayerNormalization(epsilon=1e-6)(x + f)
     x = layers.GlobalAveragePooling1D()(x); x = layers.Dropout(0.3)(x); x = layers.Dense(64, activation="relu")(x)
     out = layers.Dense(1, activation="sigmoid", dtype="float32")(x)
     model = models.Model(inp, out)
     return _compile_with_adam(model)
 
-def build_informer(input_shape, d_model=128, num_heads=4, ff_dim=256, num_layers=2, dropout=0.1):
+def build_informer(input_shape):
     _ = _lazy_tf()
     from tensorflow.keras import layers, models
-    inp = layers.Input(shape=input_shape); x = layers.Masking(mask_value=0.0)(inp); x = layers.Dense(d_model)(x)
-    for l in range(num_layers):
-        if l > 0: x = layers.Conv1D(d_model, 3, strides=2, padding="same", activation="relu")(x)
-        a = layers.MultiHeadAttention(num_heads=num_heads, key_dim=d_model//num_heads, dropout=dropout)(x, x)
+    inp = layers.Input(shape=input_shape); x = layers.Dense(128)(inp)
+    for l in range(2):
+        if l > 0: x = layers.Conv1D(128, 3, strides=2, padding="same", activation="relu")(x)
+        a = layers.MultiHeadAttention(num_heads=4, key_dim=32)(x, x)
         x = layers.LayerNormalization(epsilon=1e-6)(x + a)
-        f = layers.Dense(ff_dim, activation="relu")(x); f = layers.Dropout(dropout)(f); f = layers.Dense(d_model)(f)
+        f = layers.Dense(256, activation="relu")(x); f = layers.Dense(128)(f)
         x = layers.LayerNormalization(epsilon=1e-6)(x + f)
-    x = layers.GlobalAveragePooling1D()(x); x = layers.Dropout(dropout)(x); x = layers.Dense(64, activation="relu")(x)
+    x = layers.GlobalAveragePooling1D()(x); x = layers.Dropout(0.3)(x); x = layers.Dense(64, activation="relu")(x)
     out = layers.Dense(1, activation="sigmoid", dtype="float32")(x)
     model = models.Model(inp, out)
     return _compile_with_adam(model)
@@ -469,28 +457,27 @@ if __name__ == "__main__":
     parser.add_argument("--model", type=str,
                         choices=["rf","svm","xgb","lstm","tcn","gru","cnn_lstm","transformer","timesnet","patchtst","informer"],
                         required=True)
-    parser.add_argument("--csv", type=str, required=True, help="Путь к CSV с метаданными (filename, label)")
-    parser.add_argument("--data_dir", type=str, required=True, help="Папка с файлами (JSON или NPY)")
-    parser.add_argument("--input_format", type=str, choices=["json","npy"], default="npy",
-                        help="Источник данных: json (старый) или npy (быстрый)")
-    parser.add_argument("--schema_json", type=str, default="", help="schema_joints.json (для JSON / имен фич)")
-    parser.add_argument("--motion_key", type=str, default="running", help="running | walking (только для JSON)")
+    parser.add_argument("--csv", type=str, required=True)
+    parser.add_argument("--data_dir", type=str, required=True)
+    parser.add_argument("--input_format", type=str, choices=["json","npy"], default="npy")
+    parser.add_argument("--schema_json", type=str, default="")
+    parser.add_argument("--motion_key", type=str, default="running")
     parser.add_argument("--filename_col", type=str, default="filename")
     parser.add_argument("--label_col", type=str, default="No inj/ inj")
-    parser.add_argument("--use_joints", type=str, default="", help="через запятую: pelvis_1,hip_r,... (пусто = авто-схема)")
+    parser.add_argument("--use_joints", type=str, default="")
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch_size", type=int, default=32)   # локальный BS на одну реплику
-    parser.add_argument("--out_dir", type=str, default="outputs", help="куда сохранять модель/метрики")
-    parser.add_argument("--max_len", type=str, default="auto", help="'auto' (95-перцентиль по train) или число для NN")
-    parser.add_argument("--loader_workers", type=int, default=0, help="(для классики/пре-вычислений)")
-    parser.add_argument("--downsample", type=int, default=1, help="шаг по времени для ускорения (>=1)")
+    parser.add_argument("--out_dir", type=str, default="outputs")
+    parser.add_argument("--max_len", type=str, default="auto")
+    parser.add_argument("--loader_workers", type=int, default=0)  # для классики/фич
+    parser.add_argument("--downsample", type=int, default=1)
     # ускорение/мульти-GPU
-    parser.add_argument("--gpus", type=str, default="all", help="all | cpu | список индексов через запятую, напр. '0,1'")
-    parser.add_argument("--mixed_precision", action="store_true", help="float16 на GPU (T4/Ampere и новее)")
-    parser.add_argument("--xla", action="store_true", help="включить XLA JIT")
+    parser.add_argument("--gpus", type=str, default="all", help="all | cpu | '0,1'")
+    parser.add_argument("--mixed_precision", action="store_true")
+    parser.add_argument("--xla", action="store_true")
     args = parser.parse_args()
 
-    # --- Настроим видимость GPU ДО импорта TensorFlow ---
+    # Видимость GPU до импорта TF
     if args.gpus.lower() == "cpu":
         os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
     elif args.gpus.lower() != "all":
@@ -516,7 +503,7 @@ if __name__ == "__main__":
 
     out_dir = os.path.join(args.out_dir, args.model); ensure_dir(out_dir)
 
-    # ========= ВЕТКА КЛАССИЧЕСКИХ МОДЕЛЕЙ =========
+    # ========= КЛАССИКА =========
     if args.model in ["rf","svm","xgb"]:
         if args.input_format == "npy":
             X_all, y_all = load_features_from_npy(
@@ -555,10 +542,9 @@ if __name__ == "__main__":
         dev_metrics, test_metrics, thr, model = train_classical(
             X_train_feat, X_dev_feat, X_test_feat, y_train, y_dev, y_test, args.model, out_dir
         )
-
         joblib.dump({"model": model, "scaler": scaler}, os.path.join(out_dir, "model.joblib"))
 
-    # ========= ВЕТКА НЕЙРОСЕТЕЙ (с поддержкой нескольких GPU) =========
+    # ========= НЕЙРОСЕТИ =========
     else:
         import contextlib
         k_tf = _lazy_tf()
@@ -566,42 +552,42 @@ if __name__ == "__main__":
         pad_sequences = k_tf["pad_sequences"]
         SequenceBase = tf.keras.utils.Sequence
 
-        # опции производительности
+        # производительность
         gpus = tf.config.list_physical_devices("GPU")
         for g in gpus:
-            try:
-                tf.config.experimental.set_memory_growth(g, True)
-            except Exception:
-                pass
-
+            try: tf.config.experimental.set_memory_growth(g, True)
+            except Exception: pass
         if args.mixed_precision:
             from tensorflow.keras import mixed_precision as mp
             mp.set_global_policy("mixed_float16")
-
         if args.xla:
             tf.config.optimizer.set_jit(True)
 
-        # стратегия для нескольких GPU
+        # стратегия
         strategy = tf.distribute.MirroredStrategy() if len(gpus) > 1 else None
         replicas = strategy.num_replicas_in_sync if strategy else 1
-        global_bs = args.batch_size * replicas  # итоговый размер батча из генератора
+        global_bs = args.batch_size * replicas
 
-        # --- Локальные датасеты-генераторы ---
+        # pad_value: маскируем только паддинг в RNN-моделях
+        rnn_models = {"gru", "lstm"}
+        pad_value = -1e9 if args.model in rnn_models else 0.0
+
         class _BaseSeq(SequenceBase):
-            def __init__(self, items, max_len, batch_size, replicas, shuffle=True, downsample=1):
+            def __init__(self, items, max_len, batch_size, replicas, shuffle=True, downsample=1, pad_value=0.0):
                 super().__init__()
                 self.items = list(items)
                 self.max_len = int(max_len)
-                self.bs = int(batch_size)             # это GLOBAL batch size
+                self.bs = int(batch_size)     # GLOBAL batch size
                 self.replicas = max(1, int(replicas))
                 self.shuffle = bool(shuffle)
                 self.downsample = max(1, int(downsample))
+                self.pad_value = float(pad_value)
                 self.indices = np.arange(len(self.items))
-                self.feature_dim = None  # заполним при первом удачном чтении
+                self.feature_dim = None
                 self.on_epoch_end()
 
             def __len__(self):
-                # важнo: отбрасываем хвост, чтобы всегда возвращать полный батч
+                # возвращаем только полные батчи — всегда кратно репликам
                 return len(self.items) // self.bs
 
             def on_epoch_end(self):
@@ -609,36 +595,36 @@ if __name__ == "__main__":
                     np.random.shuffle(self.indices)
 
             def _finalize_batch(self, seq_list, y_list):
-                # если ничего не загрузили — сгенерируем «пустышки»
                 if not seq_list:
+                    # безопасная заглушка: 2 таймстепа, нули (не маскируется при pad_value != 0)
                     if self.feature_dim is None:
-                        # худший случай — пока не знаем размер, примем 3
                         self.feature_dim = 3
-                    dummy = np.zeros((min(self.max_len, 2), self.feature_dim), dtype=np.float32)
-                    seq_list = [dummy]
+                    dummy = np.zeros((2, self.feature_dim), dtype=np.float32)
+                    seq_list = [dummy]; y_list = [0]
 
-                # добить до размера батча (и кратности репликам) дубликатами последнего
+                # добиваем до полного батча дубликатами последнего
                 need = self.bs - len(seq_list)
                 if need > 0:
-                    last = seq_list[-1]; last_y = y_list[-1] if y_list else 0
+                    last = seq_list[-1]; last_y = y_list[-1]
                     for _ in range(need):
-                        seq_list.append(last)
-                        y_list.append(last_y)
+                        seq_list.append(last); y_list.append(last_y)
 
-                # выравнивание на случай редких несостыковок
+                # выравнивание на кратность репликам (на всякий случай)
                 extra = (-len(seq_list)) % self.replicas
                 for _ in range(extra):
                     seq_list.append(seq_list[-1]); y_list.append(y_list[-1])
 
-                Xp = pad_sequences(seq_list, maxlen=self.max_len, dtype='float32',
-                                   padding='post', truncating='post')
+                Xp = pad_sequences(
+                    seq_list, maxlen=self.max_len, dtype='float32',
+                    padding='post', truncating='post', value=self.pad_value
+                )
                 y  = np.array(y_list[:len(Xp)], dtype=np.int32)
                 return Xp, y
 
         class JsonSeq(_BaseSeq):
             def __init__(self, items, motion_key, schema_joints, max_len, batch_size, replicas,
-                         shuffle=True, downsample=1):
-                super().__init__(items, max_len, batch_size, replicas, shuffle, downsample)
+                         shuffle=True, downsample=1, pad_value=0.0):
+                super().__init__(items, max_len, batch_size, replicas, shuffle, downsample, pad_value)
                 self.motion_key = motion_key
                 self.schema_joints = schema_joints
 
@@ -683,16 +669,14 @@ if __name__ == "__main__":
                         continue
                 return self._finalize_batch(X_batch, y_batch)
 
-        # Построим индекс
+        # индекс
         items = _build_index(args.csv, args.data_dir, args.filename_col, args.label_col, input_format=args.input_format)
         assert items, "Нет валидных файлов/меток."
 
-        # Оценим max_len
+        # max_len
         if args.max_len.strip().lower() == "auto":
-            if args.input_format == "npy":
-                max_len = _probe_max_len_npy(items, pctl=95, sample_max=None)
-            else:
-                max_len = _probe_max_len_json(items, args.motion_key, schema_joints, pctl=95, sample_max=None)
+            max_len = _probe_max_len_npy(items, pctl=95) if args.input_format == "npy" \
+                      else _probe_max_len_json(items, args.motion_key, schema_joints, pctl=95)
             if not max_len or max_len <= 1:
                 raise ValueError("Не удалось оценить max_len. Укажи --max_len вручную.")
         else:
@@ -715,13 +699,13 @@ if __name__ == "__main__":
         print_split_stats("TEST  (≈20%)", labels[idx_test])
 
         if args.input_format == "npy":
-            train_seq = NpySeq([items[i] for i in idx_train], max_len, global_bs, replicas, shuffle=True,  downsample=args.downsample)
-            dev_seq   = NpySeq([items[i] for i in idx_dev],   max_len, global_bs, replicas, shuffle=False, downsample=args.downsample)
-            test_seq  = NpySeq([items[i] for i in idx_test],  max_len, global_bs, replicas, shuffle=False, downsample=args.downsample)
+            train_seq = NpySeq([items[i] for i in idx_train], max_len, global_bs, replicas, shuffle=True,  downsample=args.downsample, pad_value=pad_value)
+            dev_seq   = NpySeq([items[i] for i in idx_dev],   max_len, global_bs, replicas, shuffle=False, downsample=args.downsample, pad_value=pad_value)
+            test_seq  = NpySeq([items[i] for i in idx_test],  max_len, global_bs, replicas, shuffle=False, downsample=args.downsample, pad_value=pad_value)
         else:
-            train_seq = JsonSeq([items[i] for i in idx_train], args.motion_key, schema_joints, max_len, global_bs, replicas, shuffle=True,  downsample=args.downsample)
-            dev_seq   = JsonSeq([items[i] for i in idx_dev],   args.motion_key, schema_joints, max_len, global_bs, replicas, shuffle=False, downsample=args.downsample)
-            test_seq  = JsonSeq([items[i] for i in idx_test],  args.motion_key, schema_joints, max_len, global_bs, replicas, shuffle=False, downsample=args.downsample)
+            train_seq = JsonSeq([items[i] for i in idx_train], args.motion_key, schema_joints, max_len, global_bs, replicas, shuffle=True,  downsample=args.downsample, pad_value=pad_value)
+            dev_seq   = JsonSeq([items[i] for i in idx_dev],   args.motion_key, schema_joints, max_len, global_bs, replicas, shuffle=False, downsample=args.downsample, pad_value=pad_value)
+            test_seq  = JsonSeq([items[i] for i in idx_test],  args.motion_key, schema_joints, max_len, global_bs, replicas, shuffle=False, downsample=args.downsample, pad_value=pad_value)
 
         # пример батча -> input_shape
         X_sample, _ = train_seq[0]
@@ -729,19 +713,19 @@ if __name__ == "__main__":
             raise RuntimeError("Пустой первый батч. Проверь данные.")
         input_shape = (X_sample.shape[1], X_sample.shape[2])
 
-        # веса классов по train
+        # class weights
         classes = np.array([0, 1], dtype=np.int32)
         w = compute_class_weight(class_weight="balanced", classes=classes, y=labels[idx_train])
         class_weight = {0: float(w[0]), 1: float(w[1])}
         print("Class weights (train):", class_weight)
         print(f"GPUs: {len(gpus)} | replicas_in_sync: {replicas} | global_batch: {global_bs}")
 
-        # строим модель под стратегией и обучаем
+        # модель под стратегией
         ctx = strategy.scope() if strategy else contextlib.nullcontext()
         with ctx:
-            if   args.model == "lstm":        model = build_lstm(input_shape)
+            if   args.model == "lstm":        model = build_lstm(input_shape, pad_value=pad_value)
             elif args.model == "tcn":         model = build_tcn(input_shape)
-            elif args.model == "gru":         model = build_gru(input_shape)
+            elif args.model == "gru":         model = build_gru(input_shape, pad_value=pad_value)
             elif args.model == "cnn_lstm":    model = build_cnn_lstm(input_shape)
             elif args.model == "transformer": model = build_transformer(input_shape)
             elif args.model == "timesnet":    model = build_timesnet(input_shape)
@@ -750,7 +734,6 @@ if __name__ == "__main__":
             else: raise ValueError("Unknown deep model")
 
         cb = [k_tf["EarlyStopping"](monitor="val_loss", patience=5, restore_best_weights=True)]
-        # ВАЖНО: без workers/use_multiprocessing — совместимо с Keras 3
         model.fit(
             train_seq,
             validation_data=dev_seq,
@@ -781,7 +764,7 @@ if __name__ == "__main__":
         pred_test = (prob_test >= thr).astype(int)
         test_metrics = compute_metrics(y_test, pred_test, prob_test)
 
-        model.save(os.path.join(out_dir, "model.keras"))  # формат Keras 3
+        model.save(os.path.join(out_dir, "model.keras"))
         with open(os.path.join(out_dir, "threshold.txt"), "w") as f:
             f.write(str(thr))
         np.savez(os.path.join(out_dir, "norm_stats.npz"), max_len=input_shape[0])
@@ -790,7 +773,7 @@ if __name__ == "__main__":
             with open(os.path.join(out_dir, "schema_joints.json"), "w", encoding="utf-8") as f:
                 json.dump(schema_joints, f, ensure_ascii=False, indent=2)
 
-    # ===== Сохранение отчётов =====
+    # ===== отчёты =====
     print("\n=== DEV METRICS (threshold tuned here) ===")
     for k in ["accuracy", "f1", "roc_auc", "confusion_matrix"]:
         print(f"{k}: {dev_metrics[k]}")

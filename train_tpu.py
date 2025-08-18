@@ -296,42 +296,61 @@ def _lazy_tf():
         }
     except Exception as e:
         raise RuntimeError(f"TensorFlow недоступен: {e}")
-
 def setup_strategy(device: str = "auto", tpu_address: str = ""):
     """
     Возвращает (strategy, using_tpu: bool).
     device: auto|cpu|gpu|tpu
+    tpu_address: 'local' или 'grpc://10.x.x.x:8470'
     """
     k = _lazy_tf()
     tf = k["tf"]
 
-    # Явный выбор CPU/GPU
     if device in ("cpu", "gpu"):
         print(f"[Device] Using {device.upper()} (no strategy).")
         return (tf.distribute.get_strategy(), False)
 
-    # Попытка обнаружить TPU
-    if device in ("auto", "tpu"):
+    # Кандидаты адресов TPU: явный флаг, переменные окружения, затем 'local'
+    candidates = []
+    if tpu_address:
+        candidates.append(tpu_address.strip())
+
+    env_addr = (
+        os.environ.get("TPU_NAME") or
+        os.environ.get("COLAB_TPU_ADDR") or
+        os.environ.get("TPU_WORKER_ADDRESS")
+    )
+    if env_addr:
+        env_addr = env_addr.strip()
+        if not env_addr.startswith("grpc://") and env_addr != "local":
+            env_addr = "grpc://" + env_addr
+        candidates.append(env_addr)
+
+    candidates.append("local")  # TPU-VM
+
+    last_exc = None
+    for tpu in candidates:
         try:
-            if tpu_address:
-                resolver = tf.distribute.cluster_resolver.TPUClusterResolver(tpu=tpu_address)
-            else:
-                resolver = tf.distribute.cluster_resolver.TPUClusterResolver.connect()
+            print(f"[Device] Trying TPU endpoint: {tpu}")
+            resolver = tf.distribute.cluster_resolver.TPUClusterResolver(tpu=tpu)
             tf.tpu.experimental.initialize_tpu_system(resolver)
             strategy = tf.distribute.TPUStrategy(resolver)
-            print("[Device] TPU detected and initialized.")
+            # Включаем bfloat16 на TPU
             try:
                 from tensorflow.keras import mixed_precision as mp
-                policy = mp.Policy("mixed_bfloat16")
-                mp.set_global_policy(policy)
-                print("[Device] Mixed precision policy set to mixed_bfloat16.")
+                mp.set_global_policy("mixed_bfloat16")
+                print("[Device] Mixed precision: mixed_bfloat16")
             except Exception as e:
                 print(f"[Device] Mixed precision not set: {e}")
+            print("[Device] TPU initialized.")
             return (strategy, True)
         except Exception as e:
-            if device == "tpu":
-                raise RuntimeError(f"Не удалось инициализировать TPU: {e}")
-            print(f"[Device] TPU not available ({e}). Fallback to default strategy.")
+            print(f"[Device] TPU endpoint failed: {e}")
+            last_exc = e
+
+    if device == "tpu":
+        raise RuntimeError(f"Не удалось инициализировать TPU: {last_exc}")
+
+    print("[Device] TPU не найден. Переход на обычную стратегию.")
     return (tf.distribute.get_strategy(), False)
 
 # ===================== МОДЕЛИ (TF/Keras) =====================
