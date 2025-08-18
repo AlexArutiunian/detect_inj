@@ -130,7 +130,7 @@ def discover_joint_schema(csv_path, data_dir, motion_key,
         p = os.path.join(data_dir, fn)
         print(p)
         if not os.path.exists(p) and not fn.endswith(".json"):
-            p2 = p + ".json"
+            p2 = p + ".npy"
             if os.path.exists(p2):
                 p = p2
         if not os.path.exists(p):
