@@ -626,6 +626,28 @@ def _write_html_report(out_dir, dev_metrics, test_metrics, images, thr):
     with open(os.path.join(out_dir, "report.html"), "w", encoding="utf-8") as f:
         f.write("\n".join(html))
 
+
+def _display_inline(images: dict, show: bool):
+    """Показать картинки внутри ячейки (работает при запуске через %run)."""
+    if not show:
+        return
+    try:
+        from IPython.display import display, HTML, Image as IPyImage
+        sections = [
+            ("DEV",  ["cm_dev", "roc_dev", "pr_dev", "f1_dev"]),
+            ("TEST", ["cm_test", "roc_test", "pr_test"]),
+            ("FEATURES", ["fi"]),
+        ]
+        for title, keys in sections:
+            have = [k for k in keys if k in images]
+            if not have:
+                continue
+            display(HTML(f"<h3>{title}</h3>"))
+            for k in have:
+                display(IPyImage(filename=images[k]))
+    except Exception as e:
+        print(f"[inline-display disabled] {e}")
+
 # ===================== MAIN =====================
 
 if __name__ == "__main__":
@@ -649,6 +671,9 @@ if __name__ == "__main__":
     parser.add_argument("--loader_workers", type=int, default=0, help="воркеры для извлечения фич / датасетов")
     parser.add_argument("--downsample", type=int, default=1, help="шаг по времени для ускорения (>=1)")
     parser.add_argument("--top_features", type=int, default=30, help="сколько лучших фич показывать на графике важности (RF/XGB)")
+    parser.add_argument("--show_plots", action="store_true",
+                    help="показывать графики прямо в ячейке (используй %run)")
+
     args = parser.parse_args()
 
     # joints schema
@@ -741,6 +766,9 @@ if __name__ == "__main__":
             images["fi"] = os.path.join(out_dir, "feature_importance_top.png")
 
         _write_html_report(out_dir, dev_metrics, test_metrics, images, thr)
+        
+        _display_inline(images, args.show_plots)
+
 
     # ========= ВЕТКА НЕЙРОСЕТЕЙ =========
     else:
@@ -899,6 +927,7 @@ if __name__ == "__main__":
             _plot_pr(y_test,  prob_test, "TEST PR",  os.path.join(out_dir, "pr_test.png"));  images["pr_test"]  = os.path.join(out_dir, "pr_test.png")
 
         _write_html_report(out_dir, dev_metrics, test_metrics, images, thr)
+        _display_inline(images, args.show_plots)
 
         # сохраним схему для predict (если есть)
         if schema_joints is not None:
