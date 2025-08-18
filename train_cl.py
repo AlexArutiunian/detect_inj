@@ -206,6 +206,7 @@ def load_features_from_npy(csv_path, npy_dir, filename_col="filename", label_col
         y = label_to_int(row.get(label_col))
         if not fn or y is None: continue
         p = _map_to_npy_path(npy_dir, fn)
+        print(p)
         if os.path.exists(p): tasks.append((p, y, int(max(1, downsample))))
 
     results = []
