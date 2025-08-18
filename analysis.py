@@ -125,19 +125,28 @@ def plot_joint_importance(df: pd.DataFrame, topn: int, title: str, plot_path: st
     # для красивого порядка сверху-вниз
     top = top.iloc[::-1]
 
-    h = max(3.5, 0.4 * len(top))  # динамическая высота
+       # нормируем в проценты
+    top["importance_pct"] = 100 * top["importance_sum"] / top["importance_sum"].sum()
+
+    h = max(3.5, 0.3 * len(top))       # делаем столбцы ниже (коэф. 0.3 вместо 0.4)
     plt.figure(figsize=(8, h))
-    plt.barh(top["joint"], top["importance_sum"])
-    plt.xlabel("Importance (sum of 18 features)")
+    plt.barh(top["joint"], top["importance_pct"])
+    plt.xlabel("Importance (%)")
     plt.title(title)
+
     # подписи значений справа от баров
-    for i, v in enumerate(top["importance_sum"]):
-        plt.text(v, i, f" {v:.4f}", va="center")
+    for i, v in enumerate(top["importance_pct"]):
+        plt.text(v, i, f" {v:.1f}%", va="center")
+
+    # добавляем запас справа, чтобы подписи не съезжали
+    plt.xlim(0, top["importance_pct"].max() * 1.1)
+
     plt.tight_layout()
     plt.savefig(plot_path, dpi=dpi)
     if show:
         plt.show()
     plt.close()
+
     print(f"[OK] Диаграмма сохранена: {plot_path}")
 
 def main():
