@@ -407,33 +407,55 @@ def build_gru(input_shape):
     model = models.Model(inp, out)
     model.compile(optimizer="adam", loss="binary_crossentropy", metrics=["accuracy"])
     return model
-
 def build_transformer(input_shape, d_model=128, num_heads=4, ff_dim=256, num_layers=2, dropout=0.1):
     _ = _lazy_tf()
     from tensorflow.keras import layers, models
+
     inp = layers.Input(shape=input_shape)
     x = layers.Masking(mask_value=0.0)(inp)
-    x = layers.Dense(d_model)(x)
+    x = layers.Dense(d_model)(x)  # -> (..., d_model)
+
+    # Синусо-косинусное позиционное кодирование, устойчивое для TPU
     def add_positional_encoding(x_):
         import tensorflow as tf
-        T = tf.shape(x_)[1]; d = int(x_.shape[-1])
-        pos = tf.cast(tf.range(T)[:, None], tf.float32)
-        i   = tf.cast(tf.range(d)[None, :], tf.float32)
-        angle = pos / tf.pow(10000.0, (2*(i//2))/d)
-        pe = tf.where(tf.equal(tf.cast(i % 2, tf.int32), 0), tf.sin(angle), tf.cos(angle))
-        pe = tf.expand_dims(pe, 0)
+        T = tf.shape(x_)[1]                 # динамическая длина
+        d = int(x_.shape[-1])               # статическая ширина (d_model)
+
+        # считаем в float32 для стабильности и точности, затем приводим к dtype входа
+        pos = tf.cast(tf.range(T)[:, None], tf.float32)          # (T,1)
+        i   = tf.cast(tf.range(d)[None, :], tf.float32)          # (1,d)
+
+        angle = pos / tf.pow(10000.0, (2.0 * tf.floor(i/2.0)) / float(d))  # (T,d)
+        sin = tf.sin(angle)
+        cos = tf.cos(angle)
+
+        even_mask = tf.cast(tf.math.floormod(tf.range(d), 2) == 0, tf.float32)[None, :]  # (1,d)
+        pe = sin * even_mask + cos * (1.0 - even_mask)            # (T,d)
+        pe = tf.expand_dims(pe, 0)                                 # (1,T,d)
+        pe = tf.cast(pe, x_.dtype)                                 # bfloat16 при policy=mixed_bfloat16
+
         return x_ + pe
-    x = layers.Lambda(add_positional_encoding)(x)
+
+    # ВАЖНО: указываем output_shape, чтобы Keras/XLA не ругались
+    x = layers.Lambda(add_positional_encoding, output_shape=lambda s: s, name="pos_encoding")(x)
+
     for _ in range(num_layers):
         a = layers.MultiHeadAttention(num_heads=num_heads, key_dim=d_model//num_heads, dropout=dropout)(x, x)
         x = layers.LayerNormalization(epsilon=1e-6)(x + a)
-        f = layers.Dense(ff_dim, activation="relu")(x); f = layers.Dropout(dropout)(f); f = layers.Dense(d_model)(f)
+        f = layers.Dense(ff_dim, activation="relu")(x)
+        f = layers.Dropout(dropout)(f)
+        f = layers.Dense(d_model)(f)
         x = layers.LayerNormalization(epsilon=1e-6)(x + f)
-    x = layers.GlobalAveragePooling1D()(x); x = layers.Dropout(dropout)(x); x = layers.Dense(64, activation="relu")(x)
+
+    x = layers.GlobalAveragePooling1D()(x)
+    x = layers.Dropout(dropout)(x)
+    x = layers.Dense(64, activation="relu")(x)
     out = layers.Dense(1, activation="sigmoid")(x)
+
     model = models.Model(inp, out)
     model.compile(optimizer="adam", loss="binary_crossentropy", metrics=["accuracy"])
     return model
+
 
 def build_timesnet(input_shape):
     _ = _lazy_tf()
