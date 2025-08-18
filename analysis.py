@@ -126,7 +126,7 @@ def plot_joint_importance(df: pd.DataFrame, topn: int, title: str, plot_path: st
     top = top.iloc[::-1]
 
        # нормируем в проценты
-    top["importance_pct"] = 100 * top["importance_sum"] / top["importance_sum"].sum()
+    top["importance_pct"] = 100 * top["importance_sum"]
 
     h = max(3.5, 0.3 * len(top))       # делаем столбцы ниже (коэф. 0.3 вместо 0.4)
     plt.figure(figsize=(8, h))
