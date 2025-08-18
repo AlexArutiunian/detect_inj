@@ -128,13 +128,9 @@ def discover_joint_schema(csv_path, data_dir, motion_key,
         if not fn or y is None:
             continue
         p = os.path.join(data_dir, fn)
+        p.replace(".json", ".npy")
         print(p)
-        if not os.path.exists(p) and not fn.endswith(".json"):
-            p2 = p + ".npy"
-            if os.path.exists(p2):
-                p = p2
-        if not os.path.exists(p):
-            continue
+       
         try:
             data = _safe_json_load(p)
             if motion_key not in data or not isinstance(data[motion_key], dict):
