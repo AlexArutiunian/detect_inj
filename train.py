@@ -3,7 +3,7 @@
 
 # ===================== detect_inj/train3.py =====================
 # Классика (RF/SVM/XGB) и нейросети (LSTM/TCN/и т.п.) для бинарной классификации.
-# ВАЖНО: TensorFlow подгружается ЛЕНИВО и ТОЛЬКО если выбрана нейросеточная модель.
+# TensorFlow подгружается ЛЕНИВО и ТОЛЬКО если выбрана нейросеточная модель.
 
 import os
 import json
@@ -201,7 +201,6 @@ def load_features_from_npy(csv_path, npy_dir, filename_col="filename", label_col
         y = label_to_int(row.get(label_col))
         if not fn or y is None: continue
         p = _map_to_npy_path(npy_dir, fn)
-        
         if os.path.exists(p): tasks.append((p, y, int(max(1, downsample))))
 
     results = []
@@ -354,7 +353,7 @@ def build_gru(input_shape):
     return model
 
 def build_transformer(input_shape, d_model=128, num_heads=4, ff_dim=256, num_layers=2, dropout=0.1):
-    _ = _lazy_tf()  # гарантируем наличие TF
+    _ = _lazy_tf()
     from tensorflow.keras import layers, models
     inp = layers.Input(shape=input_shape)
     x = layers.Masking(mask_value=0.0)(inp)
@@ -424,7 +423,7 @@ def build_informer(input_shape, d_model=128, num_heads=4, ff_dim=256, num_layers
     model = models.Model(inp, out); model.compile(optimizer="adam", loss="binary_crossentropy", metrics=["accuracy"])
     return model
 
-# ===================== ОБУЧЕНИЕ =====================
+# ===================== ОБУЧЕНИЕ (классика) =====================
 
 def train_classical(X_train, X_dev, X_test, y_train, y_dev, y_test, model_type, out_dir):
     if model_type == "rf":
@@ -458,49 +457,6 @@ def train_classical(X_train, X_dev, X_test, y_train, y_dev, y_test, model_type, 
         f.write(str(thr))
     return dev_metrics, test_metrics, thr, model
 
-def train_deep(name, train_seq, dev_seq, test_seq, class_weight, epochs, out_dir, input_shape):
-    k = _lazy_tf()
-    if   name == "lstm":        model = build_lstm(input_shape)
-    elif name == "tcn":         model = build_tcn(input_shape)
-    elif name == "gru":         model = build_gru(input_shape)
-    elif name == "cnn_lstm":    model = build_cnn_lstm(input_shape)
-    elif name == "transformer": model = build_transformer(input_shape)
-    elif name == "timesnet":    model = build_timesnet(input_shape)
-    elif name == "patchtst":    model = build_patchtst(input_shape)
-    elif name == "informer":    model = build_informer(input_shape)
-    else: raise ValueError("Unknown deep model")
-
-    cb = [k["EarlyStopping"](monitor="val_loss", patience=5, restore_best_weights=True)]
-    model.fit(train_seq, validation_data=dev_seq, epochs=epochs,
-              class_weight=class_weight, callbacks=cb, verbose=1)
-
-    # DEV
-    prob_dev, y_dev = [], []
-    for Xb, yb in dev_seq:
-        if len(Xb) == 0: continue
-        pb = model.predict(Xb, verbose=0).flatten()
-        prob_dev.append(pb); y_dev.append(yb)
-    prob_dev = np.concatenate(prob_dev); y_dev = np.concatenate(y_dev)
-    thr = best_threshold_by_f1(y_dev, prob_dev)
-    pred_dev = (prob_dev >= thr).astype(int)
-    dev_metrics = compute_metrics(y_dev, pred_dev, prob_dev)
-
-    # TEST
-    prob_test, y_test = [], []
-    for Xb, yb in test_seq:
-        if len(Xb) == 0: continue
-        pb = model.predict(Xb, verbose=0).flatten()
-        prob_test.append(pb); y_test.append(yb)
-    prob_test = np.concatenate(prob_test); y_test = np.concatenate(y_test)
-    pred_test = (prob_test >= thr).astype(int)
-    test_metrics = compute_metrics(y_test, pred_test, prob_test)
-
-    model.save(os.path.join(out_dir, "model.h5"))
-    with open(os.path.join(out_dir, "threshold.txt"), "w") as f:
-        f.write(str(thr))
-    np.savez(os.path.join(out_dir, "norm_stats.npz"), max_len=input_shape[0])
-    return dev_metrics, test_metrics, thr, model
-
 # ===================== MAIN =====================
 
 if __name__ == "__main__":
@@ -523,7 +479,19 @@ if __name__ == "__main__":
     parser.add_argument("--max_len", type=str, default="auto", help="'auto' (95-перцентиль по train) или число для NN")
     parser.add_argument("--loader_workers", type=int, default=0, help="воркеры для извлечения фич / датасетов")
     parser.add_argument("--downsample", type=int, default=1, help="шаг по времени для ускорения (>=1)")
+    # ускорение/мульти-GPU
+    parser.add_argument("--gpus", type=str, default="all", help="all | cpu | список индексов через запятую, напр. '0,1'")
+    parser.add_argument("--mixed_precision", action="store_true", help="float16 на GPU (Ampere/T4)")
+    parser.add_argument("--xla", action="store_true", help="включить XLA JIT")
+    parser.add_argument("--mp", action="store_true", help="подкачка батчей в отдельных процессах")
+    parser.add_argument("--queue_size", type=int, default=64, help="max_queue_size для генератора/Sequence")
     args = parser.parse_args()
+
+    # --- Установим видимость GPU ДО любого импорта TensorFlow ---
+    if args.gpus.lower() == "cpu":
+        os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+    elif args.gpus.lower() != "all":
+        os.environ["CUDA_VISIBLE_DEVICES"] = args.gpus
 
     # joints schema
     use_joints = None
@@ -531,7 +499,6 @@ if __name__ == "__main__":
         use_joints = [s.strip() for s in args.use_joints.split(",") if s.strip()]
     schema_joints = None
     if args.input_format == "npy":
-        # имена суставов нужны только для отчётов/совместимости
         if args.schema_json and os.path.exists(args.schema_json):
             with open(args.schema_json, "r", encoding="utf-8") as f:
                 schema_joints = json.load(f)
@@ -561,12 +528,10 @@ if __name__ == "__main__":
                 schema_joints=schema_joints, workers=args.loader_workers
             )
 
-        # сохраним схему, если есть
         if schema_joints is not None:
             with open(os.path.join(out_dir, "schema_joints.json"), "w", encoding="utf-8") as f:
                 json.dump(schema_joints, f, ensure_ascii=False, indent=2)
 
-        # Сплит 70/20/10
         X_train_full, X_test, y_train_full, y_test = train_test_split(
             X_all, y_all, test_size=0.20, random_state=42, stratify=y_all
         )
@@ -590,14 +555,35 @@ if __name__ == "__main__":
 
         joblib.dump({"model": model, "scaler": scaler}, os.path.join(out_dir, "model.joblib"))
 
-    # ========= ВЕТКА НЕЙРОСЕТЕЙ =========
+    # ========= ВЕТКА НЕЙРОСЕТЕЙ (с поддержкой нескольких GPU) =========
     else:
-        # Локально определяем Keras Sequence на базе ленивого TF
+        import contextlib
         k_tf = _lazy_tf()
         tf = k_tf["tf"]
         pad_sequences = k_tf["pad_sequences"]
         SequenceBase = tf.keras.utils.Sequence
 
+        # опции производительности
+        gpus = tf.config.list_physical_devices("GPU")
+        for g in gpus:
+            try:
+                tf.config.experimental.set_memory_growth(g, True)
+            except Exception:
+                pass
+
+        if args.mixed_precision:
+            from tensorflow.keras import mixed_precision as mp
+            mp.set_global_policy("mixed_float16")
+
+        if args.xla:
+            tf.config.optimizer.set_jit(True)
+
+        # стратегия для нескольких GPU
+        strategy = tf.distribute.MirroredStrategy() if len(gpus) > 1 else None
+        replicas = strategy.num_replicas_in_sync if strategy else 1
+        eff_bs = args.batch_size * replicas  # глобальный batch size
+
+        # локальные датасеты-генераторы (используют pad_sequences из TF)
         class JsonSeq(SequenceBase):
             def __init__(self, items, motion_key, schema_joints, max_len, batch_size,
                          shuffle=True, downsample=1, **kwargs):
@@ -670,7 +656,7 @@ if __name__ == "__main__":
         items = _build_index(args.csv, args.data_dir, args.filename_col, args.label_col, input_format=args.input_format)
         assert items, "Нет валидных файлов/меток."
 
-        # оценим max_len
+        # Оценим max_len
         if args.max_len.strip().lower() == "auto":
             if args.input_format == "npy":
                 max_len = _probe_max_len_npy(items, pctl=95, sample_max=None)
@@ -698,14 +684,13 @@ if __name__ == "__main__":
         print_split_stats("TEST  (≈20%)", labels[idx_test])
 
         if args.input_format == "npy":
-            train_seq = NpySeq([items[i] for i in idx_train], max_len, args.batch_size, shuffle=True,  downsample=args.downsample)
-            dev_seq   = NpySeq([items[i] for i in idx_dev],   max_len, args.batch_size, shuffle=False, downsample=args.downsample)
-            test_seq  = NpySeq([items[i] for i in idx_test],  max_len, args.batch_size, shuffle=False, downsample=args.downsample)
+            train_seq = NpySeq([items[i] for i in idx_train], max_len, eff_bs, shuffle=True,  downsample=args.downsample)
+            dev_seq   = NpySeq([items[i] for i in idx_dev],   max_len, eff_bs, shuffle=False, downsample=args.downsample)
+            test_seq  = NpySeq([items[i] for i in idx_test],  max_len, eff_bs, shuffle=False, downsample=args.downsample)
         else:
-            # JSON
-            train_seq = JsonSeq([items[i] for i in idx_train], args.motion_key, schema_joints, max_len, args.batch_size, shuffle=True,  downsample=args.downsample)
-            dev_seq   = JsonSeq([items[i] for i in idx_dev],   args.motion_key, schema_joints, max_len, args.batch_size, shuffle=False, downsample=args.downsample)
-            test_seq  = JsonSeq([items[i] for i in idx_test],  args.motion_key, schema_joints, max_len, args.batch_size, shuffle=False, downsample=args.downsample)
+            train_seq = JsonSeq([items[i] for i in idx_train], args.motion_key, schema_joints, max_len, eff_bs, shuffle=True,  downsample=args.downsample)
+            dev_seq   = JsonSeq([items[i] for i in idx_dev],   args.motion_key, schema_joints, max_len, eff_bs, shuffle=False, downsample=args.downsample)
+            test_seq  = JsonSeq([items[i] for i in idx_test],  args.motion_key, schema_joints, max_len, eff_bs, shuffle=False, downsample=args.downsample)
 
         # пример батча -> input_shape
         X_sample, _ = train_seq[0]
@@ -718,12 +703,60 @@ if __name__ == "__main__":
         w = compute_class_weight(class_weight="balanced", classes=classes, y=labels[idx_train])
         class_weight = {0: float(w[0]), 1: float(w[1])}
         print("Class weights (train):", class_weight)
+        print(f"GPUs: {len(gpus)} | replicas_in_sync: {replicas} | global_batch: {eff_bs}")
 
-        dev_metrics, test_metrics, thr, model = train_deep(
-            args.model, train_seq, dev_seq, test_seq, class_weight, args.epochs, out_dir, input_shape
+        # строим модель под стратегией и обучаем
+        ctx = strategy.scope() if strategy else contextlib.nullcontext()
+        with ctx:
+            if   args.model == "lstm":        model = build_lstm(input_shape)
+            elif args.model == "tcn":         model = build_tcn(input_shape)
+            elif args.model == "gru":         model = build_gru(input_shape)
+            elif args.model == "cnn_lstm":    model = build_cnn_lstm(input_shape)
+            elif args.model == "transformer": model = build_transformer(input_shape)
+            elif args.model == "timesnet":    model = build_timesnet(input_shape)
+            elif args.model == "patchtst":    model = build_patchtst(input_shape)
+            elif args.model == "informer":    model = build_informer(input_shape)
+            else: raise ValueError("Unknown deep model")
+
+        cb = [k_tf["EarlyStopping"](monitor="val_loss", patience=5, restore_best_weights=True)]
+        model.fit(
+            train_seq,
+            validation_data=dev_seq,
+            epochs=args.epochs,
+            class_weight=class_weight,
+            callbacks=cb,
+            verbose=1,
+            workers=args.loader_workers,
+            use_multiprocessing=args.mp,
+            max_queue_size=args.queue_size,
         )
 
-        # сохраним схему для predict (если есть)
+        # DEV
+        prob_dev, y_dev = [], []
+        for Xb, yb in dev_seq:
+            if len(Xb) == 0: continue
+            pb = model.predict(Xb, verbose=0).flatten()
+            prob_dev.append(pb); y_dev.append(yb)
+        prob_dev = np.concatenate(prob_dev); y_dev = np.concatenate(y_dev)
+        thr = best_threshold_by_f1(y_dev, prob_dev)
+        pred_dev = (prob_dev >= thr).astype(int)
+        dev_metrics = compute_metrics(y_dev, pred_dev, prob_dev)
+
+        # TEST
+        prob_test, y_test = [], []
+        for Xb, yb in test_seq:
+            if len(Xb) == 0: continue
+            pb = model.predict(Xb, verbose=0).flatten()
+            prob_test.append(pb); y_test.append(yb)
+        prob_test = np.concatenate(prob_test); y_test = np.concatenate(y_test)
+        pred_test = (prob_test >= thr).astype(int)
+        test_metrics = compute_metrics(y_test, pred_test, prob_test)
+
+        model.save(os.path.join(out_dir, "model.h5"))
+        with open(os.path.join(out_dir, "threshold.txt"), "w") as f:
+            f.write(str(thr))
+        np.savez(os.path.join(out_dir, "norm_stats.npz"), max_len=input_shape[0])
+
         if schema_joints is not None:
             with open(os.path.join(out_dir, "schema_joints.json"), "w", encoding="utf-8") as f:
                 json.dump(schema_joints, f, ensure_ascii=False, indent=2)
