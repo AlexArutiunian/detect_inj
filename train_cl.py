@@ -451,7 +451,7 @@ def train_classical(X_train, X_dev, X_test, y_train, y_dev, y_test, model_type, 
     model.fit(X_train, y_train)
 
     prob_dev = model.predict_proba(X_dev)[:, 1]
-    thr = best_threshold_by_f1(y_dev, prob_dev)
+    thr = 0.3
     pred_dev = (prob_dev >= thr).astype(int)
     dev_metrics = compute_metrics(y_dev, pred_dev, prob_dev)
 
