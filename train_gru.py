@@ -1,0 +1,334 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import os, json, argparse, math, random
+from typing import List, Tuple
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")           # чтобы сохранять картинки без GUI
+import matplotlib.pyplot as plt
+from sklearn.metrics import roc_curve, auc
+
+def save_plots(history, out_dir, y_test, prob_test):
+    os.makedirs(out_dir, exist_ok=True)
+
+    # loss / accuracy по эпохам
+    for metric in ["loss", "accuracy"]:
+        train = history.history.get(metric, [])
+        val   = history.history.get(f"val_{metric}", [])
+        if not train: 
+            continue
+        plt.figure()
+        plt.plot(range(1, len(train)+1), train, label=f"train_{metric}")
+        if val: plt.plot(range(1, len(val)+1), val, label=f"val_{metric}")
+        plt.xlabel("Epoch"); plt.ylabel(metric); plt.legend()
+        plt.grid(alpha=0.3); plt.tight_layout()
+        plt.savefig(os.path.join(out_dir, f"{metric}.png"), dpi=150)
+        plt.close()
+
+    # ROC-кривая на тесте
+    if y_test is not None and prob_test is not None and len(np.unique(y_test)) == 2:
+        fpr, tpr, _ = roc_curve(y_test, prob_test)
+        roc_auc = auc(fpr, tpr)
+        plt.figure()
+        plt.plot(fpr, tpr, label=f"ROC AUC = {roc_auc:.3f}")
+        plt.plot([0,1], [0,1], linestyle="--")
+        plt.xlabel("FPR"); plt.ylabel("TPR"); plt.legend()
+        plt.grid(alpha=0.3); plt.tight_layout()
+        plt.savefig(os.path.join(out_dir, "roc_test.png"), dpi=150)
+        plt.close()
+
+
+# ---------------------- утилиты ----------------------
+
+def ensure_dir(p: str): os.makedirs(p, exist_ok=True)
+
+def label_to_int(v):
+    if v is None: return None
+    s = str(v).strip().lower()
+    if s in ("injury", "1"): return 1
+    if s in ("no injury", "0"): return 0
+    return None
+
+def sanitize_seq(a: np.ndarray) -> np.ndarray:
+    # заменяем nan/inf и приводим к float32
+    a = np.nan_to_num(a, nan=0.0, posinf=0.0, neginf=0.0)
+    return a.astype(np.float32, copy=False)
+
+def best_threshold_by_f1(y_true, p):
+    from sklearn.metrics import precision_recall_curve
+    pr, rc, th = precision_recall_curve(y_true, p)
+    if len(th) == 0: return 0.5
+    f1 = 2*pr[:-1]*rc[:-1]/np.clip(pr[:-1]+rc[:-1], 1e-12, None)
+    return float(th[int(np.nanargmax(f1))])
+
+def compute_metrics(y_true, y_pred, y_prob):
+    from sklearn.metrics import accuracy_score, f1_score, roc_auc_score, confusion_matrix, classification_report
+    return {
+        "accuracy": float(accuracy_score(y_true, y_pred)),
+        "f1": float(f1_score(y_true, y_pred)),
+        "roc_auc": float(roc_auc_score(y_true, y_prob)) if len(np.unique(y_true)) == 2 else float("nan"),
+        "confusion_matrix": confusion_matrix(y_true, y_pred).tolist(),
+        "report": classification_report(y_true, y_pred, digits=3),
+    }
+
+# ---------------------- чтение индекса ----------------------
+
+def build_items(csv_path: str, data_dir: str, filename_col="filename", label_col="No inj/ inj") -> List[Tuple[str,int]]:
+    meta = pd.read_csv(csv_path, usecols=[filename_col, label_col])
+    items = []
+    for _, row in meta.iterrows():
+        fn = str(row[filename_col]).strip() if pd.notnull(row.get(filename_col)) else ""
+        y  = label_to_int(row.get(label_col))
+        if not fn or y is None: continue
+        p = os.path.join(data_dir, fn)
+        if not p.endswith(".npy"): p += ".npy"
+        if os.path.exists(p):
+            # сразу отбрасываем пустышки
+            try:
+                with np.load(p, mmap_mode="r") as arr:  # context ok для npy
+                    pass
+            except Exception:
+                # np.load поддерживает контекст только для .npz, поэтому повторно:
+                arr = np.load(p, allow_pickle=False, mmap_mode="r")
+            if arr.ndim == 2 and arr.shape[0] >= 2:
+                items.append((p, int(y)))
+    return items
+
+def probe_stats(items: List[Tuple[str,int]], downsample: int = 1, pctl: int = 95):
+    lengths = []
+    feat = None
+    for p, _ in items:
+        arr = np.load(p, allow_pickle=False, mmap_mode="r")
+        if arr.ndim != 2 or arr.shape[0] < 2: continue
+        if feat is None: feat = int(arr.shape[1])
+        L = int(arr.shape[0] // max(1, downsample))
+        if L > 0: lengths.append(L)
+    max_len = int(np.percentile(lengths, pctl)) if lengths else 256
+    return max_len, feat or 1
+
+def compute_norm_stats(items: List[Tuple[str,int]], feat_dim: int, downsample: int, max_len_cap: int, sample_items: int = 512):
+    # Стриминговая оценка mean/std по train без загрузки всего в память
+    rng = random.Random(42)
+    pool = items if len(items) <= sample_items else rng.sample(items, sample_items)
+    count = 0
+    mean = np.zeros(feat_dim, dtype=np.float64)
+    m2   = np.zeros(feat_dim, dtype=np.float64)  # для дисперсии (Welford)
+    for p, _ in pool:
+        arr = np.load(p, allow_pickle=False, mmap_mode="r")
+        x = sanitize_seq(arr[::max(1, downsample)])
+        if x.shape[0] > max_len_cap: x = x[:max_len_cap]
+        # сворачиваем по времени
+        for t in range(x.shape[0]):
+            count += 1
+            delta = x[t] - mean
+            mean += delta / count
+            m2   += delta * (x[t] - mean)
+    var = m2 / max(1, (count - 1))
+    std = np.sqrt(np.clip(var, 1e-12, None)).astype(np.float32)
+    return mean.astype(np.float32), std
+
+# ---------------------- TF часть ----------------------
+
+def lazy_tf():
+    import tensorflow as tf
+    from tensorflow.keras import layers, models
+    return tf, layers, models
+
+def make_datasets(items, labels, max_len, feat_dim, bs, downsample, mean, std, replicas):
+    import tensorflow as tf
+    AUTOTUNE = tf.data.AUTOTUNE
+
+    def gen(indices):
+        def _g():
+            for i in indices:
+                p = items[i]
+                y = labels[i]
+                arr = np.load(p, allow_pickle=False, mmap_mode="r")
+                x = sanitize_seq(arr[::max(1, downsample)])
+                # отбросим совсем короткие (редко, но попадались)
+                if x.shape[0] < 2:
+                    continue
+                # обрезка по времени
+                if x.shape[0] > max_len:
+                    x = x[:max_len]
+                # нормализация
+                x = (x - mean) / std
+                yield x, np.int32(y)
+        return _g
+
+    sig = (
+        tf.TensorSpec(shape=(None, feat_dim), dtype=tf.float32),
+        tf.TensorSpec(shape=(), dtype=tf.int32),
+    )
+
+    def pad_map(x, y):
+        T = tf.shape(x)[0]
+        pad_t = tf.maximum(0, max_len - T)
+        x = tf.pad(x, [[0, pad_t], [0, 0]])          # pad до max_len
+        x = x[:max_len]                               # защита
+        x.set_shape([max_len, feat_dim])              # статическая форма
+        return x, y
+
+    def make(indices, shuffle=False, drop_remainder=False):
+        ds = tf.data.Dataset.from_generator(gen(indices), output_signature=sig)
+        if shuffle:
+            ds = ds.shuffle(4096, reshuffle_each_iteration=True)
+        ds = ds.map(pad_map, num_parallel_calls=AUTOTUNE)
+        ds = ds.batch(bs, drop_remainder=drop_remainder)
+        ds = ds.prefetch(AUTOTUNE)
+        return ds
+
+    return make
+
+def build_gru_model(input_shape, learning_rate=1e-3, mixed_precision=False):
+    tf, layers, models = lazy_tf()
+    inp = layers.Input(shape=input_shape)              # (max_len, D)
+    x = layers.Masking(mask_value=0.0)(inp)           # паддинг нулями маскируется (см. гайд по RNN). :contentReference[oaicite:2]{index=2}
+    x = layers.GRU(128, return_sequences=True)(x)
+    x = layers.GRU(64)(x)
+    x = layers.Dropout(0.3)(x)
+    x = layers.Dense(64, activation="relu")(x)
+    out = layers.Dense(1, activation="sigmoid", dtype="float32")(x)  # float32 выход даже при AMP
+
+    model = models.Model(inp, out)
+    opt = tf.keras.optimizers.Adam(learning_rate=learning_rate, clipnorm=1.0)
+    model.compile(optimizer=opt, loss="binary_crossentropy", metrics=["accuracy"])
+    return model
+
+# ---------------------- main ----------------------
+
+def main():
+    ap = argparse.ArgumentParser("GRU binary classifier over NPY sequences")
+    ap.add_argument("--csv", required=True)
+    ap.add_argument("--data_dir", required=True)
+    ap.add_argument("--filename_col", default="filename")
+    ap.add_argument("--label_col", default="No inj/ inj")
+    ap.add_argument("--out_dir", default="output_run_gru")
+    ap.add_argument("--epochs", type=int, default=20)
+    ap.add_argument("--batch_size", type=int, default=16)     # локальный BS (будет умножен на число GPU)
+    ap.add_argument("--downsample", type=int, default=1)
+    ap.add_argument("--max_len", default="auto")              # "auto" -> 95 перцентиль
+    ap.add_argument("--gpus", default="all")                  # "all" | "cpu" | "0,1"
+    ap.add_argument("--mixed_precision", action="store_true")
+    args = ap.parse_args()
+
+    # Видимость GPU до импорта TF
+    if args.gpus.lower() == "cpu":
+        os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+    elif args.gpus.lower() != "all":
+        os.environ["CUDA_VISIBLE_DEVICES"] = args.gpus
+
+    # Индекс
+    items_y = build_items(args.csv, args.data_dir, args.filename_col, args.label_col)
+    assert items_y, "Не найдено валидных .npy и меток"
+    paths = [p for p, _ in items_y]
+    labels_all = np.array([y for _, y in items_y], dtype=np.int32)
+
+    # Статы по длине/размеру признака
+    if args.max_len.strip().lower() == "auto":
+        max_len, feat_dim = probe_stats(items_y, downsample=args.downsample, pctl=95)
+        max_len = int(max(8, min(max_len, 20000)))
+    else:
+        max_len = int(args.max_len)
+        # определим feat_dim по первому файлу
+        aa = np.load(paths[0], allow_pickle=False, mmap_mode="r")
+        feat_dim = int(aa.shape[1])
+    print(f"max_len={max_len} | feat_dim={feat_dim}")
+
+    # Сплит 70/10/20
+    from sklearn.model_selection import train_test_split
+    idx = np.arange(len(paths))
+    idx_train_full, idx_test = train_test_split(idx, test_size=0.20, random_state=42, stratify=labels_all)
+    idx_train, idx_dev = train_test_split(idx_train_full, test_size=0.125, random_state=42, stratify=labels_all[idx_train_full])
+
+    # Норм-статы по train
+    mean, std = compute_norm_stats([items_y[i] for i in idx_train], feat_dim, args.downsample, max_len)
+    np.savez_compressed(os.path.join(args.out_dir, "norm_stats.npz"), mean=mean, std=std, max_len=max_len)
+
+    # TF / стратегия
+    tf, layers, models = lazy_tf()
+    gpus = tf.config.list_physical_devices("GPU")
+    for g in gpus:
+        try: tf.config.experimental.set_memory_growth(g, True)
+        except Exception: pass
+
+    if args.mixed_precision:
+        from tensorflow.keras import mixed_precision as mp
+        mp.set_global_policy("mixed_float16")  # выходной Dense уже float32
+
+    strategy = tf.distribute.MirroredStrategy() if len(gpus) > 1 else None
+    replicas = strategy.num_replicas_in_sync if strategy else 1
+    global_bs = args.batch_size * replicas
+    print(f"GPUs: {len(gpus)} | replicas: {replicas} | global_batch: {global_bs}")
+
+    # Датасеты
+    make_ds = make_datasets(paths, labels_all, max_len, feat_dim, global_bs,
+                            args.downsample, mean, std, replicas)
+    # Drop remainder только на train при multi-GPU
+    train_ds = make_ds(idx_train, shuffle=True,  drop_remainder=(replicas > 1))
+    dev_ds   = make_ds(idx_dev,   shuffle=False, drop_remainder=False)
+    test_ds  = make_ds(idx_test,  shuffle=False, drop_remainder=False)
+
+    # Веса классов
+    from sklearn.utils.class_weight import compute_class_weight
+    cls = np.array([0, 1], dtype=np.int32)
+    w = compute_class_weight("balanced", classes=cls, y=labels_all[idx_train])
+    class_weight = {0: float(w[0]), 1: float(w[1])}
+    print("class_weight:", class_weight)
+
+    ensure_dir(args.out_dir)
+    # Строим модель
+    ctx = strategy.scope() if strategy else contextlib_null()
+    with ctx:
+        model = build_gru_model((max_len, feat_dim), learning_rate=1e-3, mixed_precision=args.mixed_precision)
+
+    # Коллбеки
+    cb = [
+        tf.keras.callbacks.EarlyStopping(monitor="val_loss", patience=5, restore_best_weights=True),
+        tf.keras.callbacks.ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=2, min_lr=1e-6)
+    ]
+
+    # Обучение
+    hist = model.fit(train_ds,
+                     validation_data=dev_ds,
+                     epochs=args.epochs,
+                     class_weight=class_weight,
+                     verbose=1)
+
+    # Предсказания и метрики
+    prob_dev  = model.predict(dev_ds,  verbose=0).reshape(-1).astype(np.float32)
+    y_dev     = labels_all[idx_dev]
+    thr = best_threshold_by_f1(y_dev, prob_dev)
+
+    prob_test = model.predict(test_ds, verbose=0).reshape(-1).astype(np.float32)
+    y_test    = labels_all[idx_test]
+    pred_test = (prob_test >= thr).astype(np.int32)
+
+    dev_pred  = (prob_dev >= thr).astype(np.int32)
+    dev_metrics  = compute_metrics(y_dev, dev_pred, prob_dev)
+    test_metrics = compute_metrics(y_test, pred_test, prob_test)
+    save_plots(hist, args.out_dir, y_test, prob_test)
+
+    # Сохранения
+    model.save(os.path.join(args.out_dir, "model.keras"))
+    with open(os.path.join(args.out_dir, "threshold.txt"), "w") as f: f.write(str(thr))
+    with open(os.path.join(args.out_dir, "metrics_dev.json"), "w", encoding="utf-8") as f:
+        json.dump(dev_metrics, f, ensure_ascii=False, indent=2)
+    with open(os.path.join(args.out_dir, "metrics_test.json"), "w", encoding="utf-8") as f:
+        json.dump(test_metrics, f, ensure_ascii=False, indent=2)
+
+    print("\n=== DEV (threshold tuned) ===")
+    print(dev_metrics["report"])
+    print("\n=== TEST (using DEV threshold) ===")
+    print(test_metrics["report"])
+    print("Saved to:", args.out_dir)
+
+# простая заглушка контекста, если нет стратегии
+class contextlib_null:
+    def __enter__(self): return None
+    def __exit__(self, *exc): return False
+
+if __name__ == "__main__":
+    main()
