@@ -51,6 +51,34 @@ def label_to_int(v):
 def sanitize_seq(a: np.ndarray) -> np.ndarray:
     a = np.nan_to_num(a, nan=0.0, posinf=0.0, neginf=0.0)
     return a.astype(np.float32, copy=False)
+def best_threshold_by_balanced_accuracy(y_true, p):
+    from sklearn.metrics import roc_curve
+    fpr, tpr, th = roc_curve(y_true, p)
+    tnr = 1.0 - fpr
+    bal = 0.5 * (tpr + tnr)
+    return float(th[int(np.nanargmax(bal))])
+
+def threshold_for_specificity(y_true, p, target_spec=0.80):
+    # найдём порог с максимальной чувствительностью при специфичности >= target_spec
+    from sklearn.metrics import roc_curve
+    fpr, tpr, th = roc_curve(y_true, p)
+    spec = 1.0 - fpr
+    idx = np.where(spec >= target_spec)[0]
+    if len(idx) == 0:
+        return float(th[0])  # самый жёсткий порог (максимальная специфичность)
+    # среди подходящих берём тот, где TPR максимален
+    j = idx[int(np.nanargmax(tpr[idx]))]
+    return float(th[j])
+
+def threshold_for_precision(y_true, p, target_prec=0.80):
+    # если хотите контролировать именно precision (меньше FP → выше precision)
+    from sklearn.metrics import precision_recall_curve
+    prec, rec, th = precision_recall_curve(y_true, p)
+    ok = np.where(prec[:-1] >= target_prec)[0]  # len(th) == len(prec)-1
+    if len(ok) == 0:
+        return 1.0  # очень высокий порог, если нужная точность недостижима
+    j = ok[int(np.nanargmax(rec[ok]))]  # из них берём с максимальным recall
+    return float(th[j])
 
 def best_threshold_by_f1(y_true, p):
     from sklearn.metrics import precision_recall_curve
@@ -311,6 +339,18 @@ def main():
     ap.add_argument("--peek", type=int, default=0,
                     help="Показать N успешно сопоставленных путей (форма массива)")
     args = ap.parse_args()
+    
+    ap.add_argument("--threshold_mode", choices=["f1", "balanced_acc", "specificity", "precision"],
+                default="specificity", help="как подбирать порог на DEV")
+    ap.add_argument("--target_specificity", type=float, default=0.85,
+                    help="целевая специфичность для threshold_mode=specificity")
+    ap.add_argument("--target_precision", type=float, default=0.85,
+                    help="целевая точность для threshold_mode=precision")
+
+    # (опционально) усилить вес отрицательного класса в лоссе
+    ap.add_argument("--neg_weight_mult", type=float, default=1.0,
+                    help="множитель к весу класса 0 (для снижения FP)")
+
 
     # Видимость GPU до импорта TF
     if args.gpus.lower() == "cpu":
@@ -396,7 +436,10 @@ def main():
     cls = np.array([0, 1], dtype=np.int32)
     w = compute_class_weight("balanced", classes=cls, y=labels_all[idx_train])
     class_weight = {0: float(w[0]), 1: float(w[1])}
+    if args.neg_weight_mult != 1.0:
+        class_weight[0] *= float(args.neg_weight_mult)
     print("class_weight:", class_weight)
+
 
     # Строим модель
     ctx = strategy.scope() if strategy else contextlib_null()
@@ -420,7 +463,21 @@ def main():
     # Предсказания и метрики
     prob_dev  = model.predict(dev_ds,  verbose=0).reshape(-1).astype(np.float32)
     y_dev     = labels_all[idx_dev]
-    thr = best_threshold_by_f1(y_dev, prob_dev)
+    prob_dev  = model.predict(dev_ds,  verbose=0).reshape(-1).astype(np.float32)
+    y_dev     = labels_all[idx_dev]
+
+    if args.threshold_mode == "specificity":
+        thr = threshold_for_specificity(y_dev, prob_dev, args.target_specificity)
+    elif args.threshold_mode == "precision":
+        thr = threshold_for_precision(y_dev, prob_dev, args.target_precision)
+    elif args.threshold_mode == "balanced_acc":
+        thr = best_threshold_by_balanced_accuracy(y_dev, prob_dev)
+    else:
+        thr = best_threshold_by_f1(y_dev, prob_dev)
+
+    print(f"[THRESHOLD] mode={args.threshold_mode} "
+        f"target_spec={args.target_specificity} target_prec={args.target_precision} -> thr={thr:.4f}")
+
 
     prob_test = model.predict(test_ds, verbose=0).reshape(-1).astype(np.float32)
     y_test    = labels_all[idx_test]
