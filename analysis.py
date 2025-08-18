@@ -5,9 +5,12 @@ import joblib
 import argparse
 import numpy as np
 import pandas as pd
+import matplotlib
+matplotlib.use("Agg")  # чтобы скрипт работал в headless-окружениях
+import matplotlib.pyplot as plt
 from sklearn.inspection import permutation_importance
 
-from train import load_features_streaming, label_to_int
+from train import label_to_int
 
 # ==== утилиты ====
 
@@ -45,6 +48,34 @@ def save_importance_tables(out_dir, all_rows, by_joint, by_joint_axis, prefix="p
         .to_csv(os.path.join(out_dir, f"{prefix}_joints.csv"), index=False)
     pd.DataFrame([{"joint_axis": k, "importance": v} for k, v in by_joint_axis.items()]) \
         .to_csv(os.path.join(out_dir, f"{prefix}_joint_axes.csv"), index=False)
+
+
+def plot_top_joints_barh(by_joint, top_k, out_path, title="Top joints by importance", xlabel="Importance"):
+    """
+    Строит горизонтальный бар-чарт для топ-K суставов по значимости и сохраняет в PNG.
+    """
+    if not by_joint:
+        return
+    # сортируем по значимости по убыванию и берём топ-K
+    items = sorted(by_joint.items(), key=lambda x: x[1], reverse=True)[:top_k]
+    joints, vals = zip(*items)
+
+    plt.figure(figsize=(10, 6))
+    y_pos = np.arange(len(joints))
+    plt.barh(y_pos, vals)
+    plt.yticks(y_pos, joints)
+    plt.gca().invert_yaxis()  # самый важный сверху
+    plt.xlabel(xlabel)
+    plt.title(title)
+
+    # аннотации значений на концах баров
+    ax = plt.gca()
+    for i, v in enumerate(vals):
+        ax.text(v + (abs(max(vals)) * 0.01 if max(vals) != 0 else 0.01), i, f"{v:.4f}", va="center")
+
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close()
 
 
 # ==== основной код ====
@@ -96,10 +127,23 @@ def main(args):
     )
     importances_mean = pi.importances_mean
 
-    # сохраняем
+    # сохраняем таблицы
     all_rows = [{"feature": fn, "importance": float(im)} for fn, im in zip(feat_names, importances_mean)]
     by_joint, by_joint_axis = aggregate_importance_by_joint(feat_names, importances_mean)
     save_importance_tables(out_dir, all_rows, by_joint, by_joint_axis, prefix=prefix)
+
+    # график топ суставов
+    if args.plots:
+        os.makedirs(out_dir, exist_ok=True)
+        plot_path = os.path.join(out_dir, f"{prefix}_top{args.top_k_joints}_joints.png")
+        plot_top_joints_barh(
+            by_joint,
+            top_k=args.top_k_joints,
+            out_path=plot_path,
+            title=f"Top {args.top_k_joints} joints by importance ({motion_key})",
+            xlabel="Permutation importance (sum over features)",
+        )
+        print(f"Сохранён график: {plot_path}")
 
     print("\n=== Важность суставов (по убыванию) ===")
     for j, v in sorted(by_joint.items(), key=lambda x: x[1], reverse=True):
@@ -108,7 +152,7 @@ def main(args):
 
 def build_arg_parser():
     p = argparse.ArgumentParser(
-        description="Вычисление permutation importance для модели ходьбы/бега с агрегацией по суставам."
+        description="Вычисление permutation importance с агрегацией по суставам и построением бар-чартов."
     )
     # Основные переменные
     p.add_argument("--out-dir", type=str, default="outputs/rf", help="Каталог для модели и вывода результатов.")
@@ -132,8 +176,13 @@ def build_arg_parser():
     p.add_argument("--random-state", type=int, default=42, help="RandomState для воспроизводимости.")
     p.add_argument("--n-jobs", type=int, default=-1, help="Параллелизм в permutation_importance (-1 = все ядра).")
 
+    # Графики
+    p.add_argument("--top-k-joints", type=int, default=20, help="Сколько суставов показать на графике.")
+    p.add_argument("--no-plots", dest="plots", action="store_false", help="Отключить построение графиков.")
+    p.set_defaults(plots=True)
+
     # Прочее
-    p.add_argument("--prefix", type=str, default="perm", help="Префикс для CSV файлов с важностями.")
+    p.add_argument("--prefix", type=str, default="perm", help="Префикс для CSV и PNG файлов.")
     return p
 
 
