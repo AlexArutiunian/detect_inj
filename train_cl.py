@@ -3,7 +3,7 @@
 
 # ===================== detect_inj/train3.py =====================
 # Классика (RF/SVM/XGB) и нейросети (LSTM/TCN/и т.п.) для бинарной классификации.
-# ВАЖНО: TensorFlow подгружается ЛЕНИВО и ТОЛЬКО если выбрана нейросеточная модель.
+# Визуализации: confusion matrix, ROC, PR, F1(threshold), feature importance (+ HTML отчёт).
 
 import os
 import json
@@ -19,10 +19,16 @@ from sklearn.svm import SVC
 from xgboost import XGBClassifier
 from sklearn.metrics import (
     accuracy_score, f1_score, roc_auc_score,
-    classification_report, confusion_matrix
+    classification_report, confusion_matrix,
+    roc_curve, precision_recall_curve, average_precision_score
 )
 from sklearn.utils.class_weight import compute_class_weight
 import joblib
+
+# ---- Matplotlib (без GUI) ----
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 # ===================== УТИЛИТЫ =====================
 
@@ -46,7 +52,6 @@ def compute_metrics(y_true, y_pred, y_prob):
     }
 
 def best_threshold_by_f1(y_true, proba):
-    from sklearn.metrics import precision_recall_curve
     pr, rc, th = precision_recall_curve(y_true, proba)
     f1_vals = 2 * pr[:-1] * rc[:-1] / np.clip(pr[:-1] + rc[:-1], 1e-12, None)
     if len(f1_vals) == 0 or np.all(np.isnan(f1_vals)): return 0.5
@@ -201,7 +206,6 @@ def load_features_from_npy(csv_path, npy_dir, filename_col="filename", label_col
         y = label_to_int(row.get(label_col))
         if not fn or y is None: continue
         p = _map_to_npy_path(npy_dir, fn)
-        
         if os.path.exists(p): tasks.append((p, y, int(max(1, downsample))))
 
     results = []
@@ -501,6 +505,126 @@ def train_deep(name, train_seq, dev_seq, test_seq, class_weight, epochs, out_dir
     np.savez(os.path.join(out_dir, "norm_stats.npz"), max_len=input_shape[0])
     return dev_metrics, test_metrics, thr, model
 
+# ===================== VIZ / REPORT =====================
+
+CLASS_NAMES = ["No Injury (0)", "Injury (1)"]
+
+def _plot_confusion(cm, title, path):
+    cm = np.asarray(cm, dtype=np.int32)
+    cmn = cm / np.clip(cm.sum(axis=1, keepdims=True), 1, None)
+    fig, ax = plt.subplots(figsize=(4.5, 4))
+    im = ax.imshow(cmn, interpolation='nearest', cmap='Blues', vmin=0, vmax=1)
+    ax.set_title(title)
+    ax.set_xlabel('Predicted label'); ax.set_ylabel('True label')
+    ax.set_xticks([0,1]); ax.set_yticks([0,1])
+    ax.set_xticklabels(CLASS_NAMES, rotation=15, ha='right'); ax.set_yticklabels(CLASS_NAMES)
+    # подписи ячеек: counts + % 
+    for i in range(2):
+        for j in range(2):
+            ax.text(j, i, f"{cm[i,j]}\n{cmn[i,j]:.2f}", ha="center", va="center", fontsize=10,
+                    color="black")
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    fig.tight_layout()
+    fig.savefig(path, dpi=160)
+    plt.close(fig)
+
+def _plot_roc(y_true, y_prob, title, path):
+    if len(np.unique(y_true)) < 2:
+        return None
+    fpr, tpr, _ = roc_curve(y_true, y_prob)
+    auc_val = roc_auc_score(y_true, y_prob)
+    fig, ax = plt.subplots(figsize=(5,4))
+    ax.plot(fpr, tpr, label=f"AUC = {auc_val:.3f}")
+    ax.plot([0,1],[0,1], linestyle='--')
+    ax.set_xlim([0,1]); ax.set_ylim([0,1])
+    ax.set_xlabel("False Positive Rate"); ax.set_ylabel("True Positive Rate"); ax.set_title(title)
+    ax.legend(loc="lower right")
+    fig.tight_layout()
+    fig.savefig(path, dpi=160)
+    plt.close(fig)
+    return auc_val
+
+def _plot_pr(y_true, y_prob, title, path):
+    precision, recall, _ = precision_recall_curve(y_true, y_prob)
+    ap = average_precision_score(y_true, y_prob)
+    fig, ax = plt.subplots(figsize=(5,4))
+    ax.plot(recall, precision, label=f"AP = {ap:.3f}")
+    ax.set_xlim([0,1]); ax.set_ylim([0,1])
+    ax.set_xlabel("Recall"); ax.set_ylabel("Precision"); ax.set_title(title)
+    ax.legend(loc="lower left")
+    fig.tight_layout()
+    fig.savefig(path, dpi=160)
+    plt.close(fig)
+    return ap
+
+def _plot_f1_threshold(y_true, y_prob, best_thr, title, path):
+    pr, rc, th = precision_recall_curve(y_true, y_prob)
+    f1_vals = 2 * pr[:-1] * rc[:-1] / np.clip(pr[:-1] + rc[:-1], 1e-12, None)
+    th = np.asarray(th)
+    fig, ax = plt.subplots(figsize=(5.5,4))
+    ax.plot(th, f1_vals)
+    ax.axvline(best_thr, linestyle='--', label=f"best thr = {best_thr:.3f}")
+    ax.set_xlabel("Threshold"); ax.set_ylabel("F1"); ax.set_title(title); ax.legend()
+    fig.tight_layout()
+    fig.savefig(path, dpi=160)
+    plt.close(fig)
+
+def _plot_feature_importance(model, feature_names, topn, title, path):
+    if not hasattr(model, "feature_importances_"):
+        return False
+    imp = np.asarray(model.feature_importances_, dtype=float)
+    idx = np.argsort(-imp)[:topn]
+    names = [feature_names[i] for i in idx]
+    vals = imp[idx]
+    fig, ax = plt.subplots(figsize=(7, max(3, 0.25*len(idx)+1)))
+    ax.barh(range(len(idx)), vals)
+    ax.set_yticks(range(len(idx))); ax.set_yticklabels(names)
+    ax.invert_yaxis()
+    ax.set_xlabel("Importance"); ax.set_title(title)
+    fig.tight_layout()
+    fig.savefig(path, dpi=160)
+    plt.close(fig)
+    return True
+
+# имена фич для классики (если известна схема)
+_STAT_NAMES = ["mean","std","min","max","dmean","dstd"]
+_AXIS = ["x","y","z"]
+def classical_feature_names(schema_joints, d_dim):
+    if schema_joints:
+        names = []
+        for j in schema_joints:
+            for ax in _AXIS:
+                for st in _STAT_NAMES:
+                    names.append(f"{j}:{ax}:{st}")
+        return names
+    # фолбэк, если схемы нет
+    return [f"f_{i}" for i in range(d_dim)]
+
+def _write_html_report(out_dir, dev_metrics, test_metrics, images, thr):
+    html = []
+    html.append("<html><head><meta charset='utf-8'><title>Training Report</title></head><body>")
+    html.append("<h1>Training report</h1>")
+    html.append(f"<p><b>Best threshold (from DEV)</b>: {thr:.6f}</p>")
+    def sec(name, m):
+        html.append(f"<h2>{name}</h2>")
+        html.append("<ul>")
+        html.append(f"<li>accuracy: {m['accuracy']:.4f}</li>")
+        html.append(f"<li>f1: {m['f1']:.4f}</li>")
+        html.append(f"<li>roc_auc: {m['roc_auc']:.4f}</li>")
+        html.append("</ul>")
+    sec("DEV metrics", dev_metrics); sec("TEST metrics", test_metrics)
+    def img(title, key):
+        if key in images:
+            html.append(f"<h3>{title}</h3><img src='{os.path.basename(images[key])}' style='max-width:700px'>")
+    img("DEV: Confusion Matrix", "cm_dev")
+    img("DEV: ROC", "roc_dev"); img("DEV: Precision-Recall", "pr_dev"); img("DEV: F1 vs threshold", "f1_dev")
+    img("TEST: Confusion Matrix", "cm_test")
+    img("TEST: ROC", "roc_test"); img("TEST: Precision-Recall", "pr_test")
+    img("Feature Importance (top)", "fi")
+    html.append("</body></html>")
+    with open(os.path.join(out_dir, "report.html"), "w", encoding="utf-8") as f:
+        f.write("\n".join(html))
+
 # ===================== MAIN =====================
 
 if __name__ == "__main__":
@@ -523,6 +647,7 @@ if __name__ == "__main__":
     parser.add_argument("--max_len", type=str, default="auto", help="'auto' (95-перцентиль по train) или число для NN")
     parser.add_argument("--loader_workers", type=int, default=0, help="воркеры для извлечения фич / датасетов")
     parser.add_argument("--downsample", type=int, default=1, help="шаг по времени для ускорения (>=1)")
+    parser.add_argument("--top_features", type=int, default=30, help="сколько лучших фич показывать на графике важности (RF/XGB)")
     args = parser.parse_args()
 
     # joints schema
@@ -589,6 +714,32 @@ if __name__ == "__main__":
         )
 
         joblib.dump({"model": model, "scaler": scaler}, os.path.join(out_dir, "model.joblib"))
+
+        # ---- Визуализации (классика) ----
+        prob_dev  = model.predict_proba(X_dev_feat)[:,1]
+        prob_test = model.predict_proba(X_test_feat)[:,1]
+        pred_dev  = (prob_dev  >= thr).astype(int)
+        pred_test = (prob_test >= thr).astype(int)
+
+        images = {}
+        # Confusion matrices
+        _plot_confusion(np.array(dev_metrics["confusion_matrix"]),  "DEV Confusion Matrix",  os.path.join(out_dir, "cm_dev.png"));  images["cm_dev"]  = os.path.join(out_dir, "cm_dev.png")
+        _plot_confusion(np.array(test_metrics["confusion_matrix"]), "TEST Confusion Matrix", os.path.join(out_dir, "cm_test.png")); images["cm_test"] = os.path.join(out_dir, "cm_test.png")
+        # ROC/PR/F1
+        if len(np.unique(y_dev)) == 2:
+            _plot_roc(y_dev, prob_dev,  "DEV ROC",  os.path.join(out_dir, "roc_dev.png"));  images["roc_dev"]  = os.path.join(out_dir, "roc_dev.png")
+            _plot_pr(y_dev,  prob_dev,  "DEV PR",   os.path.join(out_dir, "pr_dev.png"));   images["pr_dev"]   = os.path.join(out_dir, "pr_dev.png")
+            _plot_f1_threshold(y_dev, prob_dev, thr, "DEV F1 vs threshold", os.path.join(out_dir, "f1_dev.png")); images["f1_dev"] = os.path.join(out_dir, "f1_dev.png")
+        if len(np.unique(y_test)) == 2:
+            _plot_roc(y_test, prob_test, "TEST ROC", os.path.join(out_dir, "roc_test.png")); images["roc_test"] = os.path.join(out_dir, "roc_test.png")
+            _plot_pr(y_test,  prob_test, "TEST PR",  os.path.join(out_dir, "pr_test.png"));  images["pr_test"]  = os.path.join(out_dir, "pr_test.png")
+
+        # Feature importance (RF/XGB)
+        feat_names = classical_feature_names(schema_joints, X_train_feat.shape[1])
+        if _plot_feature_importance(model, feat_names, args.top_features, "Feature Importance (top)", os.path.join(out_dir, "feature_importance_top.png")):
+            images["fi"] = os.path.join(out_dir, "feature_importance_top.png")
+
+        _write_html_report(out_dir, dev_metrics, test_metrics, images, thr)
 
     # ========= ВЕТКА НЕЙРОСЕТЕЙ =========
     else:
@@ -702,7 +853,6 @@ if __name__ == "__main__":
             dev_seq   = NpySeq([items[i] for i in idx_dev],   max_len, args.batch_size, shuffle=False, downsample=args.downsample)
             test_seq  = NpySeq([items[i] for i in idx_test],  max_len, args.batch_size, shuffle=False, downsample=args.downsample)
         else:
-            # JSON
             train_seq = JsonSeq([items[i] for i in idx_train], args.motion_key, schema_joints, max_len, args.batch_size, shuffle=True,  downsample=args.downsample)
             dev_seq   = JsonSeq([items[i] for i in idx_dev],   args.motion_key, schema_joints, max_len, args.batch_size, shuffle=False, downsample=args.downsample)
             test_seq  = JsonSeq([items[i] for i in idx_test],  args.motion_key, schema_joints, max_len, args.batch_size, shuffle=False, downsample=args.downsample)
@@ -723,12 +873,38 @@ if __name__ == "__main__":
             args.model, train_seq, dev_seq, test_seq, class_weight, args.epochs, out_dir, input_shape
         )
 
+        # ---- Визуализации (нейросеть) ----
+        # Снова соберём предсказания для графиков
+        def _collect(seq):
+            ys, ps = [], []
+            for Xb, yb in seq:
+                if len(Xb) == 0: continue
+                pb = model.predict(Xb, verbose=0).flatten()
+                ys.append(yb); ps.append(pb)
+            return (np.concatenate(ys), np.concatenate(ps)) if ys else (np.array([]), np.array([]))
+
+        y_dev,  prob_dev  = _collect(dev_seq)
+        y_test, prob_test = _collect(test_seq)
+
+        images = {}
+        _plot_confusion(np.array(dev_metrics["confusion_matrix"]),  "DEV Confusion Matrix",  os.path.join(out_dir, "cm_dev.png"));  images["cm_dev"]  = os.path.join(out_dir, "cm_dev.png")
+        _plot_confusion(np.array(test_metrics["confusion_matrix"]), "TEST Confusion Matrix", os.path.join(out_dir, "cm_test.png")); images["cm_test"] = os.path.join(out_dir, "cm_test.png")
+        if y_dev.size:
+            _plot_roc(y_dev, prob_dev,  "DEV ROC",  os.path.join(out_dir, "roc_dev.png"));  images["roc_dev"]  = os.path.join(out_dir, "roc_dev.png")
+            _plot_pr(y_dev,  prob_dev,  "DEV PR",   os.path.join(out_dir, "pr_dev.png"));   images["pr_dev"]   = os.path.join(out_dir, "pr_dev.png")
+            _plot_f1_threshold(y_dev, prob_dev, thr, "DEV F1 vs threshold", os.path.join(out_dir, "f1_dev.png")); images["f1_dev"] = os.path.join(out_dir, "f1_dev.png")
+        if y_test.size:
+            _plot_roc(y_test, prob_test, "TEST ROC", os.path.join(out_dir, "roc_test.png")); images["roc_test"] = os.path.join(out_dir, "roc_test.png")
+            _plot_pr(y_test,  prob_test, "TEST PR",  os.path.join(out_dir, "pr_test.png"));  images["pr_test"]  = os.path.join(out_dir, "pr_test.png")
+
+        _write_html_report(out_dir, dev_metrics, test_metrics, images, thr)
+
         # сохраним схему для predict (если есть)
         if schema_joints is not None:
             with open(os.path.join(out_dir, "schema_joints.json"), "w", encoding="utf-8") as f:
                 json.dump(schema_joints, f, ensure_ascii=False, indent=2)
 
-    # ===== Сохранение отчётов =====
+    # ===== Сохранение отчётов (текст/JSON) =====
     print("\n=== DEV METRICS (threshold tuned here) ===")
     for k in ["accuracy", "f1", "roc_auc", "confusion_matrix"]:
         print(f"{k}: {dev_metrics[k]}")
@@ -745,3 +921,4 @@ if __name__ == "__main__":
         json.dump(test_metrics, f, ensure_ascii=False, indent=2)
 
     print(f"\nSaved to: {out_dir}")
+    print(f"Report: {os.path.join(out_dir, 'report.html')}")
