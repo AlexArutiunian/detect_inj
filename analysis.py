@@ -1,241 +1,203 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+
+"""
+top_joints_from_model.py
+Агрегация важностей по суставам для классических моделей (RF/XGB),
+натренированных на фичах из train3.py (6 статистик × 3 оси × |joints|),
++ построение горизонтальной диаграммы важностей (показывается в ячейке и сохраняется как PNG).
+
+Пример:
+    python top_joints_from_model.py \
+        --npy_dir /path/to/npy \
+        --model_joblib /path/to/outputs/rf/model.joblib \
+        --topn 15 \
+        --topn_plot 20 \
+        --plot_path top_joints.png \
+        --save_csv top_joints.csv
+"""
 
 import os
 import json
 import argparse
-import joblib
 import numpy as np
+import joblib
 import pandas as pd
-
-# Matplotlib (headless)
-import matplotlib
-matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from sklearn.inspection import permutation_importance
-from sklearn.model_selection import train_test_split
+# --- Встроенная схема суставов (можно заменить через --schema_json)
+DEFAULT_JOINTS = [
+  "L_foot_1","L_foot_2","L_foot_3","L_foot_4",
+  "L_shank_1","L_shank_2","L_shank_3","L_shank_4",
+  "L_thigh_1","L_thigh_2","L_thigh_3","L_thigh_4",
+  "R_foot_1","R_foot_2","R_foot_3","R_foot_4",
+  "R_shank_1","R_shank_2","R_shank_3","R_shank_4",
+  "R_thigh_1","R_thigh_2","R_thigh_3","R_thigh_4",
+  "pelvis_1","pelvis_2","pelvis_3","pelvis_4"
+]
 
-# ВАЖНО: функция загрузки фич из NPY из вашего проекта
-# должна иметь сигнатуру: load_features_from_npy(csv_path, npy_dir, filename_col, label_col, downsample, workers)
-from train_cl import load_features_from_npy
+STAT_NAMES = ["mean","std","min","max","dmean","dstd"]  # как в train3.py
+AXES = ["x","y","z"]                                   # 3 координаты
+FEATS_PER_JOINT = len(STAT_NAMES) * len(AXES)          # 6*3 = 18
 
+def load_joints(schema_json: str | None):
+    if schema_json and os.path.exists(schema_json):
+        with open(schema_json, "r", encoding="utf-8") as f:
+            return list(json.load(f))
+    return list(DEFAULT_JOINTS)
 
-# ===================== УТИЛИТЫ =====================
+def find_first_npy(npy_dir: str):
+    for root, _, files in os.walk(npy_dir):
+        for fn in files:
+            if fn.lower().endswith(".npy"):
+                return os.path.join(root, fn)
+    return None
 
-def ensure_dir(p: str) -> None:
-    os.makedirs(p, exist_ok=True)
+def load_model(model_path: str):
+    obj = joblib.load(model_path)
+    if isinstance(obj, dict) and "model" in obj:
+        return obj["model"]
+    return obj
 
-
-def classical_feature_names(schema_joints):
-    """
-    Имена признаков в порядке, совпадающем с _features_from_seq в train3:
-    concat по статистикам [mean, std, min, max, dmean, dstd] поверх осей x,y,z и суставов.
-    Итог: 6 * (3 * |joints|) признаков.
-    """
-    stats = ["mean", "std", "min", "max", "dmean", "dstd"]
-    axes = ["x", "y", "z"]
-    feats = []
-    for st in stats:                 # порядок по статистикам
-        for j in schema_joints:      # затем по суставам
-            for ax in axes:          # затем по осям
-                feats.append(f"{st}_{ax}_{j}")
-    return feats
-
-
-def aggregate_importance_by_joint(feat_names, importances):
-    by_joint = {}
-    by_joint_axis = {}
-    for fn, im in zip(feat_names, importances):
-        parts = fn.split("_")
-        # "stat_axis_joint(with_underscores_inside)"
-        stat, axis, joint = parts[0], parts[1], "_".join(parts[2:])
-        by_joint[joint] = by_joint.get(joint, 0.0) + float(im)
-        key = f"{joint}_{axis}"
-        by_joint_axis[key] = by_joint_axis.get(key, 0.0) + float(im)
-    return by_joint, by_joint_axis
-
-
-def save_importance_tables(out_dir, all_rows, by_joint, by_joint_axis, prefix="perm"):
-    ensure_dir(out_dir)
-    pd.DataFrame(all_rows).to_csv(os.path.join(out_dir, f"{prefix}_features.csv"), index=False)
-    pd.DataFrame([{"joint": k, "importance": v} for k, v in by_joint.items()]) \
-        .to_csv(os.path.join(out_dir, f"{prefix}_joints.csv"), index=False)
-    pd.DataFrame([{"joint_axis": k, "importance": v} for k, v in by_joint_axis.items()]) \
-        .to_csv(os.path.join(out_dir, f"{prefix}_joint_axes.csv"), index=False)
-
-
-def plot_top_barh(items, out_path, title, xlabel):
-    if not items:
-        return
-    labels, vals = zip(*items)
-    plt.figure(figsize=(10, max(3, 0.4 * len(labels))))
-    y = np.arange(len(labels))
-    plt.barh(y, vals)
-    plt.yticks(y, labels)
-    plt.gca().invert_yaxis()
-    plt.xlabel(xlabel)
-    plt.title(title)
-    ax = plt.gca()
-    vmax = max(abs(float(v)) for v in vals) if vals else 0.0
-    offs = (vmax * 0.01) if vmax > 0 else 0.01
-    for i, v in enumerate(vals):
-        ax.text(float(v) + offs, i, f"{float(v):.4f}", va="center")
-    plt.tight_layout()
-    plt.savefig(out_path, dpi=200, bbox_inches="tight")
-    plt.close()
-
-
-def stratified_subsample(X, y, max_samples, random_state=42):
-    """Быстрая стратифицированная подвыборка для ускорения permutation_importance."""
-    n = X.shape[0]
-    if max_samples is None or max_samples <= 0 or max_samples >= n:
-        return X, y
-    test_size = 1.0 - float(max_samples) / float(n)
-    if test_size <= 0:
-        return X, y
-    _, X_sub, _, y_sub = train_test_split(
-        X, y, test_size=max(0.0001, test_size), random_state=random_state, stratify=y
-    )
-    return X_sub, y_sub
-
-
-# ===================== ОСНОВНОЙ КОД =====================
-
-def main(args):
-    out_dir = args.out_dir
-    prefix = args.prefix
-
-    # Пути к модели и схеме
-    model_path = args.model_path or os.path.join(out_dir, "model.joblib")
-    schema_path = args.schema_path or os.path.join(out_dir, "schema_joints.json")
-
-    # Загрузим модель и нормировщик
-    bundle = joblib.load(model_path)
-    model = bundle["model"]
-    scaler = bundle["scaler"]
-
-    # Схема суставов (список строк в нужном порядке)
-    with open(schema_path, "r", encoding="utf-8") as f:
-        schema_joints = json.load(f)
-
-    # Загрузим фичи из NPY по CSV-индексу
-    X_all, y_all = load_features_from_npy(
-        args.csv_path,
-        args.data_dir,
-        filename_col=args.filename_col,
-        label_col=args.label_col,
-        downsample=args.downsample,
-        workers=args.workers,
-    )
-
-    # Нормализация как при обучении
-    X_all = scaler.transform(X_all)
-
-    # Подвыборка для ускорения (опционально)
-    if args.max_samples and args.max_samples > 0:
-        X_all, y_all = stratified_subsample(X_all, y_all, args.max_samples, args.random_state)
-        print(f"[subsample] using {X_all.shape[0]} samples")
-
-    # Имена фич и sanity-check
-    feat_names = classical_feature_names(schema_joints)
-    if len(feat_names) != X_all.shape[1]:
+def get_importances(model):
+    imp = getattr(model, "feature_importances_", None)
+    if imp is None:
         raise RuntimeError(
-            f"Несовпадение размерностей: feature_names={len(feat_names)} vs X_all.shape[1]={X_all.shape[1]}.\n"
-            f"Проверь порядок статистик/осей и schema_joints."
+            "У модели нет feature_importances_. "
+            "Нужен RandomForest/XGBoost, обученный на классических фичах."
+        )
+    return np.asarray(imp, dtype=float)
+
+def sanity_check_with_npy(npy_dir: str, joints: list[str], verbose: bool=True):
+    sample = find_first_npy(npy_dir)
+    if not sample:
+        if verbose:
+            print("[WARN] В папке npy не найдено .npy — пропускаю проверку формы.")
+        return
+    try:
+        arr = np.load(sample, allow_pickle=False, mmap_mode="r")
+        if arr.ndim != 2 or arr.shape[0] < 2:
+            print(f"[WARN] '{sample}' имеет форму {arr.shape}, ожидалась (T, F) с T>=2.")
+        else:
+            F_seq = arr.shape[1]
+            expect_coords = 3 * len(joints)
+            if F_seq % 3 != 0:
+                print(f"[WARN] Число признаков в последовательности = {F_seq}, не кратно 3.")
+            if F_seq != expect_coords:
+                print(f"[INFO] В последовательности на кадр F={F_seq}, ожидалось 3*|joints|={expect_coords}. "
+                      "Это не критично для агрегации важностей, но проверьте соответствие схемы.")
+    except Exception as e:
+        print(f"[WARN] Не удалось открыть NPY для проверки: {e}")
+
+def build_feature_name_map(joints: list[str]):
+    names = []
+    for j in joints:
+        for ax in AXES:
+            for st in STAT_NAMES:
+                names.append(f"{j}:{ax}:{st}")
+    return names
+
+def aggregate_joint_importance(importances: np.ndarray, joints: list[str]) -> pd.DataFrame:
+    expected = FEATS_PER_JOINT * len(joints)
+    if importances.size != expected:
+        raise ValueError(
+            f"Длина importances = {importances.size}, а по схеме ожидается {expected} "
+            f"(18 признаков × {len(joints)} суставов). Проверьте, что модель обучалась "
+            "на классических фичах из train3.py и схема совпадает."
+        )
+    joint_scores = []
+    for j_idx, jname in enumerate(joints):
+        start = j_idx * FEATS_PER_JOINT
+        end = start + FEATS_PER_JOINT
+        score = float(np.sum(importances[start:end]))
+        joint_scores.append((jname, score))
+    df = pd.DataFrame(joint_scores, columns=["joint", "importance_sum"])
+    tot = df["importance_sum"].sum()
+    df["importance_norm"] = df["importance_sum"] / tot if tot > 0 else 0.0
+    return df.sort_values("importance_sum", ascending=False).reset_index(drop=True)
+
+def plot_joint_importance(df: pd.DataFrame, topn: int, title: str, plot_path: str, show: bool=True, dpi: int=160):
+    """
+    Строит горизонтальную диаграмму для topn суставов.
+    Показывает в ячейке (если show=True) и сохраняет в PNG.
+    """
+    top = df.head(max(1, int(topn))).copy()
+    # для красивого порядка сверху-вниз
+    top = top.iloc[::-1]
+
+    h = max(3.5, 0.4 * len(top))  # динамическая высота
+    plt.figure(figsize=(8, h))
+    plt.barh(top["joint"], top["importance_sum"])
+    plt.xlabel("Importance (sum of 18 features)")
+    plt.title(title)
+    # подписи значений справа от баров
+    for i, v in enumerate(top["importance_sum"]):
+        plt.text(v, i, f" {v:.4f}", va="center")
+    plt.tight_layout()
+    plt.savefig(plot_path, dpi=dpi)
+    if show:
+        plt.show()
+    plt.close()
+    print(f"[OK] Диаграмма сохранена: {plot_path}")
+
+def main():
+    ap = argparse.ArgumentParser(description="Вывод топ-значимых суставов и построение диаграммы важностей.")
+    ap.add_argument("--npy_dir", required=True, help="Папка с *.npy (для быстрой проверки формы).")
+    ap.add_argument("--model_joblib", required=True, help="Путь к model.joblib (RF/XGB, обученная на классических фичах).")
+    ap.add_argument("--schema_json", default="", help="JSON со списком суставов (если не задан — встроенный список).")
+    ap.add_argument("--topn", type=int, default=15, help="Сколько суставов показать текстом.")
+    ap.add_argument("--save_csv", default="", help="Куда сохранить CSV с важностями (опционально).")
+
+    # Параметры графика
+    ap.add_argument("--topn_plot", type=int, default=20, help="Сколько верхних суставов рисовать на диаграмме.")
+    ap.add_argument("--plot_path", default="top_joints_importance.png", help="Куда сохранить PNG диаграммы.")
+    ap.add_argument("--title", default="Joint Importance (sum over 18 features per joint)", help="Заголовок диаграммы.")
+    ap.add_argument("--no_show", action="store_true", help="Не показывать график в ячейке/окне, только сохранить.")
+
+    args = ap.parse_args()
+
+    joints = load_joints(args.schema_json)
+    print(f"[INFO] Суставов в схеме: {len(joints)} (ожидается, что в модели фич = 18×|joints| = {FEATS_PER_JOINT*len(joints)})")
+
+    # Быстрая проверка формата одного npy (не влияет на вычисление важностей, лишь sanity-check)
+    sanity_check_with_npy(args.npy_dir, joints, verbose=True)
+
+    # Модель и её важности
+    model = load_model(args.model_joblib)
+    importances = get_importances(model)
+
+    # Карта имён фич (проверка размерности)
+    feat_names = build_feature_name_map(joints)
+    if len(feat_names) != importances.size:
+        raise ValueError(
+            f"Размерности не совпадают: len(feat_names)={len(feat_names)} "
+            f"vs len(importances)={importances.size}. Проверьте схему суставов."
         )
 
-    # Permutation importance
-    pi = permutation_importance(
-        model,
-        X_all,
-        y_all,
-        n_repeats=args.n_repeats,
-        random_state=args.random_state,
-        n_jobs=args.n_jobs,
-        scoring=args.scoring  # может быть None -> estimator.score
+    # Агрегация до суставов
+    df = aggregate_joint_importance(importances, joints)
+
+    # Текстовый вывод TOP-N
+    topn = max(1, int(args.topn))
+    print("\n=== TOP суставов (сумма важностей по 18 фичам каждого сустава) ===")
+    for i, row in df.head(topn).iterrows():
+        print(f"{i+1:2d}. {row['joint']:>12s}  importance_sum={row['importance_sum']:.6f}  "
+              f"(norm={row['importance_norm']:.4f})")
+
+    # Сохранить CSV (опционально)
+    if args.save_csv:
+        df.to_csv(args.save_csv, index=False)
+        print(f"[OK] Сохранено: {args.save_csv}")
+
+    # Диаграмма (показываем в ячейке и сохраняем)
+    plot_joint_importance(
+        df=df,
+        topn=args.topn_plot,
+        title=args.title,
+        plot_path=args.plot_path,
+        show=not args.no_show,
+        dpi=160
     )
-    importances_mean = pi.importances_mean.astype(float)
-
-    # Сохраним таблички
-    all_rows = [{"feature": fn, "importance": float(im)} for fn, im in zip(feat_names, importances_mean)]
-    by_joint, by_joint_axis = aggregate_importance_by_joint(feat_names, importances_mean)
-    save_importance_tables(out_dir, all_rows, by_joint, by_joint_axis, prefix=prefix)
-
-    # Топы и графики
-    topJ = sorted(by_joint.items(), key=lambda x: x[1], reverse=True)[:args.top_k_joints]
-    if args.plots and topJ:
-        plot_path = os.path.join(out_dir, f"{prefix}_top{args.top_k_joints}_joints.png")
-        plot_top_barh(
-            topJ,
-            out_path=plot_path,
-            title=f"Top {len(topJ)} joints by importance",
-            xlabel="Permutation importance (sum over features)"
-        )
-        print(f"Saved: {plot_path}")
-
-    if args.plots and args.plot_joint_axes:
-        topJA = sorted(by_joint_axis.items(), key=lambda x: x[1], reverse=True)[:args.top_k_joint_axes]
-        if topJA:
-            plot_path2 = os.path.join(out_dir, f"{prefix}_top{len(topJA)}_joint_axes.png")
-            plot_top_barh(
-                topJA,
-                out_path=plot_path2,
-                title=f"Top {len(topJA)} joint-axes by importance",
-                xlabel="Permutation importance"
-            )
-            print(f"Saved: {plot_path2}")
-
-    # Печать топа в stdout
-    print("\n=== Топ суставов по значимости ===")
-    for j, v in sorted(by_joint.items(), key=lambda x: x[1], reverse=True)[:args.top_k_joints]:
-        print(f"{j:25s} {v:.6f}")
-
-    if args.verbose_full:
-        print("\n=== Полный список суставов (по убыванию) ===")
-        for j, v in sorted(by_joint.items(), key=lambda x: x[1], reverse=True):
-            print(f"{j:25s} {v:.6f}")
-
-
-def build_arg_parser():
-    p = argparse.ArgumentParser(
-        description="Permutation importance: агрегирование по суставам (NPY-пайплайн) + бар-чарты."
-    )
-
-    # Источники данных
-    p.add_argument("--csv-path", type=str, required=True, help="CSV с индексом файлов и метками.")
-    p.add_argument("--data-dir", type=str, required=True, help="Папка с .npy последовательностями.")
-    p.add_argument("--filename-col", type=str, default="filename", help="Имя столбца с путями/именами файлов.")
-    p.add_argument("--label-col", type=str, default="No inj/ inj", help="Имя столбца с метками.")
-    p.add_argument("--downsample", type=int, default=1, help="Шаг по времени (>=1) при чтении NPY.")
-    p.add_argument("--workers", type=int, default=0, help="Воркеры при извлечении фич из NPY.")
-
-    # Модель и схема
-    p.add_argument("--out-dir", type=str, required=True, help="Директория эксперимента (где лежит model.joblib).")
-    p.add_argument("--model-path", type=str, default=None, help="Путь к model.joblib (по умолчанию OUT_DIR/model.joblib).")
-    p.add_argument("--schema-path", type=str, default=None, help="Путь к schema_joints.json (по умолчанию OUT_DIR/schema_joints.json).")
-
-    # Permutation importance
-    p.add_argument("--n-repeats", type=int, default=10, help="Повторов перемешивания на признак.")
-    p.add_argument("--random-state", type=int, default=42, help="Сид случайности.")
-    p.add_argument("--n-jobs", type=int, default=-1, help="Параллелизм (-1 = все ядра).")
-    p.add_argument("--scoring", type=str, default=None,
-                   help="Скора для permutation_importance (например, 'roc_auc'). По умолчанию estimator.score.")
-    p.add_argument("--max-samples", type=int, default=0,
-                   help="Ограничить число объектов для ускорения (0 = использовать все).")
-
-    # Вывод/графики
-    p.add_argument("--prefix", type=str, default="perm", help="Префикс имен файлов (CSV/PNG).")
-    p.add_argument("--top-k-joints", type=int, default=20, help="Сколько суставов рисовать/печатать в топе.")
-    p.add_argument("--plot-joint-axes", action="store_true", help="Строить доп. график по joint+axis.")
-    p.add_argument("--top-k-joint-axes", type=int, default=30, help="Топ по joint+axis для графика.")
-    p.add_argument("--no-plots", dest="plots", action="store_false", help="Отключить построение графиков.")
-    p.add_argument("--verbose-full", action="store_true", help="Печатать полный список суставов в stdout.")
-    p.set_defaults(plots=True)
-
-    return p
-
 
 if __name__ == "__main__":
-    args = build_arg_parser().parse_args()
-    main(args)
+    main()
