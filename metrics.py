@@ -5,7 +5,27 @@ import os
 import cv2
 import numpy as np
 import argparse
-from google.colab.patches import cv2_imshow
+
+def show_image(img):
+    """Try google.colab.patches.cv2_imshow; fallback to matplotlib if it fails."""
+    try:
+        from google.colab.patches import cv2_imshow  # may not exist outside Colab
+        try:
+            cv2_imshow(img)
+            return
+        except Exception:
+            pass  # fall through to matplotlib
+    except Exception:
+        pass
+
+    # Fallback: matplotlib (works everywhere)
+    try:
+        import matplotlib.pyplot as plt
+        plt.imshow(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+        plt.axis("off")
+        plt.show()
+    except Exception as e:
+        print(f"[WARN] Failed to display image: {e}")
 
 def main():
     parser = argparse.ArgumentParser(description="Build 2x2 collage from metrics images.")
@@ -16,6 +36,10 @@ def main():
     parser.add_argument(
         "--output", type=str, default="collage_2x2.png",
         help="Where to save the collage (default: collage_2x2.png)"
+    )
+    parser.add_argument(
+        "--no_show", action="store_true",
+        help="Do not display the collage, only save to file."
     )
     args = parser.parse_args()
 
@@ -33,6 +57,7 @@ def main():
         img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
         if img is None:
             raise FileNotFoundError(f"Cannot open file: {path}")
+        # normalize to 3-channel BGR
         if img.ndim == 2:
             img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
         elif img.shape[2] == 4:
@@ -58,11 +83,14 @@ def main():
             collage[y:y+h_min, x:x+w_min] = resized[idx]
             idx += 1
 
-    # Show (for Colab)
-    cv2_imshow(collage)
+    # Show
+    if not args.no_show:
+        show_image(collage)
 
     # Save
-    cv2.imwrite(args.output, collage)
+    ok = cv2.imwrite(args.output, collage)
+    if not ok:
+        raise RuntimeError(f"Failed to save collage to {args.output}")
     print(f"[OK] Collage saved to {args.output}")
 
 if __name__ == "__main__":
