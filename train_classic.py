@@ -17,6 +17,18 @@ from sklearn.metrics import (
 from sklearn.utils.class_weight import compute_class_weight
 import joblib
 
+# ===================== Фиксированная схема суставов =====================
+DEFAULT_SCHEMA_JOINTS = [
+  "L_foot_1","L_foot_2","L_foot_3","L_foot_4",
+  "L_shank_1","L_shank_2","L_shank_3","L_shank_4",
+  "L_thigh_1","L_thigh_2","L_thigh_3","L_thigh_4",
+  "R_foot_1","R_foot_2","R_foot_3","R_foot_4",
+  "R_shank_1","R_shank_2","R_shank_3","R_shank_4",
+  "R_thigh_1","R_thigh_2","R_thigh_3","R_thigh_4",
+  "pelvis_1","pelvis_2","pelvis_3","pelvis_4"
+]
+_JOINTS_DIM = len(DEFAULT_SCHEMA_JOINTS)  # 28
+_AXIS_DIM = 3
 
 # Имена фич для классики: 3 оси * 6 статистик на каждый сустав
 _STAT_NAMES = ["mean","std","min","max","dmean","dstd"]
@@ -28,24 +40,18 @@ def classical_feature_names(schema_joints):
         for ax in _AXIS:
             for st in _STAT_NAMES:
                 names.append(f"{j}:{ax}:{st}")
-    return names  # порядок совпадает с features_from_sequence()
+    return names
 
-
-# ===================== Метки =====================
+# ===================== Метки/утилиты =====================
 
 def label_to_int(v):
     """Ровно две метки: 'Injury' -> 1, 'No Injury' -> 0."""
     if v is None:
         return None
     s = str(v).strip().lower()
-    if s == "injury":
-        return 1
-    if s == "no injury":
-        return 0
+    if s == "injury": return 1
+    if s == "no injury": return 0
     return None
-
-
-# ===================== Метрики/утилиты =====================
 
 def compute_metrics(y_true, y_pred, y_prob):
     out = {
@@ -57,118 +63,102 @@ def compute_metrics(y_true, y_pred, y_prob):
     }
     return out
 
-def ensure_dir(p):
-    os.makedirs(p, exist_ok=True)
+def ensure_dir(p): os.makedirs(p, exist_ok=True)
 
 def best_threshold_by_f1(y_true, proba):
-    """Подбор порога по максимуму F1 на dev."""
     pr, rc, th = precision_recall_curve(y_true, proba)  # n+1, n+1, n
     f1_vals = 2 * pr[:-1] * rc[:-1] / np.clip(pr[:-1] + rc[:-1], 1e-12, None)
-    if len(f1_vals) == 0 or np.all(np.isnan(f1_vals)):
-        return 0.5
+    if len(f1_vals) == 0 or np.all(np.isnan(f1_vals)): return 0.5
     best_idx = int(np.nanargmax(f1_vals))
     return float(th[max(0, min(best_idx, len(th) - 1))])
 
+# ===================== Загрузка NPY (без JSON) =====================
 
-# ===================== Низкоуровневые загрузчики =====================
+def _resolve_npy_path(data_dir, fn):
+    """Ищем .npy: как есть, иначе добавляем .npy."""
+    p = os.path.join(data_dir, fn)
+    if os.path.exists(p) and p.endswith(".npy"):
+        return p
+    if not p.endswith(".npy"):
+        p2 = p + ".npy"
+        if os.path.exists(p2):
+            return p2
+    return p if os.path.exists(p) else None
 
-def _safe_json_load(path):
-    """Быстрый json.load: пробуем orjson (если установлен)."""
-    try:
-        import orjson
-        with open(path, "rb") as f:
-            return orjson.loads(f.read())
-    except Exception:
-        with open(path, "r") as f:
-            return json.load(f)
+def _load_npy(path):
+    """Грузит .npy. Поддерживает dict (object) или ndarray."""
+    arr = np.load(path, allow_pickle=True)
+    if isinstance(arr, np.ndarray) and arr.dtype == object:
+        try:
+            arr = arr.item()
+        except Exception:
+            pass
+    return arr
 
 def _stack_motion_frames_with_schema(md, schema_joints):
     """
-    Из dict суставов -> (T, 3*|schema|) с заполнением отсутствующих суставов NaN.
-    T = min длина по присутствующим суставам; если ни одного — None.
+    Поддерживает:
+      1) md: dict[joint] -> (T,3)
+      2) md: ndarray (T, J, 3) или (T, 3*J) с J == len(schema_joints)
+    Возвращает (T, 3*|schema|).
     """
-    present = [j for j in schema_joints if j in md]
-    if not present:
+    # dict: ожидаем ключи из schema_joints
+    if isinstance(md, dict):
+        present = [j for j in schema_joints if j in md]
+        if not present: return None
+        T = min(len(md[j]) for j in present)
+        if T <= 1: return None
+        cols = []
+        for j in schema_joints:
+            if j in md:
+                arr = np.asarray(md[j], dtype=np.float32)[:T]
+                if arr.ndim != 2 or arr.shape[1] != _AXIS_DIM:
+                    raise ValueError(f"{j}: ожидалось (T,3), получено {arr.shape}")
+            else:
+                arr = np.full((T, _AXIS_DIM), np.nan, dtype=np.float32)
+            cols.append(arr)
+        return np.concatenate(cols, axis=1)
+
+    # ndarray
+    arr = np.asarray(md, dtype=np.float32)
+    if arr.ndim == 3:
+        T, J, C = arr.shape
+        if C != _AXIS_DIM:
+            raise ValueError(f"Ожидалось C=3, получено {C} в массиве {arr.shape}")
+        if J != len(schema_joints):
+            raise ValueError(f"Число суставов J={J} не совпадает со схемой ({len(schema_joints)}).")
+        return arr.reshape(T, J * _AXIS_DIM)
+    elif arr.ndim == 2:
+        if arr.shape[1] % _AXIS_DIM != 0:
+            raise ValueError(f"Вторая размерность должна делиться на 3, получено {arr.shape[1]}")
+        J = arr.shape[1] // _AXIS_DIM
+        if J != len(schema_joints):
+            raise ValueError(f"Число суставов J={J} не совпадает со схемой ({len(schema_joints)}).")
+        return arr
+    else:
         return None
-    T = min(len(md[j]) for j in present)
-    if T <= 1:
-        return None
-    cols = []
-    for j in schema_joints:
-        if j in md:
-            arr = np.asarray(md[j], dtype=np.float32)[:T]   # (T,3)
-        else:
-            arr = np.full((T, 3), np.nan, dtype=np.float32) # отсутствующий сустав
-        cols.append(arr)
-    X = np.concatenate(cols, axis=1)  # (T, 3*|schema|)
-    return X
 
-
-# ===================== Автодетект схемы суставов =====================
-
-def discover_joint_schema(csv_path, data_dir, motion_key,
-                          filename_col="filename", label_col="No inj/ inj",
-                          sample_max=500, freq_threshold=0.9, use_joints=None):
-    """
-    Возвращает упорядоченный список суставов (schema_joints).
-    - если задан use_joints -> возвращаем его как есть;
-    - иначе сканируем до sample_max файлов и берём суставы, встречающиеся в >= freq_threshold доле файлов.
-    """
-    if use_joints:
-        return list(use_joints)
-
-    meta = pd.read_csv(csv_path, usecols=[filename_col, label_col])
-    counts = {}
-    seen = 0
-    for _, row in meta.iterrows():
-        if seen >= sample_max:
-            break
-        fn = str(row[filename_col]).strip() if pd.notnull(row.get(filename_col)) else ""
-        y = label_to_int(row.get(label_col))
-        if not fn or y is None:
-            continue
-        p = os.path.join(data_dir, fn)
-        p = p.replace(".json", ".npy")
-        print(p)
-       
-        try:
-            data = _safe_json_load(p)
-            if motion_key not in data or not isinstance(data[motion_key], dict):
-                continue
-            joints = list(data[motion_key].keys())
-            for j in joints:
-                counts[j] = counts.get(j, 0) + 1
-            seen += 1
-        except Exception:
-            continue
-
-    if seen == 0:
-        raise RuntimeError("discover_joint_schema: не удалось прочитать ни одного файла.")
-
-    freq = {j: c / seen for j, c in counts.items()}
-    schema = [j for j, f in freq.items() if f >= freq_threshold]
-    if not schema:
-        schema = list(counts.keys())
-    schema = sorted(schema)
-    return schema
-
-
-# ===================== Стриминг фич для классики =====================
+# ===================== Стриминг фич для классики (NPY only) =====================
 
 def _feats_from_file(args):
-    json_path, y, motion_key, schema_joints = args
+    path, y, motion_key, schema_joints = args
     try:
-        data = _safe_json_load(json_path)
-        if motion_key not in data or not isinstance(data[motion_key], dict):
-            return None
-        md = data[motion_key]
+        obj = _load_npy(path)
+        # извлекаем "md" — либо dict с motion_key, либо сразу массив
+        if isinstance(obj, dict):
+            if motion_key not in obj: return None
+            md = obj[motion_key]
+        else:
+            md = obj
+
         seq = _stack_motion_frames_with_schema(md, schema_joints)
         if seq is None or seq.shape[0] < 2:
             return None
         seq = seq.astype(np.float32, copy=False)
         dif = np.diff(seq, axis=0)
         stat = np.concatenate([
-            np.nanmean(seq, axis=0), np.nanstd(seq, axis=0), np.nanmin(seq, axis=0), np.nanmax(seq, axis=0),
+            np.nanmean(seq, axis=0), np.nanstd(seq, axis=0),
+            np.nanmin(seq, axis=0), np.nanmax(seq, axis=0),
             np.nanmean(dif, axis=0), np.nanstd(dif, axis=0)
         ]).astype(np.float32, copy=False)
         stat = np.nan_to_num(stat, nan=0.0, posinf=0.0, neginf=0.0)
@@ -181,11 +171,9 @@ def load_features_streaming(csv_path, data_dir, motion_key="running",
                             use_joints=None, workers=0):
     """
     Возвращает X (n, d), y (n,) и schema_joints — фичи для классических моделей.
+    Используется фиксированная схема (или переданная через --use_joints).
     """
-    schema_joints = discover_joint_schema(
-        csv_path, data_dir, motion_key, filename_col, label_col,
-        sample_max=500, freq_threshold=0.9, use_joints=use_joints
-    )
+    schema_joints = list(use_joints) if use_joints else list(DEFAULT_SCHEMA_JOINTS)
     print(f"Feature schema joints ({len(schema_joints)}): "
           f"{', '.join(schema_joints[:8])}{' ...' if len(schema_joints) > 8 else ''}")
 
@@ -196,12 +184,8 @@ def load_features_streaming(csv_path, data_dir, motion_key="running",
         y = label_to_int(row.get(label_col))
         if not fn or y is None:
             continue
-        p = os.path.join(data_dir, fn)
-        if not os.path.exists(p) and not fn.endswith(".json"):
-            p2 = p + ".json"
-            if os.path.exists(p2):
-                p = p2
-        if os.path.exists(p):
+        p = _resolve_npy_path(data_dir, fn)
+        if p and os.path.exists(p):
             tasks.append((p, y, motion_key, schema_joints))
 
     results = []
@@ -219,11 +203,10 @@ def load_features_streaming(csv_path, data_dir, motion_key="running",
                 results.append(r)
 
     if not results:
-        raise RuntimeError("Не удалось получить ни одной строки фич.")
+        raise RuntimeError("Не удалось получить ни одной строки фич (проверь .npy файлы и motion_key).")
     X = np.stack([r[0] for r in results]).astype(np.float32, copy=False)
     y = np.array([r[1] for r in results], dtype=np.int32)
     return X, y, schema_joints
-
 
 # ===================== Обучение моделей (классика) =====================
 
@@ -233,8 +216,7 @@ def train_classical(X_train, X_dev, X_test, y_train, y_dev, y_test, model_type, 
     elif model_type == "svm":
         model = SVC(kernel="rbf", probability=True, class_weight="balanced", random_state=42)
     elif model_type == "xgb":
-        pos = int(np.sum(y_train == 1))
-        neg = int(np.sum(y_train == 0))
+        pos = int(np.sum(y_train == 1)); neg = int(np.sum(y_train == 0))
         spw = (neg / max(pos, 1)) if pos > 0 else 1.0
         model = XGBClassifier(
             n_estimators=600, max_depth=6, learning_rate=0.05,
@@ -263,33 +245,24 @@ def train_classical(X_train, X_dev, X_test, y_train, y_dev, y_test, model_type, 
 
     return dev_metrics, test_metrics, thr, model
 
-
 # ===================== Main =====================
 
 def print_split_stats(name, y):
-    n = len(y)
-    n1 = int(np.sum(y == 1))
-    n0 = n - n1
-    p1 = (n1 / n * 100) if n else 0.0
-    p0 = (n0 / n * 100) if n else 0.0
+    n = len(y); n1 = int(np.sum(y == 1)); n0 = n - n1
+    p1 = (n1 / n * 100) if n else 0.0; p0 = (n0 / n * 100) if n else 0.0
     print(f"[{name}] total={n} | Injury=1: {n1} ({p1:.1f}%) | No Injury=0: {n0} ({p0:.1f}%)")
 
-
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Binary injury classifier from 3D joint JSON sequences (70/10/20 split)")
-    parser.add_argument(
-        "--model", type=str,
-        choices=["rf","svm","xgb"],
-        required=True
-    )
+    parser = argparse.ArgumentParser(description="Binary injury classifier from NPY 3D joint sequences (70/10/20 split)")
+    parser.add_argument("--model", type=str, choices=["rf","svm","xgb"], required=True)
     parser.add_argument("--csv", type=str, required=True, help="Путь к CSV с метаданными")
-    parser.add_argument("--data_dir", type=str, required=True, help="Папка с JSON файлами")
-    parser.add_argument("--motion_key", type=str, default="running", help="running | walking")
+    parser.add_argument("--data_dir", type=str, required=True, help="Папка с .npy файлами")
+    parser.add_argument("--motion_key", type=str, default="running", help="ключ для dict внутри .npy, если используется")
     parser.add_argument("--filename_col", type=str, default="filename")
     parser.add_argument("--label_col", type=str, default="No inj/ inj")
-    parser.add_argument("--use_joints", type=str, default="", help="через запятую: pelvis_1,hip_r,... (пусто = авто-схема)")
+    parser.add_argument("--use_joints", type=str, default="", help="кастомная схема: имя1,имя2,... (по умолчанию фиксированная)")
     parser.add_argument("--out_dir", type=str, default="outputs", help="куда сохранять модель/метрики")
-    parser.add_argument("--loader_workers", type=int, default=0, help="кол-во процессов при извлечении фич (классика)")
+    parser.add_argument("--loader_workers", type=int, default=0, help="кол-во процессов при извлечении фич")
 
     args = parser.parse_args()
 
@@ -300,7 +273,7 @@ if __name__ == "__main__":
     out_dir = os.path.join(args.out_dir, args.model)
     ensure_dir(out_dir)
 
-    # ===== КЛАССИКА: стриминг фич + сохранение схемы суставов =====
+    # ===== Стриминг фич из .npy + сохранение схемы суставов =====
     X_all, y_all, schema_joints = load_features_streaming(
         args.csv, args.data_dir,
         motion_key=args.motion_key,
@@ -309,7 +282,6 @@ if __name__ == "__main__":
         use_joints=use_joints,
         workers=args.loader_workers
     )
-    # Сохраним схему для predict.py
     with open(os.path.join(out_dir, "schema_joints.json"), "w", encoding="utf-8") as f:
         json.dump(schema_joints, f, ensure_ascii=False, indent=2)
 
@@ -355,7 +327,6 @@ if __name__ == "__main__":
         print(f"{k}: {test_metrics[k]}")
     print("\nTest classification report:\n", test_metrics["report"])
 
-    # JSON-отчёты
     with open(os.path.join(out_dir, "metrics_dev.json"), "w", encoding="utf-8") as f:
         json.dump(dev_metrics, f, ensure_ascii=False, indent=2)
     with open(os.path.join(out_dir, "metrics_test.json"), "w", encoding="utf-8") as f:
