@@ -338,7 +338,6 @@ def main():
                     help="Печатать статус каждой строки при индексации")
     ap.add_argument("--peek", type=int, default=0,
                     help="Показать N успешно сопоставленных путей (форма массива)")
-    args = ap.parse_args()
     
     ap.add_argument("--threshold_mode", choices=["f1", "balanced_acc", "specificity", "precision"],
                 default="specificity", help="как подбирать порог на DEV")
@@ -350,6 +349,11 @@ def main():
     # (опционально) усилить вес отрицательного класса в лоссе
     ap.add_argument("--neg_weight_mult", type=float, default=1.0,
                     help="множитель к весу класса 0 (для снижения FP)")
+    
+    
+    args = ap.parse_args()
+    
+   
 
 
     # Видимость GPU до импорта TF
