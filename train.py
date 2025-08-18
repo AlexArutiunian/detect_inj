@@ -1,4 +1,10 @@
-# detect_inj/train.py
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+# ===================== detect_inj/train3.py =====================
+# Классика (RF/SVM/XGB) и нейросети (LSTM/TCN/и т.п.) для бинарной классификации.
+# ВАЖНО: TensorFlow подгружается ЛЕНИВО и ТОЛЬКО если выбрана нейросеточная модель.
+
 import os
 import json
 import argparse
@@ -13,46 +19,16 @@ from sklearn.svm import SVC
 from xgboost import XGBClassifier
 from sklearn.metrics import (
     accuracy_score, f1_score, roc_auc_score,
-    classification_report, confusion_matrix, precision_recall_curve
+    classification_report, confusion_matrix
 )
 from sklearn.utils.class_weight import compute_class_weight
 import joblib
 
-from sklearn.inspection import permutation_importance
+# ===================== УТИЛИТЫ =====================
 
-# ===================== КОНСТАНТЫ ДЛЯ "КЛАССИКИ" =====================
-_STAT_NAMES = ["mean","std","min","max","dmean","dstd"]
-_AXIS = ["x","y","z"]
+def ensure_dir(p: str) -> None:
+    os.makedirs(p, exist_ok=True)
 
-def classical_feature_names(schema_joints):
-    names = []
-    for j in schema_joints:
-        for ax in _AXIS:
-            for st in _STAT_NAMES:
-                names.append(f"{j}:{ax}:{st}")
-    return names
-
-def aggregate_importance_by_joint(feat_names, importances):
-    by_joint, by_joint_axis = {}, {}
-    for nm, imp in zip(feat_names, importances):
-        j, ax, st = nm.split(":")
-        by_joint[j] = by_joint.get(j, 0.0) + float(imp)
-        key = (j, ax)
-        by_joint_axis[key] = by_joint_axis.get(key, 0.0) + float(imp)
-    return by_joint, by_joint_axis
-
-def save_importance_tables(out_dir, all_rows, by_joint, by_joint_axis, prefix):
-    os.makedirs(out_dir, exist_ok=True)
-    pd.DataFrame(all_rows).sort_values("importance", ascending=False)\
-        .to_csv(os.path.join(out_dir, f"{prefix}_feature_importance.csv"), index=False)
-    pd.DataFrame([{"joint": j, "importance": v} for j, v in by_joint.items()])\
-        .sort_values("importance", ascending=False)\
-        .to_csv(os.path.join(out_dir, f"{prefix}_joint_importance.csv"), index=False)
-    pd.DataFrame([{"joint": j, "axis": ax, "importance": v} for (j, ax), v in by_joint_axis.items()])\
-        .sort_values("importance", ascending=False)\
-        .to_csv(os.path.join(out_dir, f"{prefix}_joint_axis_importance.csv"), index=False)
-
-# ===================== МЕТКИ/МЕТРИКИ =====================
 def label_to_int(v):
     if v is None: return None
     s = str(v).strip().lower()
@@ -69,23 +45,28 @@ def compute_metrics(y_true, y_pred, y_prob):
         "report": classification_report(y_true, y_pred, digits=3),
     }
 
-def ensure_dir(p): os.makedirs(p, exist_ok=True)
-
 def best_threshold_by_f1(y_true, proba):
-    pr, rc, th = precision_recall_curve(y_true, proba)  # n+1, n+1, n
+    from sklearn.metrics import precision_recall_curve
+    pr, rc, th = precision_recall_curve(y_true, proba)
     f1_vals = 2 * pr[:-1] * rc[:-1] / np.clip(pr[:-1] + rc[:-1], 1e-12, None)
     if len(f1_vals) == 0 or np.all(np.isnan(f1_vals)): return 0.5
     best_idx = int(np.nanargmax(f1_vals))
     return float(th[max(0, min(best_idx, len(th) - 1))])
 
-# ===================== НИЗКОУРОВНЕВАЯ ЗАГРУЗКА =====================
+def print_split_stats(name, y):
+    n = len(y); n1 = int(np.sum(y == 1)); n0 = n - n1
+    p1 = (n1 / n * 100) if n else 0.0; p0 = (n0 / n * 100) if n else 0.0
+    print(f"[{name}] total={n} | Injury=1: {n1} ({p1:.1f}%) | No Injury=0: {n0} ({p0:.1f}%)")
+
+# ===================== JSON utils (для input_format=json) =====================
+
 def _safe_json_load(path):
     try:
         import orjson
         with open(path, "rb") as f:
             return orjson.loads(f.read())
     except Exception:
-        with open(path, "r") as f:
+        with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
 
 def _stack_motion_frames_with_schema(md, schema_joints):
@@ -95,12 +76,13 @@ def _stack_motion_frames_with_schema(md, schema_joints):
     if T <= 1: return None
     cols = []
     for j in schema_joints:
-        if j in md: arr = np.asarray(md[j], dtype=np.float32)[:T]
-        else:       arr = np.full((T, 3), np.nan, dtype=np.float32)
+        if j in md:
+            arr = np.asarray(md[j], dtype=np.float32)[:T]   # (T,3)
+        else:
+            arr = np.full((T, 3), np.nan, dtype=np.float32) # отсутствующий сустав
         cols.append(arr)
     return np.concatenate(cols, axis=1)  # (T, 3*|schema|)
 
-# ===================== СХЕМА СУСТАВОВ =====================
 def discover_joint_schema(csv_path, data_dir, motion_key,
                           filename_col="filename", label_col="No inj/ inj",
                           sample_max=500, freq_threshold=0.9, use_joints=None):
@@ -132,7 +114,21 @@ def discover_joint_schema(csv_path, data_dir, motion_key,
     return sorted(schema)
 
 # ===================== ФИЧИ ДЛЯ "КЛАССИКИ" =====================
-def _feats_from_file(args):
+
+def _features_from_seq(seq_np):
+    """seq_np: (T, F=3*|schema|) -> агрегированные статистики для классики."""
+    seq = seq_np.astype(np.float32, copy=False)
+    dif = np.diff(seq, axis=0)
+    stat = np.concatenate([
+        np.nanmean(seq, axis=0), np.nanstd(seq, axis=0),
+        np.nanmin(seq, axis=0),  np.nanmax(seq, axis=0),
+        np.nanmean(dif, axis=0), np.nanstd(dif, axis=0)
+    ]).astype(np.float32, copy=False)
+    return np.nan_to_num(stat, nan=0.0, posinf=0.0, neginf=0.0)
+
+# ---- JSON -> фичи ----
+
+def _feats_from_json_task(args):
     json_path, y, motion_key, schema_joints = args
     try:
         data = _safe_json_load(json_path)
@@ -140,30 +136,17 @@ def _feats_from_file(args):
         md = data[motion_key]
         seq = _stack_motion_frames_with_schema(md, schema_joints)
         if seq is None or seq.shape[0] < 2: return None
-        seq = seq.astype(np.float32, copy=False)
-        dif = np.diff(seq, axis=0)
-        stat = np.concatenate([
-            np.nanmean(seq, axis=0), np.nanstd(seq, axis=0),
-            np.nanmin(seq, axis=0), np.nanmax(seq, axis=0),
-            np.nanmean(dif, axis=0), np.nanstd(dif, axis=0)
-        ]).astype(np.float32, copy=False)
-        stat = np.nan_to_num(stat, nan=0.0, posinf=0.0, neginf=0.0)
-        return (stat, int(y))
+        return (_features_from_seq(seq), int(y))
     except Exception:
         return None
 
-def load_features_streaming(csv_path, data_dir, motion_key="running",
+def load_features_from_json(csv_path, data_dir, motion_key="running",
                             filename_col="filename", label_col="No inj/ inj",
-                            use_joints=None, workers=0):
-    schema_joints = discover_joint_schema(
-        csv_path, data_dir, motion_key, filename_col, label_col,
-        sample_max=500, freq_threshold=0.9, use_joints=use_joints
-    )
-    print(f"Feature schema joints ({len(schema_joints)}): "
-          f"{', '.join(schema_joints[:8])}{' ...' if len(schema_joints) > 8 else ''}")
+                            schema_joints=None, workers=0):
+    assert schema_joints is not None, "schema_joints не заданы"
     meta = pd.read_csv(csv_path, usecols=[filename_col, label_col])
     tasks = []
-    for _, row in tqdm(meta.iterrows(), total=len(meta), desc="Indexing", dynamic_ncols=True, mininterval=0.2):
+    for _, row in tqdm(meta.iterrows(), total=len(meta), desc="Indexing(JSON)", dynamic_ncols=True, mininterval=0.2):
         fn = str(row[filename_col]).strip() if pd.notnull(row.get(filename_col)) else ""
         y = label_to_int(row.get(label_col))
         if not fn or y is None: continue
@@ -172,25 +155,126 @@ def load_features_streaming(csv_path, data_dir, motion_key="running",
             p2 = p + ".json"
             if os.path.exists(p2): p = p2
         if os.path.exists(p): tasks.append((p, y, motion_key, schema_joints))
+
     results = []
     if workers and workers > 0:
         from concurrent.futures import ProcessPoolExecutor
         with ProcessPoolExecutor(max_workers=workers) as ex:
-            for r in tqdm(ex.map(_feats_from_file, tasks, chunksize=16),
-                          total=len(tasks), desc="Feats", dynamic_ncols=True, mininterval=0.2):
+            for r in tqdm(ex.map(_feats_from_json_task, tasks, chunksize=16),
+                          total=len(tasks), desc="Feats(JSON)", dynamic_ncols=True, mininterval=0.2):
                 if r is not None: results.append(r)
     else:
-        for t in tqdm(tasks, desc="Feats", dynamic_ncols=True, mininterval=0.2):
-            r = _feats_from_file(t)
+        for t in tqdm(tasks, desc="Feats(JSON)", dynamic_ncols=True, mininterval=0.2):
+            r = _feats_from_json_task(t)
             if r is not None: results.append(r)
+
     if not results:
-        raise RuntimeError("Не удалось получить ни одной строки фич.")
+        raise RuntimeError("Не удалось получить ни одной строки фич из JSON.")
     X = np.stack([r[0] for r in results]).astype(np.float32, copy=False)
     y = np.array([r[1] for r in results], dtype=np.int32)
-    return X, y, schema_joints
+    return X, y
 
-# ===================== LAZY TF + МОДЕЛИ =====================
+# ---- NPY -> фичи ----
+
+def _map_to_npy_path(data_dir, rel_path):
+    base = rel_path[:-5] if rel_path.endswith(".json") else rel_path
+    if not base.endswith(".npy"):
+        base = base + ".npy"
+    return os.path.join(data_dir, base)
+
+def _feats_from_npy_task(args):
+    npy_path, y, downsample = args
+    try:
+        arr = np.load(npy_path, allow_pickle=False, mmap_mode="r")
+        if arr.ndim != 2 or arr.shape[0] < 2: return None
+        seq = arr[::downsample] if downsample > 1 else arr
+        return (_features_from_seq(np.asarray(seq)), int(y))
+    except Exception:
+        return None
+
+def load_features_from_npy(csv_path, npy_dir, filename_col="filename", label_col="No inj/ inj",
+                           downsample=1, workers=0):
+    meta = pd.read_csv(csv_path, usecols=[filename_col, label_col])
+    tasks = []
+    for _, row in tqdm(meta.iterrows(), total=len(meta), desc="Indexing(NPY)", dynamic_ncols=True, mininterval=0.2):
+        fn = str(row[filename_col]).strip() if pd.notnull(row.get(filename_col)) else ""
+        y = label_to_int(row.get(label_col))
+        if not fn or y is None: continue
+        p = _map_to_npy_path(npy_dir, fn)
+        
+        if os.path.exists(p): tasks.append((p, y, int(max(1, downsample))))
+
+    results = []
+    if workers and workers > 0:
+        from concurrent.futures import ProcessPoolExecutor
+        with ProcessPoolExecutor(max_workers=workers) as ex:
+            for r in tqdm(ex.map(_feats_from_npy_task, tasks, chunksize=32),
+                          total=len(tasks), desc="Feats(NPY)", dynamic_ncols=True, mininterval=0.2):
+                if r is not None: results.append(r)
+    else:
+        for t in tqdm(tasks, desc="Feats(NPY)", dynamic_ncols=True, mininterval=0.2):
+            r = _feats_from_npy_task(t)
+            if r is not None: results.append(r)
+
+    if not results:
+        raise RuntimeError("Не удалось получить ни одной строки фич из NPY.")
+    X = np.stack([r[0] for r in results]).astype(np.float32, copy=False)
+    y = np.array([r[1] for r in results], dtype=np.int32)
+    return X, y
+
+# ===================== NN: индекс и оценка длины =====================
+
+def _build_index(csv_path, data_dir_or_npy_dir, filename_col, label_col, input_format="npy"):
+    meta = pd.read_csv(csv_path, usecols=[filename_col, label_col])
+    items = []
+    for _, row in meta.iterrows():
+        fn = str(row[filename_col]).strip() if pd.notnull(row.get(filename_col)) else ""
+        y = label_to_int(row.get(label_col))
+        if not fn or y is None: continue
+        if input_format == "json":
+            p = os.path.join(data_dir_or_npy_dir, fn)
+            if not os.path.exists(p) and not fn.endswith(".json"):
+                p2 = p + ".json"
+                if os.path.exists(p2): p = p2
+        else:
+            p = _map_to_npy_path(data_dir_or_npy_dir, fn)
+        if os.path.exists(p): items.append((p, int(y)))
+    return items
+
+def _probe_max_len_json(file_label_pairs, motion_key, schema_joints, pctl=95, sample_max=None):
+    L = []
+    it = file_label_pairs if sample_max is None else file_label_pairs[:sample_max]
+    for p, _ in tqdm(it, desc="Probe(JSON)", dynamic_ncols=True, mininterval=0.2):
+        try:
+            data = _safe_json_load(p)
+            if motion_key not in data or not isinstance(data[motion_key], dict): continue
+            md = data[motion_key]
+            present = [j for j in schema_joints if j in md]
+            if not present: continue
+            lengths = [len(md[j]) for j in present]
+            if lengths: L.append(min(lengths))
+        except Exception:
+            continue
+    if not L: return None
+    return int(np.percentile(L, pctl))
+
+def _probe_max_len_npy(file_label_pairs, pctl=95, sample_max=None):
+    L = []
+    it = file_label_pairs if sample_max is None else file_label_pairs[:sample_max]
+    for p, _ in tqdm(it, desc="Probe(NPY)", dynamic_ncols=True, mininterval=0.2):
+        try:
+            arr = np.load(p, allow_pickle=False, mmap_mode="r")
+            if arr.ndim == 2 and arr.shape[0] > 1:
+                L.append(int(arr.shape[0]))
+        except Exception:
+            continue
+    if not L: return None
+    return int(np.percentile(L, pctl))
+
+# ===================== МОДЕЛИ (TF/Keras) — ленивый импорт =====================
+
 def _lazy_tf():
+    """Импортирует TF только при необходимости (для нейросетей)."""
     try:
         import tensorflow as tf
         from tensorflow.keras.models import Sequential
@@ -198,8 +282,8 @@ def _lazy_tf():
             LSTM, Dense, Conv1D, BatchNormalization, Dropout,
             GlobalAveragePooling1D, Masking
         )
-        from tensorflow.keras.preprocessing.sequence import pad_sequences
         from tensorflow.keras.callbacks import EarlyStopping
+        from tensorflow.keras.preprocessing.sequence import pad_sequences
         return {
             "tf": tf,
             "Sequential": Sequential,
@@ -210,20 +294,17 @@ def _lazy_tf():
             "Dropout": Dropout,
             "GlobalAveragePooling1D": GlobalAveragePooling1D,
             "Masking": Masking,
-            "pad_sequences": pad_sequences,
             "EarlyStopping": EarlyStopping,
+            "pad_sequences": pad_sequences,
         }
     except Exception as e:
-        raise RuntimeError(
-            "TensorFlow недоступен или несовместим с текущей средой. "
-            f"Ошибка: {e}"
-        )
+        raise RuntimeError(f"TensorFlow недоступен: {e}")
 
 def build_lstm(input_shape):
     k = _lazy_tf()
     model = k["Sequential"]([
         k["Masking"](mask_value=0.0, input_shape=input_shape),
-        k["LSTM"](128, return_sequences=False),  # ← исправлено
+        k["LSTM"](128, return_sequences=False),
         k["Dense"](64, activation='relu'),
         k["Dropout"](0.3),
         k["Dense"](1, activation='sigmoid')
@@ -273,20 +354,20 @@ def build_gru(input_shape):
     return model
 
 def build_transformer(input_shape, d_model=128, num_heads=4, ff_dim=256, num_layers=2, dropout=0.1):
-    k = _lazy_tf()
+    _ = _lazy_tf()  # гарантируем наличие TF
     from tensorflow.keras import layers, models
     inp = layers.Input(shape=input_shape)
     x = layers.Masking(mask_value=0.0)(inp)
     x = layers.Dense(d_model)(x)
-    def add_positional_encoding(x):
+    def add_positional_encoding(x_):
         import tensorflow as tf
-        T = tf.shape(x)[1]; d = int(x.shape[-1])
+        T = tf.shape(x_)[1]; d = int(x_.shape[-1])
         pos = tf.cast(tf.range(T)[:, None], tf.float32)
         i   = tf.cast(tf.range(d)[None, :], tf.float32)
         angle = pos / tf.pow(10000.0, (2*(i//2))/d)
         pe = tf.where(tf.equal(tf.cast(i % 2, tf.int32), 0), tf.sin(angle), tf.cos(angle))
         pe = tf.expand_dims(pe, 0)
-        return x + pe
+        return x_ + pe
     x = layers.Lambda(add_positional_encoding)(x)
     for _ in range(num_layers):
         a = layers.MultiHeadAttention(num_heads=num_heads, key_dim=d_model//num_heads, dropout=dropout)(x, x)
@@ -300,7 +381,7 @@ def build_transformer(input_shape, d_model=128, num_heads=4, ff_dim=256, num_lay
     return model
 
 def build_timesnet(input_shape):
-    k = _lazy_tf()
+    _ = _lazy_tf()
     from tensorflow.keras import layers, models
     inp = layers.Input(shape=input_shape); x = layers.Masking(mask_value=0.0)(inp)
     b1 = layers.Conv1D(64, 3, padding="same", activation="relu")(x)
@@ -314,7 +395,7 @@ def build_timesnet(input_shape):
     return model
 
 def build_patchtst(input_shape, patch_len=16, stride=8, d_model=128, num_layers=2, num_heads=4, ff_dim=256):
-    k = _lazy_tf()
+    _ = _lazy_tf()
     from tensorflow.keras import layers, models
     inp = layers.Input(shape=input_shape); x = layers.Masking(mask_value=0.0)(inp)
     x = layers.Conv1D(filters=d_model, kernel_size=patch_len, strides=stride, padding="valid")(x)
@@ -329,7 +410,7 @@ def build_patchtst(input_shape, patch_len=16, stride=8, d_model=128, num_layers=
     return model
 
 def build_informer(input_shape, d_model=128, num_heads=4, ff_dim=256, num_layers=2, dropout=0.1):
-    k = _lazy_tf()
+    _ = _lazy_tf()
     from tensorflow.keras import layers, models
     inp = layers.Input(shape=input_shape); x = layers.Masking(mask_value=0.0)(inp); x = layers.Dense(d_model)(x)
     for l in range(num_layers):
@@ -343,86 +424,8 @@ def build_informer(input_shape, d_model=128, num_heads=4, ff_dim=256, num_layers
     model = models.Model(inp, out); model.compile(optimizer="adam", loss="binary_crossentropy", metrics=["accuracy"])
     return model
 
-# ===================== ИНДЕКС ДЛЯ NN =====================
-def _build_index(csv_path, data_dir, filename_col, label_col):
-    meta = pd.read_csv(csv_path, usecols=[filename_col, label_col])
-    items = []
-    for _, row in meta.iterrows():
-        fn = str(row[filename_col]).strip() if pd.notnull(row.get(filename_col)) else ""
-        y = label_to_int(row.get(label_col))
-        if not fn or y is None: continue
-        p = os.path.join(data_dir, fn)
-        if not os.path.exists(p) and not fn.endswith(".json"):
-            p2 = p + ".json"
-            if os.path.exists(p2): p = p2
-        if os.path.exists(p): items.append((p, int(y)))
-    return items
-
-def _probe_max_len(file_label_pairs, motion_key, schema_joints, pctl=95, sample_max=None):
-    L = []
-    it = file_label_pairs if sample_max is None else file_label_pairs[:sample_max]
-    for p, _ in tqdm(it, desc="Probe lengths", dynamic_ncols=True, mininterval=0.2):
-        try:
-            data = _safe_json_load(p)
-            if motion_key not in data or not isinstance(data[motion_key], dict): continue
-            md = data[motion_key]
-            present = [j for j in schema_joints if j in md]
-            if not present: continue
-            lengths = [len(md[j]) for j in present]
-            if lengths: L.append(min(lengths))
-        except Exception:
-            continue
-    if not L: return None
-    return int(np.percentile(L, pctl))
-
-# ===================== ДАТАЛОАДЕР (Keras Sequence) =====================
-from tensorflow import keras
-from tensorflow.keras.preprocessing.sequence import pad_sequences
-
-class JsonSeq(keras.utils.Sequence):
-    """Параллельная подача батчей. kwargs: workers, use_multiprocessing, max_queue_size."""
-    def __init__(self, items, motion_key, schema_joints, max_len, batch_size,
-                 shuffle=True, downsample=1, **kwargs):
-        super().__init__(**kwargs)  # важно для Keras 3
-        self.items = list(items)
-        self.motion_key = motion_key
-        self.schema_joints = schema_joints
-        self.max_len = int(max_len)
-        self.bs = int(batch_size)
-        self.shuffle = bool(shuffle)
-        self.downsample = max(1, int(downsample))
-        self.indices = np.arange(len(self.items))
-        self.on_epoch_end()
-
-    def __len__(self):
-        return (len(self.items) + self.bs - 1) // self.bs
-
-    def on_epoch_end(self):
-        if self.shuffle:
-            np.random.shuffle(self.indices)
-
-    def __getitem__(self, idx):
-        sl = self.indices[idx*self.bs:(idx+1)*self.bs]
-        X_batch, y_batch = [], []
-        for i in sl:
-            p, y = self.items[i]
-            try:
-                data = _safe_json_load(p)
-                if self.motion_key in data and isinstance(data[self.motion_key], dict):
-                    md = data[self.motion_key]
-                    seq = _stack_motion_frames_with_schema(md, self.schema_joints)
-                    if seq is None: continue
-                    if self.downsample > 1: seq = seq[::self.downsample]
-                    seq = np.nan_to_num(seq, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
-                    X_batch.append(seq); y_batch.append(y)
-            except Exception:
-                continue
-        if not X_batch:
-            return np.zeros((0, self.max_len, 1), dtype=np.float32), np.zeros((0,), dtype=np.int32)
-        Xp = pad_sequences(X_batch, maxlen=self.max_len, dtype='float32', padding='post', truncating='post')
-        return Xp, np.array(y_batch, dtype=np.int32)
-
 # ===================== ОБУЧЕНИЕ =====================
+
 def train_classical(X_train, X_dev, X_test, y_train, y_dev, y_test, model_type, out_dir):
     if model_type == "rf":
         model = RandomForestClassifier(n_estimators=400, n_jobs=-1, class_weight="balanced", random_state=42)
@@ -468,8 +471,6 @@ def train_deep(name, train_seq, dev_seq, test_seq, class_weight, epochs, out_dir
     else: raise ValueError("Unknown deep model")
 
     cb = [k["EarlyStopping"](monitor="val_loss", patience=5, restore_best_weights=True)]
-
-    # ВНИМАНИЕ: параллелизм задаётся внутри JsonSeq через kwargs, тут ничего передавать не нужно
     model.fit(train_seq, validation_data=dev_seq, epochs=epochs,
               class_weight=class_weight, callbacks=cb, verbose=1)
 
@@ -497,53 +498,75 @@ def train_deep(name, train_seq, dev_seq, test_seq, class_weight, epochs, out_dir
     model.save(os.path.join(out_dir, "model.h5"))
     with open(os.path.join(out_dir, "threshold.txt"), "w") as f:
         f.write(str(thr))
-    # нормстаты: сохраняем max_len
     np.savez(os.path.join(out_dir, "norm_stats.npz"), max_len=input_shape[0])
     return dev_metrics, test_metrics, thr, model
 
 # ===================== MAIN =====================
-def print_split_stats(name, y):
-    n = len(y); n1 = int(np.sum(y == 1)); n0 = n - n1
-    p1 = (n1 / n * 100) if n else 0.0; p0 = (n0 / n * 100) if n else 0.0
-    print(f"[{name}] total={n} | Injury=1: {n1} ({p1:.1f}%) | No Injury=0: {n0} ({p0:.1f}%)")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Binary injury classifier from 3D joint JSON sequences (70/10/20 split)")
+    parser = argparse.ArgumentParser(description="Binary injury classifier from 3D joint sequences (70/10/20 split)")
     parser.add_argument("--model", type=str,
                         choices=["rf","svm","xgb","lstm","tcn","gru","cnn_lstm","transformer","timesnet","patchtst","informer"],
                         required=True)
-    parser.add_argument("--csv", type=str, required=True, help="Путь к CSV с метаданными")
-    parser.add_argument("--data_dir", type=str, required=True, help="Папка с JSON файлами")
-    parser.add_argument("--motion_key", type=str, default="running", help="running | walking")
+    parser.add_argument("--csv", type=str, required=True, help="Путь к CSV с метаданными (filename, label)")
+    parser.add_argument("--data_dir", type=str, required=True, help="Папка с файлами (JSON или NPY)")
+    parser.add_argument("--input_format", type=str, choices=["json","npy"], default="npy",
+                        help="Источник данных: json (старый) или npy (быстрый)")
+    parser.add_argument("--schema_json", type=str, default="", help="schema_joints.json (для JSON / имен фич)")
+    parser.add_argument("--motion_key", type=str, default="running", help="running | walking (только для JSON)")
     parser.add_argument("--filename_col", type=str, default="filename")
     parser.add_argument("--label_col", type=str, default="No inj/ inj")
     parser.add_argument("--use_joints", type=str, default="", help="через запятую: pelvis_1,hip_r,... (пусто = авто-схема)")
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--out_dir", type=str, default="outputs", help="куда сохранять модель/метрики")
-    parser.add_argument("--max_len", type=str, default="auto", help="'auto' (95-перцентиль по train) или число для LSTM/TCN")
-    parser.add_argument("--loader_workers", type=int, default=0, help="процессы для извлечения фич (классика) и воркеры датасета (NN)")
-    parser.add_argument("--downsample", type=int, default=1, help="даунсэмплинг по времени (>=1) для NN")
-    parser.add_argument("--queue_size", type=int, default=32, help="очередь батчей внутри датасета (NN)")
-    parser.add_argument("--mp", action="store_true", help="use multiprocessing для датасета NN")
+    parser.add_argument("--max_len", type=str, default="auto", help="'auto' (95-перцентиль по train) или число для NN")
+    parser.add_argument("--loader_workers", type=int, default=0, help="воркеры для извлечения фич / датасетов")
+    parser.add_argument("--downsample", type=int, default=1, help="шаг по времени для ускорения (>=1)")
     args = parser.parse_args()
 
+    # joints schema
     use_joints = None
     if args.use_joints.strip():
         use_joints = [s.strip() for s in args.use_joints.split(",") if s.strip()]
+    schema_joints = None
+    if args.input_format == "npy":
+        # имена суставов нужны только для отчётов/совместимости
+        if args.schema_json and os.path.exists(args.schema_json):
+            with open(args.schema_json, "r", encoding="utf-8") as f:
+                schema_joints = json.load(f)
+        elif use_joints:
+            schema_joints = list(use_joints)
+    else:
+        schema_joints = use_joints or discover_joint_schema(
+            args.csv, args.data_dir, args.motion_key,
+            filename_col=args.filename_col, label_col=args.label_col,
+            sample_max=500, freq_threshold=0.9, use_joints=None
+        )
 
     out_dir = os.path.join(args.out_dir, args.model); ensure_dir(out_dir)
 
-    if args.model in ["rf", "svm", "xgb"]:
-        # ===== КЛАССИКА =====
-        X_all, y_all, schema_joints = load_features_streaming(
-            args.csv, args.data_dir, motion_key=args.motion_key,
-            filename_col=args.filename_col, label_col=args.label_col,
-            use_joints=use_joints, workers=args.loader_workers
-        )
-        with open(os.path.join(out_dir, "schema_joints.json"), "w", encoding="utf-8") as f:
-            json.dump(schema_joints, f, ensure_ascii=False, indent=2)
+    # ========= ВЕТКА КЛАССИЧЕСКИХ МОДЕЛЕЙ =========
+    if args.model in ["rf","svm","xgb"]:
+        if args.input_format == "npy":
+            X_all, y_all = load_features_from_npy(
+                args.csv, args.data_dir,
+                filename_col=args.filename_col, label_col=args.label_col,
+                downsample=args.downsample, workers=args.loader_workers
+            )
+        else:
+            X_all, y_all = load_features_from_json(
+                args.csv, args.data_dir, motion_key=args.motion_key,
+                filename_col=args.filename_col, label_col=args.label_col,
+                schema_joints=schema_joints, workers=args.loader_workers
+            )
 
+        # сохраним схему, если есть
+        if schema_joints is not None:
+            with open(os.path.join(out_dir, "schema_joints.json"), "w", encoding="utf-8") as f:
+                json.dump(schema_joints, f, ensure_ascii=False, indent=2)
+
+        # Сплит 70/20/10
         X_train_full, X_test, y_train_full, y_test = train_test_split(
             X_all, y_all, test_size=0.20, random_state=42, stratify=y_all
         )
@@ -556,11 +579,6 @@ if __name__ == "__main__":
         print_split_stats("DEV   (≈10%)", y_dev)
         print_split_stats("TEST  (≈20%)", y_test)
 
-        classes = np.array([0, 1])
-        w = compute_class_weight(class_weight="balanced", classes=classes, y=y_train)
-        class_weight = {0: float(w[0]), 1: float(w[1])}
-        print("Class weights (train):", class_weight)
-
         scaler = StandardScaler()
         X_train_feat = scaler.fit_transform(X_train_feat)
         X_dev_feat   = scaler.transform(X_dev_feat)
@@ -569,22 +587,100 @@ if __name__ == "__main__":
         dev_metrics, test_metrics, thr, model = train_classical(
             X_train_feat, X_dev_feat, X_test_feat, y_train, y_dev, y_test, args.model, out_dir
         )
+
         joblib.dump({"model": model, "scaler": scaler}, os.path.join(out_dir, "model.joblib"))
 
+    # ========= ВЕТКА НЕЙРОСЕТЕЙ =========
     else:
-        # ===== НЕЙРОСЕТИ =====
-        items = _build_index(args.csv, args.data_dir, args.filename_col, args.label_col)
+        # Локально определяем Keras Sequence на базе ленивого TF
+        k_tf = _lazy_tf()
+        tf = k_tf["tf"]
+        pad_sequences = k_tf["pad_sequences"]
+        SequenceBase = tf.keras.utils.Sequence
+
+        class JsonSeq(SequenceBase):
+            def __init__(self, items, motion_key, schema_joints, max_len, batch_size,
+                         shuffle=True, downsample=1, **kwargs):
+                super().__init__(**kwargs)
+                self.items = list(items)
+                self.motion_key = motion_key
+                self.schema_joints = schema_joints
+                self.max_len = int(max_len)
+                self.bs = int(batch_size)
+                self.shuffle = bool(shuffle)
+                self.downsample = max(1, int(downsample))
+                self.indices = np.arange(len(self.items))
+                self.on_epoch_end()
+            def __len__(self): return (len(self.items) + self.bs - 1) // self.bs
+            def on_epoch_end(self):
+                if self.shuffle: np.random.shuffle(self.indices)
+            def __getitem__(self, idx):
+                sl = self.indices[idx*self.bs:(idx+1)*self.bs]
+                X_batch, y_batch = [], []
+                for i in sl:
+                    p, y = self.items[i]
+                    try:
+                        data = _safe_json_load(p)
+                        if self.motion_key in data and isinstance(data[self.motion_key], dict):
+                            md = data[self.motion_key]
+                            seq = _stack_motion_frames_with_schema(md, self.schema_joints)
+                            if seq is None: continue
+                            if self.downsample > 1: seq = seq[::self.downsample]
+                            seq = np.nan_to_num(seq, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
+                            X_batch.append(seq); y_batch.append(y)
+                    except Exception:
+                        continue
+                if not X_batch:
+                    return np.zeros((0, self.max_len, 1), dtype=np.float32), np.zeros((0,), dtype=np.int32)
+                Xp = pad_sequences(X_batch, maxlen=self.max_len, dtype='float32', padding='post', truncating='post')
+                return Xp, np.array(y_batch, dtype=np.int32)
+
+        class NpySeq(SequenceBase):
+            def __init__(self, items, max_len, batch_size, shuffle=True, downsample=1, **kwargs):
+                super().__init__(**kwargs)
+                self.items = list(items)
+                self.max_len = int(max_len)
+                self.bs = int(batch_size)
+                self.shuffle = bool(shuffle)
+                self.downsample = max(1, int(downsample))
+                self.indices = np.arange(len(self.items))
+                self.on_epoch_end()
+            def __len__(self): return (len(self.items) + self.bs - 1) // self.bs
+            def on_epoch_end(self):
+                if self.shuffle: np.random.shuffle(self.indices)
+            def __getitem__(self, idx):
+                sl = self.indices[idx*self.bs:(idx+1)*self.bs]
+                X_batch, y_batch = [], []
+                for i in sl:
+                    p, y = self.items[i]
+                    try:
+                        arr = np.load(p, allow_pickle=False, mmap_mode="r")
+                        if arr.ndim != 2 or arr.shape[0] < 2: continue
+                        seq = arr[::self.downsample] if self.downsample > 1 else arr
+                        X_batch.append(np.asarray(seq, dtype=np.float32))
+                        y_batch.append(y)
+                    except Exception:
+                        continue
+                if not X_batch:
+                    return np.zeros((0, self.max_len, 1), dtype=np.float32), np.zeros((0,), dtype=np.int32)
+                Xp = pad_sequences(X_batch, maxlen=self.max_len, dtype='float32', padding='post', truncating='post')
+                return Xp, np.array(y_batch, dtype=np.int32)
+
+        # Построим индекс
+        items = _build_index(args.csv, args.data_dir, args.filename_col, args.label_col, input_format=args.input_format)
         assert items, "Нет валидных файлов/меток."
 
-        schema_joints = discover_joint_schema(
-            args.csv, args.data_dir, args.motion_key,
-            filename_col=args.filename_col, label_col=args.label_col,
-            sample_max=500, freq_threshold=0.9, use_joints=use_joints
-        )
-        with open(os.path.join(out_dir, "schema_joints.json"), "w", encoding="utf-8") as f:
-            json.dump(schema_joints, f, ensure_ascii=False, indent=2)
-        print(f"Schema joints saved ({len(schema_joints)}): "
-              f"{', '.join(schema_joints[:8])}{' ...' if len(schema_joints) > 8 else ''}")
+        # оценим max_len
+        if args.max_len.strip().lower() == "auto":
+            if args.input_format == "npy":
+                max_len = _probe_max_len_npy(items, pctl=95, sample_max=None)
+            else:
+                max_len = _probe_max_len_json(items, args.motion_key, schema_joints, pctl=95, sample_max=None)
+            if not max_len or max_len <= 1:
+                raise ValueError("Не удалось оценить max_len. Укажи --max_len вручную.")
+        else:
+            max_len = int(args.max_len)
+        print("max_len (train) =", max_len)
 
         files = np.array([p for p, _ in items], dtype=object)
         labels = np.array([y for _, y in items], dtype=np.int32)
@@ -601,43 +697,24 @@ if __name__ == "__main__":
         print_split_stats("DEV   (≈10%)", labels[idx_dev])
         print_split_stats("TEST  (≈20%)", labels[idx_test])
 
-        if args.max_len.strip().lower() == "auto":
-            max_len = _probe_max_len([items[i] for i in idx_train], args.motion_key, schema_joints, pctl=95, sample_max=None)
-            if not max_len or max_len <= 1:
-                raise ValueError("Не удалось оценить max_len. Укажи --max_len вручную.")
+        if args.input_format == "npy":
+            train_seq = NpySeq([items[i] for i in idx_train], max_len, args.batch_size, shuffle=True,  downsample=args.downsample)
+            dev_seq   = NpySeq([items[i] for i in idx_dev],   max_len, args.batch_size, shuffle=False, downsample=args.downsample)
+            test_seq  = NpySeq([items[i] for i in idx_test],  max_len, args.batch_size, shuffle=False, downsample=args.downsample)
         else:
-            max_len = int(args.max_len)
-        print("max_len (train) =", max_len)
+            # JSON
+            train_seq = JsonSeq([items[i] for i in idx_train], args.motion_key, schema_joints, max_len, args.batch_size, shuffle=True,  downsample=args.downsample)
+            dev_seq   = JsonSeq([items[i] for i in idx_dev],   args.motion_key, schema_joints, max_len, args.batch_size, shuffle=False, downsample=args.downsample)
+            test_seq  = JsonSeq([items[i] for i in idx_test],  args.motion_key, schema_joints, max_len, args.batch_size, shuffle=False, downsample=args.downsample)
 
-        # ВАЖНО: параметры параллелизма передаём ВНУТРЬ датасета
-        train_seq = JsonSeq([items[i] for i in idx_train], args.motion_key, schema_joints,
-                            max_len, args.batch_size, shuffle=True,
-                            downsample=args.downsample,
-                            workers=args.loader_workers,
-                            use_multiprocessing=args.mp,
-                            max_queue_size=args.queue_size)
-
-        dev_seq   = JsonSeq([items[i] for i in idx_dev], args.motion_key, schema_joints,
-                            max_len, args.batch_size, shuffle=False,
-                            downsample=args.downsample,
-                            workers=max(1, args.loader_workers // 2),
-                            use_multiprocessing=args.mp,
-                            max_queue_size=max(8, args.queue_size // 2))
-
-        test_seq  = JsonSeq([items[i] for i in idx_test], args.motion_key, schema_joints,
-                            max_len, args.batch_size, shuffle=False,
-                            downsample=args.downsample,
-                            workers=max(1, args.loader_workers // 2),
-                            use_multiprocessing=args.mp,
-                            max_queue_size=max(8, args.queue_size // 2))
-
-        # Получим input_shape
+        # пример батча -> input_shape
         X_sample, _ = train_seq[0]
         if X_sample.shape[0] == 0:
             raise RuntimeError("Пустой первый батч. Проверь данные.")
         input_shape = (X_sample.shape[1], X_sample.shape[2])
 
-        classes = np.array([0, 1])
+        # веса классов по train
+        classes = np.array([0, 1], dtype=np.int32)
         w = compute_class_weight(class_weight="balanced", classes=classes, y=labels[idx_train])
         class_weight = {0: float(w[0]), 1: float(w[1])}
         print("Class weights (train):", class_weight)
@@ -645,6 +722,11 @@ if __name__ == "__main__":
         dev_metrics, test_metrics, thr, model = train_deep(
             args.model, train_seq, dev_seq, test_seq, class_weight, args.epochs, out_dir, input_shape
         )
+
+        # сохраним схему для predict (если есть)
+        if schema_joints is not None:
+            with open(os.path.join(out_dir, "schema_joints.json"), "w", encoding="utf-8") as f:
+                json.dump(schema_joints, f, ensure_ascii=False, indent=2)
 
     # ===== Сохранение отчётов =====
     print("\n=== DEV METRICS (threshold tuned here) ===")
