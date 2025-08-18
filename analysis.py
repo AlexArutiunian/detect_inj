@@ -106,7 +106,7 @@ def main(args):
         schema_joints = json.load(f)
 
     # грузим фичи
-    X_all, y_all, _ = load_features_from_npy(
+    X_all, y_all = load_features_from_npy(
         csv_path,
         data_dir,
        
