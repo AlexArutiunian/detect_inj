@@ -10,7 +10,7 @@ matplotlib.use("Agg")  # чтобы скрипт работал в headless-ок
 import matplotlib.pyplot as plt
 from sklearn.inspection import permutation_importance
 
-from train import label_to_int
+from train_cl import label_to_int, load_features_from_npy
 
 # ==== утилиты ====
 
@@ -106,11 +106,10 @@ def main(args):
         schema_joints = json.load(f)
 
     # грузим фичи
-    X_all, y_all, _ = load_features_streaming(
+    X_all, y_all, _ = load_features_from_npy(
         csv_path,
         data_dir,
-        motion_key=motion_key,
-        use_joints=schema_joints,
+       
         workers=workers,
     )
     X_all = scaler.transform(X_all)
