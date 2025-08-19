@@ -409,9 +409,12 @@ def main():
                     help="доп. множитель веса класса 0 (No injury)")
     ap.add_argument("--cw_scale1", type=float, default=1.0,
                     help="доп. множитель веса класса 1 (Injury)")
+    
+    ap.add_argument("--no_xla", action="store_true", help="Disable XLA JIT")
 
 
-        
+    ap.add_argument("--lr", type=float, default=3e-4, help="initial learning rate")
+
     
     args = ap.parse_args()
 
@@ -420,6 +423,13 @@ def main():
         os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
     elif args.gpus.lower() != "all":
         os.environ["CUDA_VISIBLE_DEVICES"] = args.gpus
+        
+            # после парсинга аргументов, до lazy_tf()
+    if args.no_xla:
+        os.environ["TF_XLA_FLAGS"] = "--tf_xla_auto_jit=0"
+
+
+
 
     # Индекс
     items_x, items_y, stats, skipped = build_items(
@@ -513,7 +523,8 @@ def main():
     with ctx:
         model = build_tcn_model(
             (max_len, feat_dim),
-            learning_rate=1e-3,
+            learning_rate=args.lr,
+         
             mixed_precision=args.mixed_precision,
             tcn_filters=args.tcn_filters,
             tcn_kernel=args.tcn_kernel,
