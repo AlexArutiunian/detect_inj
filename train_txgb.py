@@ -347,7 +347,7 @@ def train_xgb(X_train, X_dev, X_test, y_train, y_dev, y_test, out_dir,
                 kw = {"ntree_limit": int(best_ntree_limit)}
 
     prob_dev  = model.predict_proba(X_dev,  **kw)[:, 1]
-    thr       =  thr_max_tnr_at_min_recall(y_dev, prob_dev)
+    thr, _       =  thr_max_tnr_at_min_recall(y_dev, prob_dev)
     pred_dev  = (prob_dev >= thr).astype(int)
     dev_metrics = compute_metrics(y_dev, pred_dev, prob_dev)
 
