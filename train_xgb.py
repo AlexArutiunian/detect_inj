@@ -13,6 +13,11 @@ from sklearn.metrics import (accuracy_score, f1_score, roc_auc_score,
                              roc_curve, precision_recall_curve,
                              average_precision_score)
 from xgboost import XGBClassifier
+try:
+    from xgboost import callback as xgb_callback  # может отсутствовать в старых версиях
+except Exception:
+    xgb_callback = None
+
 import joblib
 
 # Matplotlib без GUI
@@ -221,8 +226,8 @@ def train_xgb(X_train, X_dev, X_test, y_train, y_dev, y_test, out_dir,
               subsample=0.9, colsample_bytree=0.9, reg_lambda=1.0,
               early_stopping_rounds=50, random_state=42):
 
-    pos, neg = int(np.sum(y_train==1)), int(np.sum(y_train==0))
-    spw = (neg / max(pos, 1)) if pos>0 else 1.0
+    pos, neg = int(np.sum(y_train == 1)), int(np.sum(y_train == 0))
+    spw = (neg / max(pos, 1)) if pos > 0 else 1.0
 
     model = XGBClassifier(
         n_estimators=n_estimators,
@@ -239,32 +244,67 @@ def train_xgb(X_train, X_dev, X_test, y_train, y_dev, y_test, out_dir,
         n_jobs=-1
     )
 
-    model.fit(X_train, y_train,
-              eval_set=[(X_dev, y_dev)],
-              verbose=False,
-              early_stopping_rounds=early_stopping_rounds)
+    use_best = False
+    # 1) Современный способ: callbacks
+    try:
+        if xgb_callback is not None:
+            es = xgb_callback.EarlyStopping(
+                rounds=early_stopping_rounds, save_best=True, maximize=True
+            )
+            model.fit(
+                X_train, y_train,
+                eval_set=[(X_dev, y_dev)],
+                callbacks=[es],
+                verbose=False
+            )
+            use_best = True
+        else:
+            raise TypeError("callbacks not available")
+    except TypeError:
+        # 2) Классический способ: early_stopping_rounds в fit()
+        try:
+            model.fit(
+                X_train, y_train,
+                eval_set=[(X_dev, y_dev)],
+                early_stopping_rounds=early_stopping_rounds,
+                verbose=False
+            )
+            use_best = True
+        except TypeError:
+            # 3) Очень старая версия: без ES
+            print("[warn] early stopping недоступен в этой версии xgboost — обучаю без него.")
+            model.fit(X_train, y_train, verbose=False)
 
-    # корректное использование лучшей итерации
+    # Предсказания с учётом лучшей итерации, если она есть
     kw = {}
-    if hasattr(model, "best_iteration_") or hasattr(model, "best_iteration"):
-        best_it = getattr(model, "best_iteration_", None)
-        if best_it is None: best_it = getattr(model, "best_iteration", None)
+    if use_best:
+        best_it = getattr(model, "best_iteration", None)
+        if best_it is None:
+            best_it = getattr(model, "best_iteration_", None)
         if best_it is not None:
-            kw = {"iteration_range": (0, best_it+1)}
+            try:
+                kw = {"iteration_range": (0, int(best_it) + 1)}  # новые версии
+            except TypeError:
+                kw = {}
+        if not kw:
+            best_ntree_limit = getattr(model, "best_ntree_limit", None)  # старые версии
+            if best_ntree_limit is not None:
+                kw = {"ntree_limit": int(best_ntree_limit)}
 
-    prob_dev  = model.predict_proba(X_dev,  **kw)[:,1]
+    prob_dev  = model.predict_proba(X_dev,  **kw)[:, 1]
     thr       = best_threshold_by_f1(y_dev, prob_dev)
-    pred_dev  = (prob_dev>=thr).astype(int)
+    pred_dev  = (prob_dev >= thr).astype(int)
     dev_metrics = compute_metrics(y_dev, pred_dev, prob_dev)
 
-    prob_test = model.predict_proba(X_test, **kw)[:,1]
-    pred_test = (prob_test>=thr).astype(int)
+    prob_test = model.predict_proba(X_test, **kw)[:, 1]
+    pred_test = (prob_test >= thr).astype(int)
     test_metrics = compute_metrics(y_test, pred_test, prob_test)
 
-    with open(os.path.join(out_dir,"threshold.txt"),"w") as f:
+    with open(os.path.join(out_dir, "threshold.txt"), "w") as f:
         f.write(str(thr))
 
     return dev_metrics, test_metrics, thr, model
+
 
 
 # ---------- MAIN ----------
