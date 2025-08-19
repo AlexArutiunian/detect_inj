@@ -295,10 +295,10 @@ def build_transformer_model(
     inp = layers.Input(shape=input_shape, name="seq_input")                  # (B, T, F)
 
     # Булева маска валидных таймстепов (там где не всё нули)
-    valid_mask = layers.Lambda(
-        lambda t: tf.reduce_any(tf.not_equal(t, 0.0), axis=-1),
-        name="valid_mask"
-    )(inp)                                                                  # (B, T) bool
+    key_mask = layers.Lambda(
+        lambda m: tf.expand_dims(tf.cast(m, tf.bool), axis=1),
+        name="key_mask"
+    )(valid_mask)  # (B, 1, T) bool                                                                # (B, T) bool
 
     # Маска внимания (B, T, T): разрешаем внимание только между валидными токенами
     attn_mask = layers.Lambda(
@@ -323,7 +323,10 @@ def build_transformer_model(
         attn_out = layers.MultiHeadAttention(
             num_heads=num_heads, key_dim=d_model // num_heads,
             dropout=attn_dropout, name=f"mha_{i}"
-        )(x_norm, x_norm, attention_mask=attn_mask)
+        )(
+            x_norm, x_norm,
+            attention_mask=key_mask   # ← вместо attn_mask
+        )
         x = layers.Add(name=f"res_attn_{i}")([x, layers.Dropout(dropout, name=f"drop_attn_{i}")(attn_out)])
 
         # FFN
