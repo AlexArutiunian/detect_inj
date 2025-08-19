@@ -355,9 +355,9 @@ def main():
     ap.add_argument("--tcn_dense_units", type=int, default=64, help="Юниты в Dense-слое головы")
     ap.add_argument("--tcn_dense_dropout", type=float, default=0.3, help="Dropout перед Dense")
 
-    ap.add_argument("--print_csv_preview", action="store_true",
+    ap.add_argument("--print_csv_preview", action="store_false",
                     help="Показать первые 5 строк CSV и частоты меток")
-    ap.add_argument("--debug_index", action="store_true",
+    ap.add_argument("--debug_index", action="store_false",
                     help="Печатать статус каждой строки при индексации")
     ap.add_argument("--peek", type=int, default=0,
                     help="Показать N успешно сопоставленных путей (форма массива)")

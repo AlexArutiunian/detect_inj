@@ -60,8 +60,13 @@ def best_threshold_by_f1(y_true, p):
     return float(th[int(np.nanargmax(f1))])
 
 def best_threshold(y_true, p, mode="bal_acc", fixed=None, target_spec=None):
+    """Устойчивый выбор порога."""
     import numpy as np
     from sklearn.metrics import precision_recall_curve, roc_curve, f1_score, balanced_accuracy_score
+
+    p = np.asarray(p, dtype=np.float64)
+    p = np.clip(p, 1e-7, 1 - 1e-7)   # защита от крайностей
+
     if fixed is not None:
         return float(fixed)
 
@@ -72,30 +77,30 @@ def best_threshold(y_true, p, mode="bal_acc", fixed=None, target_spec=None):
         return float(th[int(np.nanargmax(f1))])
 
     if mode == "macro_f1":
-        thr = np.linspace(0, 1, 201)
+        thr = np.linspace(0.01, 0.99, 199)
         scores = [f1_score(y_true, p >= t, average="macro") for t in thr]
         return float(thr[int(np.argmax(scores))])
 
     if mode == "bal_acc":
-        thr = np.linspace(0, 1, 201)
+        thr = np.linspace(0.01, 0.99, 199)
         scores = [balanced_accuracy_score(y_true, p >= t) for t in thr]
-        return float(thr[int(np.argmax(scores))])
+        best_i = int(np.argmax(scores))
+        print(f"[THR] bal_acc={scores[best_i]:.3f} @ thr={thr[best_i]:.3f}")
+        return float(thr[best_i])
 
-    if mode == "roc_j" or mode == "youden":
+    if mode in ("roc_j", "youden", "spec"):
         fpr, tpr, th = roc_curve(y_true, p)
-        j = tpr - fpr
-        return float(th[int(np.argmax(j))])
-
-    if mode == "spec" and target_spec is not None:
-        fpr, tpr, th = roc_curve(y_true, p)
-        spec = 1 - fpr
-        idx = np.argmax(spec >= float(target_spec))
-        return float(th[int(idx)])
+        m = ~np.isinf(th)             # убрать inf
+        fpr, tpr, th = fpr[m], tpr[m], th[m]
+        spec = 1.0 - fpr
+        if mode != "spec":
+            j = tpr - fpr
+            return float(th[int(np.argmax(j))])
+        if target_spec is None: target_spec = 0.5
+        idx = np.where(spec >= float(target_spec))[0]
+        return float(th[idx[-1]] if len(idx) else th[-1])
 
     return 0.5
-
-
-
 
 def compute_metrics(y_true, y_pred, y_prob):
     from sklearn.metrics import accuracy_score, f1_score, roc_auc_score, confusion_matrix, classification_report
@@ -282,6 +287,7 @@ def make_datasets(items, labels, max_len, feat_dim, bs, downsample, mean, std, r
         pad_t = tf.maximum(0, max_len - T)
         x = tf.pad(x, [[0, pad_t], [0, 0]])
         x = x[:max_len]
+        x = tf.where(tf.math.is_finite(x), x, tf.zeros_like(x))  # защита от NaN/Inf
         x.set_shape([max_len, feat_dim])
         return x, y
 
@@ -320,13 +326,13 @@ def build_tcn_model(
     def tcn_block(x, filters, kernel_size, dilation_rate, dropout):
         y = layers.Conv1D(filters, kernel_size, padding="causal",
                           dilation_rate=dilation_rate)(x)
-        y = layers.BatchNormalization()(y)
+        y = layers.BatchNormalization(epsilon=1e-3)(y)
         y = layers.Activation("relu")(y)
         y = layers.Dropout(dropout)(y)
 
         y = layers.Conv1D(filters, kernel_size, padding="causal",
                           dilation_rate=dilation_rate)(y)
-        y = layers.BatchNormalization()(y)
+        y = layers.BatchNormalization(epsilon=1e-3)(y)
 
         # residual match
         if x.shape[-1] != filters:
@@ -362,7 +368,6 @@ def build_tcn_model(
 def _parse_int_list(s: str, default):
     if s is None or str(s).strip() == "":
         return tuple(default)
-    # допускаем пробелы/запятые
     parts = str(s).replace(";", ",").replace(" ", ",").split(",")
     vals = [int(p) for p in parts if p.strip() != ""]
     return tuple(vals) if vals else tuple(default)
@@ -381,6 +386,8 @@ def main():
     ap.add_argument("--max_len", default="auto")           # "auto" -> 95 перцентиль
     ap.add_argument("--gpus", default="all")               # "all" | "cpu" | "0,1"
     ap.add_argument("--mixed_precision", action="store_true")
+    ap.add_argument("--no_xla", action="store_true", help="Disable XLA JIT")
+    ap.add_argument("--lr", type=float, default=1e-3, help="initial learning rate")
 
     # ---- TCN hyperparams (все опциональные, дефолты как раньше) ----
     ap.add_argument("--tcn_filters", type=int, default=64, help="Число каналов в Conv1D")
@@ -393,29 +400,20 @@ def main():
     ap.add_argument("--tcn_dense_units", type=int, default=64, help="Юниты в Dense-слое головы")
     ap.add_argument("--tcn_dense_dropout", type=float, default=0.3, help="Dropout перед Dense")
 
-    ap.add_argument("--print_csv_preview", action="store_true",
-                    help="Показать первые 5 строк CSV и частоты меток")
-    ap.add_argument("--debug_index", action="store_true",
-                    help="Печатать статус каждой строки при индексации")
+    # прочее
     ap.add_argument("--peek", type=int, default=0,
                     help="Показать N успешно сопоставленных путей (форма массива)")
+
+    # выбор порога и веса классов
     ap.add_argument("--threshold_mode", default="bal_acc",
-                choices=["bal_acc", "f1_pos", "macro_f1", "roc_j", "spec", "fixed"])
+                    choices=["bal_acc", "f1_pos", "macro_f1", "roc_j", "spec", "fixed"])
     ap.add_argument("--threshold_fixed", type=float, default=None)
     ap.add_argument("--target_specificity", type=float, default=None)
-    
-    # после threshold-параметров
     ap.add_argument("--cw_scale0", type=float, default=1.0,
-                    help="доп. множитель веса класса 0 (No injury)")
+                    help="множитель веса класса 0 (No injury)")
     ap.add_argument("--cw_scale1", type=float, default=1.0,
-                    help="доп. множитель веса класса 1 (Injury)")
-    
-    ap.add_argument("--no_xla", action="store_true", help="Disable XLA JIT")
+                    help="множитель веса класса 1 (Injury)")
 
-
-    ap.add_argument("--lr", type=float, default=3e-4, help="initial learning rate")
-
-    
     args = ap.parse_args()
 
     # Видимость GPU до импорта TF
@@ -423,33 +421,20 @@ def main():
         os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
     elif args.gpus.lower() != "all":
         os.environ["CUDA_VISIBLE_DEVICES"] = args.gpus
-        
-            # после парсинга аргументов, до lazy_tf()
     if args.no_xla:
         os.environ["TF_XLA_FLAGS"] = "--tf_xla_auto_jit=0"
-
-
-
 
     # Индекс
     items_x, items_y, stats, skipped = build_items(
         args.csv, args.data_dir,
         filename_col=args.filename_col,
         label_col=args.label_col,
-        debug_index=args.debug_index
+        debug_index=False
     )
     assert items_x and items_y, "Не найдено валидных .npy и меток"
     items = list(zip(items_x, items_y))
     paths = items_x
     labels_all = np.array(items_y, dtype=np.int32)
-
-    if args.print_csv_preview:
-        print("\n=== CSV preview (first 5 rows) ===")
-        df_preview = pd.read_csv(args.csv)
-        print(df_preview.head(5).to_string(index=False))
-        if "No inj/ inj" in df_preview.columns:
-            print("\nLabel value counts in 'No inj/ inj':")
-            print(df_preview["No inj/ inj"].value_counts(dropna=False))
 
     if args.peek > 0:
         print(f"\n=== Peek first {min(args.peek, len(items))} matched items ===")
@@ -524,7 +509,6 @@ def main():
         model = build_tcn_model(
             (max_len, feat_dim),
             learning_rate=args.lr,
-         
             mixed_precision=args.mixed_precision,
             tcn_filters=args.tcn_filters,
             tcn_kernel=args.tcn_kernel,
@@ -552,10 +536,13 @@ def main():
     # Предсказания и метрики
     prob_dev  = model.predict(dev_ds,  verbose=0).reshape(-1).astype(np.float32)
     y_dev     = labels_all[idx_dev]
-    thr = best_threshold(y_dev, prob_dev,
-                     mode=args.threshold_mode,
-                     fixed=args.threshold_fixed,
-                     target_spec=args.target_specificity)
+    thr = best_threshold(
+        y_dev, prob_dev,
+        mode=args.threshold_mode,
+        fixed=args.threshold_fixed,
+        target_spec=args.target_specificity
+    )
+    print(f"Chosen threshold: {thr:.3f}")
 
     prob_test = model.predict(test_ds, verbose=0).reshape(-1).astype(np.float32)
     y_test    = labels_all[idx_test]
