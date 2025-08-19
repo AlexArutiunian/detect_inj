@@ -275,7 +275,6 @@ def _sinusoidal_pe(max_len: int, d_model: int) -> np.ndarray:
     pe[:, 0::2] = np.sin(angles[:, 0::2])
     pe[:, 1::2] = np.cos(angles[:, 1::2])
     return pe[None, :, :]  # (1, L, D)
-
 def build_transformer_model(
         input_shape,               # (max_len, feat_dim)
         learning_rate=1e-3,
@@ -292,62 +291,67 @@ def build_transformer_model(
     max_len, feat_dim = input_shape
 
     # Вход
-    inp = layers.Input(shape=input_shape, name="seq_input")                  # (B, T, F)
+    inp = layers.Input(shape=input_shape, name="seq_input")  # (B, T, F)
 
-    # Булева маска валидных таймстепов (там где не всё нули)
+    # ===== маски =====
+    # валидные таймстепы: там, где строка не вся из нулей (паддинг у нас нули)
+    valid_mask = layers.Lambda(
+        lambda t: tf.reduce_any(tf.not_equal(t, 0.0), axis=-1),
+        name="valid_mask"
+    )(inp)  # (B, T) bool
+
+    # key padding mask для MHA (B, 1, T) — XLA-дружелюбно, без einsum
     key_mask = layers.Lambda(
         lambda m: tf.expand_dims(tf.cast(m, tf.bool), axis=1),
         name="key_mask"
-    )(valid_mask)  # (B, 1, T) bool                                                                # (B, T) bool
+    )(valid_mask)  # (B, 1, T) bool
 
-    # Маска внимания (B, T, T): разрешаем внимание только между валидными токенами
-    attn_mask = layers.Lambda(
-        lambda m: tf.einsum('bi,bj->bij', tf.cast(m, tf.bool), tf.cast(m, tf.bool)),
-        name="attn_mask"
-    )(valid_mask)                                                            # bool
+    # ===== проектирование + позиции =====
+    x = layers.Dense(d_model, name="proj")(inp)  # (B, T, D)
 
-    # Линейная проекция признаков -> d_model
-    x = layers.Dense(d_model, name="proj")(inp)                              # (B, T, D)
-
-    # Синусоидальная позиционная энкодировка
+    # фиксированная синусоидальная PE
     pe_np = _sinusoidal_pe(max_len, d_model)
     pe = tf.constant(pe_np, dtype=tf.float32)
-    x = layers.Lambda(lambda z: z + tf.cast(pe, z.dtype), name="add_positional_encoding")(x)
+    x = layers.Lambda(lambda z: z + tf.cast(pe, z.dtype),
+                      name="add_positional_encoding")(x)
 
     x = layers.Dropout(dropout, name="drop_in")(x)
 
-    # Стек энкодеров
+    # ===== стек энкодеров =====
     for i in range(num_layers):
-        # Пре-нормализация + MHA
+        # MHA блок (pre-LN)
         x_norm = layers.LayerNormalization(epsilon=1e-6, name=f"ln1_{i}")(x)
         attn_out = layers.MultiHeadAttention(
-            num_heads=num_heads, key_dim=d_model // num_heads,
-            dropout=attn_dropout, name=f"mha_{i}"
-        )(
-            x_norm, x_norm,
-            attention_mask=key_mask   # ← вместо attn_mask
+            num_heads=num_heads,
+            key_dim=d_model // num_heads,
+            dropout=attn_dropout,
+            name=f"mha_{i}",
+        )(x_norm, x_norm, attention_mask=key_mask)   # <— подаём key padding mask
+        x = layers.Add(name=f"res_attn_{i}")(
+            [x, layers.Dropout(dropout, name=f"drop_attn_{i}")(attn_out)]
         )
-        x = layers.Add(name=f"res_attn_{i}")([x, layers.Dropout(dropout, name=f"drop_attn_{i}")(attn_out)])
 
-        # FFN
+        # FFN блок
         y = layers.LayerNormalization(epsilon=1e-6, name=f"ln2_{i}")(x)
         y = layers.Dense(ff_dim, activation="relu", name=f"ffn_{i}_dense1")(y)
         y = layers.Dropout(dropout, name=f"ffn_{i}_drop1")(y)
         y = layers.Dense(d_model, name=f"ffn_{i}_dense2")(y)
-        x = layers.Add(name=f"res_ffn_{i}")([x, layers.Dropout(dropout, name=f"ffn_{i}_drop2")(y)])
+        x = layers.Add(name=f"res_ffn_{i}")(
+            [x, layers.Dropout(dropout, name=f"ffn_{i}_drop2")(y)]
+        )
 
-    # Маскированный mean-pooling по времени
+    # ===== маскированный mean pooling =====
     def masked_mean(args):
         h, m = args  # h:(B,T,D), m:(B,T)
         m = tf.cast(m, h.dtype)
-        m = tf.expand_dims(m, -1)                # (B,T,1)
-        s = tf.reduce_sum(h * m, axis=1)         # (B,D)
-        c = tf.reduce_sum(m, axis=1) + 1e-6      # (B,1)
+        m = tf.expand_dims(m, -1)               # (B,T,1)
+        s = tf.reduce_sum(h * m, axis=1)        # (B,D)
+        c = tf.reduce_sum(m, axis=1) + 1e-6     # (B,1)
         return s / c
 
     pooled = layers.Lambda(masked_mean, name="masked_mean_pool")([x, valid_mask])  # (B, D)
 
-    # Классификатор
+    # ===== классификатор =====
     z = layers.Dropout(0.3, name="head_drop")(pooled)
     z = layers.Dense(64, activation="relu", name="head_dense")(z)
     out = layers.Dense(1, activation="sigmoid", dtype="float32", name="out")(z)
@@ -356,6 +360,7 @@ def build_transformer_model(
     opt = tf.keras.optimizers.Adam(learning_rate=learning_rate, clipnorm=1.0)
     model.compile(optimizer=opt, loss="binary_crossentropy", metrics=["accuracy"])
     return model
+
 
 # ---------------------- main ----------------------
 def main():
