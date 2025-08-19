@@ -403,6 +403,13 @@ def main():
                 choices=["bal_acc", "f1_pos", "macro_f1", "roc_j", "spec", "fixed"])
     ap.add_argument("--threshold_fixed", type=float, default=None)
     ap.add_argument("--target_specificity", type=float, default=None)
+    
+    # после threshold-параметров
+    ap.add_argument("--cw_scale0", type=float, default=1.0,
+                    help="доп. множитель веса класса 0 (No injury)")
+    ap.add_argument("--cw_scale1", type=float, default=1.0,
+                    help="доп. множитель веса класса 1 (Injury)")
+
 
         
     
