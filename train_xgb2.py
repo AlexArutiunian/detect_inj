@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# train_xgb.py — XGBoost для бинарной классификации injury/no-injury на NPY-траекториях
+# train_xgb.py — XGBoost для бинарной классификации injury/no-injury (NPY → агрегированные фичи)
+# Визуализации: CM, ROC, PR, F1(thr), feature importance, HTML-отчёт, inline в Colab.
 
 import os, json, argparse
 import numpy as np, pandas as pd
@@ -14,20 +15,21 @@ from sklearn.metrics import (accuracy_score, f1_score, roc_auc_score,
                              average_precision_score)
 from xgboost import XGBClassifier
 try:
-    from xgboost import callback as xgb_callback  # может отсутствовать в старых версиях
+    from xgboost import callback as xgb_callback   # может отсутствовать в очень старых версиях
 except Exception:
     xgb_callback = None
 
 import joblib
 
-# Matplotlib без GUI
+# ---- Matplotlib (без GUI) ----
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 
-# ---------- Утилиты ----------
-def ensure_dir(p): os.makedirs(p, exist_ok=True)
+# ===================== УТИЛИТЫ =====================
+def ensure_dir(p: str) -> None:
+    os.makedirs(p, exist_ok=True)
 
 def label_to_int(v):
     if v is None: return None
@@ -45,33 +47,40 @@ def compute_metrics(y_true, y_pred, y_prob):
         "report": classification_report(y_true, y_pred, digits=3),
     }
 
-import numpy as np
+def best_threshold_by_f1(y_true, proba):
+    pr, rc, th = precision_recall_curve(y_true, proba)
+    f1_vals = 2 * pr[:-1] * rc[:-1] / np.clip(pr[:-1] + rc[:-1], 1e-12, None)
+    if len(f1_vals) == 0 or np.all(np.isnan(f1_vals)): return 0.5
+    best_idx = int(np.nanargmax(f1_vals))
+    return float(th[max(0, min(best_idx, len(th)-1))])
 
-def thr_max_tnr_at_min_recall(y_true, proba, min_recall1=0.93):
-    """Выбрать порог, максимизирующий TNR (specificity класса 0),
-       при ограничении Recall класса 1 >= min_recall1."""
-    ths = np.unique(proba)
-    ths = np.r_[0.0, ths, 1.0]
+def thr_tnr_with_constraints(y_true, proba, min_recall1=0.93, min_precision1=0.95):
+    """Максимизируем TNR (specificity класса 0) при одновременных ограничениях:
+       recall_1 >= min_recall1 и precision_1 >= min_precision1."""
+    y = np.asarray(y_true).astype(int)
+    ths = np.r_[0.0, np.unique(proba), 1.0]
+
     best_thr = 0.5
     best_tnr = -1.0
+    best_stats = (np.nan, np.nan, np.nan)  # (prec1, rec1, tnr)
 
-    y_true = np.asarray(y_true)
     for t in ths:
         pred = (proba >= t).astype(int)
-        TP = np.sum((y_true == 1) & (pred == 1))
-        FN = np.sum((y_true == 1) & (pred == 0))
-        TN = np.sum((y_true == 0) & (pred == 0))
-        FP = np.sum((y_true == 0) & (pred == 1))
+        TP = np.sum((y == 1) & (pred == 1))
+        FN = np.sum((y == 1) & (pred == 0))
+        TN = np.sum((y == 0) & (pred == 0))
+        FP = np.sum((y == 0) & (pred == 1))
 
         rec1 = TP / max(TP + FN, 1)
-        tnr  = TN / max(TN + FP, 1)  # specificity для класса 0
+        prec1 = TP / max(TP + FP, 1)
+        tnr   = TN / max(TN + FP, 1)
 
-        if rec1 >= min_recall1 and tnr > best_tnr:
+        if (rec1 >= min_recall1) and (prec1 >= min_precision1) and (tnr > best_tnr):
             best_tnr = tnr
             best_thr = float(t)
+            best_stats = (prec1, rec1, tnr)
 
-    return best_thr, best_tnr
-
+    return best_thr, best_stats
 
 def print_split_stats(name, y):
     n = len(y); n1 = int(np.sum(y==1)); n0 = n-n1
@@ -79,7 +88,7 @@ def print_split_stats(name, y):
     print(f"[{name}] total={n} | Injury=1: {n1} ({p1:.1f}%) | No Injury=0: {n0} ({p0:.1f}%)")
 
 
-# ---------- Фичи из NPY ----------
+# ===================== ФИЧИ ИЗ NPY =====================
 _STAT_NAMES = ["mean","std","min","max","dmean","dstd"]
 _AXIS = ["x","y","z"]
 
@@ -147,7 +156,7 @@ def load_features_from_npy(csv_path, npy_dir, filename_col="filename",
     return X, y
 
 
-# ---------- Визуализации/отчёт ----------
+# ===================== ВИЗУАЛИЗАЦИИ / ОТЧЁТ =====================
 CLASS_NAMES = ["No Injury (0)", "Injury (1)"]
 
 def _plot_confusion(cm, title, path):
@@ -241,15 +250,27 @@ def _display_inline(images, show):
         print(f"[inline-display disabled] {e}")
 
 
-# ---------- Обучение ----------
-def train_xgb(X_train, X_dev, X_test, y_train, y_dev, y_test, out_dir,
-              n_estimators=2000, learning_rate=0.05, max_depth=6,
-              subsample=0.9, colsample_bytree=0.9, reg_lambda=1.0,
-              early_stopping_rounds=50, random_state=42,
-              min_recall1=0.93):  
-
-    pos, neg = int(np.sum(y_train == 1)), int(np.sum(y_train == 0))
-    spw = (neg / max(pos, 1)) if pos > 0 else 1.0
+# ===================== ОБУЧЕНИЕ =====================
+def train_xgb(
+    X_train, X_dev, X_test, y_train, y_dev, y_test, out_dir,
+    # бустинг
+    n_estimators=2000, learning_rate=0.05, max_depth=6,
+    subsample=0.9, colsample_bytree=0.9, reg_lambda=1.0, reg_alpha=0.0,
+    min_child_weight=5.0, gamma=1.0, max_delta_step=1.0,
+    # ES/seed
+    early_stopping_rounds=50, random_state=42,
+    # веса классов
+    w0=2.0, w1=1.0, use_scale_pos_weight=True,
+    # порог
+    thr_mode="tnr_constrained", min_recall1=0.93, min_precision1=0.95, fixed_thr=None,
+    # калибровка вероятностей
+    calibrate="none"  # 'none' | 'isotonic' | 'platt'
+):
+    # scale_pos_weight из дисбаланса train
+    spw = 1.0
+    if use_scale_pos_weight:
+        pos, neg = int(np.sum(y_train == 1)), int(np.sum(y_train == 0))
+        spw = (neg / max(pos, 1)) if pos > 0 else 1.0
 
     model = XGBClassifier(
         n_estimators=n_estimators,
@@ -258,6 +279,10 @@ def train_xgb(X_train, X_dev, X_test, y_train, y_dev, y_test, out_dir,
         subsample=subsample,
         colsample_bytree=colsample_bytree,
         reg_lambda=reg_lambda,
+        reg_alpha=reg_alpha,
+        min_child_weight=min_child_weight,
+        gamma=gamma,
+        max_delta_step=max_delta_step,
         objective="binary:logistic",
         eval_metric="auc",
         tree_method="hist",
@@ -266,108 +291,127 @@ def train_xgb(X_train, X_dev, X_test, y_train, y_dev, y_test, out_dir,
         n_jobs=-1
     )
 
-    use_best = False
-    # 1) Современный способ: callbacks
-        # === вместо твоего блока fit(...) вставь это ===
-    # Веса классов в обучении: усиливаем класс 0 (No Injury)
-    w0, w1 = 2.0, 1.0   # подбирай по DEV (1.5–3.0 обычно ок)
+    # sample_weight усиливает класс 0 (No Injury)
     sw_train = np.where(y_train == 0, w0, w1).astype(np.float32)
     sw_dev   = np.where(y_dev   == 0, w0, w1).astype(np.float32)
 
+    # ---- fit с поддержкой и без callbacks / eval_sample_weight
     use_best = False
-
-    # 1) Современный способ: callbacks EarlyStopping
     try:
         if xgb_callback is not None:
-            es = xgb_callback.EarlyStopping(
-                rounds=early_stopping_rounds, save_best=True, maximize=True
-            )
+            es = xgb_callback.EarlyStopping(rounds=early_stopping_rounds, save_best=True, maximize=True)
             try:
-                # новые версии поддерживают eval_sample_weight
-                model.fit(
-                    X_train, y_train,
-                    sample_weight=sw_train,
-                    eval_set=[(X_dev, y_dev)],
-                    eval_sample_weight=[sw_dev],
-                    callbacks=[es],
-                    verbose=False
-                )
+                model.fit(X_train, y_train,
+                          sample_weight=sw_train,
+                          eval_set=[(X_dev, y_dev)],
+                          eval_sample_weight=[sw_dev],
+                          callbacks=[es], verbose=False)
             except TypeError:
-                # старые версии без eval_sample_weight
-                model.fit(
-                    X_train, y_train,
-                    sample_weight=sw_train,
-                    eval_set=[(X_dev, y_dev)],
-                    callbacks=[es],
-                    verbose=False
-                )
+                model.fit(X_train, y_train,
+                          sample_weight=sw_train,
+                          eval_set=[(X_dev, y_dev)],
+                          callbacks=[es], verbose=False)
             use_best = True
         else:
             raise TypeError("callbacks not available")
     except TypeError:
-        # 2) Классический способ: early_stopping_rounds в fit()
         try:
             try:
-                model.fit(
-                    X_train, y_train,
-                    sample_weight=sw_train,
-                    eval_set=[(X_dev, y_dev)],
-                    eval_sample_weight=[sw_dev],
-                    early_stopping_rounds=early_stopping_rounds,
-                    verbose=False
-                )
+                model.fit(X_train, y_train,
+                          sample_weight=sw_train,
+                          eval_set=[(X_dev, y_dev)],
+                          eval_sample_weight=[sw_dev],
+                          early_stopping_rounds=early_stopping_rounds, verbose=False)
             except TypeError:
-                model.fit(
-                    X_train, y_train,
-                    sample_weight=sw_train,
-                    eval_set=[(X_dev, y_dev)],
-                    early_stopping_rounds=early_stopping_rounds,
-                    verbose=False
-                )
+                model.fit(X_train, y_train,
+                          sample_weight=sw_train,
+                          eval_set=[(X_dev, y_dev)],
+                          early_stopping_rounds=early_stopping_rounds, verbose=False)
             use_best = True
         except TypeError:
-            # 3) Очень старая версия: без early stopping
             print("[warn] early stopping недоступен — обучаю без него.")
             model.fit(X_train, y_train, sample_weight=sw_train, verbose=False)
 
-
-    # Предсказания с учётом лучшей итерации, если она есть
+    # ---- получить предсказания c учётом best_iteration
     kw = {}
     if use_best:
-        best_it = getattr(model, "best_iteration", None)
-        if best_it is None:
-            best_it = getattr(model, "best_iteration_", None)
-        if best_it is not None:
+        bi = getattr(model, "best_iteration", None)
+        if bi is None:
+            bi = getattr(model, "best_iteration_", None)
+        if bi is not None:
             try:
-                kw = {"iteration_range": (0, int(best_it) + 1)}  # новые версии
+                kw = {"iteration_range": (0, int(bi)+1)}
             except TypeError:
                 kw = {}
         if not kw:
-            best_ntree_limit = getattr(model, "best_ntree_limit", None)  # старые версии
-            if best_ntree_limit is not None:
-                kw = {"ntree_limit": int(best_ntree_limit)}
+            bntl = getattr(model, "best_ntree_limit", None)
+            if bntl is not None:
+                kw = {"ntree_limit": int(bntl)}
 
-    prob_dev  = model.predict_proba(X_dev, **kw)[:, 1]
-    thr, _ = thr_max_tnr_at_min_recall(y_dev, prob_dev, min_recall1=min_recall1)
-    pred_dev  = (prob_dev >= thr).astype(int)
+    # ---- калибровка вероятностей по DEV
+    calibrator = None
+    def _apply_cal(p): return calibrator.transform(p) if calibrator is not None else p
+
+    prob_dev_raw  = model.predict_proba(X_dev,  **kw)[:, 1]
+    if calibrate.lower() == "isotonic":
+        try:
+            from sklearn.isotonic import IsotonicRegression
+            calibrator = IsotonicRegression(out_of_bounds="clip")
+            calibrator.fit(prob_dev_raw, y_dev)
+        except Exception as e:
+            print(f"[warn] isotonic calibration disabled: {e}")
+    elif calibrate.lower() == "platt":
+        try:
+            from sklearn.linear_model import LogisticRegression
+            lr = LogisticRegression(max_iter=1000)
+            # обучаем LR на единственном признаке: исходная вероятность
+            lr.fit(prob_dev_raw.reshape(-1,1), y_dev)
+            class _LRWrap:
+                def __init__(self, lr): self.lr = lr
+                def transform(self, p):
+                    return self.lr.predict_proba(p.reshape(-1,1))[:,1]
+            calibrator = _LRWrap(lr)
+        except Exception as e:
+            print(f"[warn] platt calibration disabled: {e}")
+
+    prob_dev = _apply_cal(prob_dev_raw)
+
+    # ---- подбор порога
+    if fixed_thr is not None:
+        thr = float(fixed_thr)
+    else:
+        if thr_mode == "f1":
+            thr = best_threshold_by_f1(y_dev, prob_dev)
+        elif thr_mode == "tnr_constrained":
+            thr, stats = thr_tnr_with_constraints(y_dev, prob_dev,
+                                                  min_recall1=min_recall1,
+                                                  min_precision1=min_precision1)
+            print(f"[thr] constrained: precision1={stats[0]:.3f}, recall1={stats[1]:.3f}, TNR={stats[2]:.3f}, thr={thr:.3f}")
+        else:
+            raise ValueError("--thr_mode must be one of: f1 | tnr_constrained")
+
+    # ---- метрики DEV/TEST
+    pred_dev = (prob_dev >= thr).astype(int)
     dev_metrics = compute_metrics(y_dev, pred_dev, prob_dev)
 
-    prob_test = model.predict_proba(X_test, **kw)[:, 1]
+    prob_test_raw = model.predict_proba(X_test, **kw)[:, 1]
+    prob_test = _apply_cal(prob_test_raw)
     pred_test = (prob_test >= thr).astype(int)
     test_metrics = compute_metrics(y_test, pred_test, prob_test)
 
     with open(os.path.join(out_dir, "threshold.txt"), "w") as f:
         f.write(str(thr))
+    if calibrator is not None:
+        joblib.dump(calibrator, os.path.join(out_dir, "calibrator.joblib"))
 
-    return dev_metrics, test_metrics, thr, model
+    return dev_metrics, test_metrics, thr, model, prob_dev, prob_test
 
 
-
-# ---------- MAIN ----------
+# ===================== MAIN =====================
 if __name__ == "__main__":
     p = argparse.ArgumentParser(description="XGBoost injury/no-injury (NPY -> aggregated features)")
-    p.add_argument("--min_recall1", type=float, default=0.93,
-                   help="минимальный recall класса 1 (injury) при оптимизации порога по TNR")
+
+    # пути/данные
     p.add_argument("--csv", required=True, type=str)
     p.add_argument("--data_dir", required=True, type=str, help="папка с .npy")
     p.add_argument("--filename_col", default="filename", type=str)
@@ -376,19 +420,44 @@ if __name__ == "__main__":
     p.add_argument("--out_dir", default="outputs/xgb", type=str)
     p.add_argument("--downsample", default=1, type=int)
     p.add_argument("--loader_workers", default=0, type=int)
-    # XGB гиперпараметры (мои рекомендации)
-    p.add_argument("--n_estimators", default=2000, type=int)
-    p.add_argument("--early_stopping_rounds", default=50, type=int)
-    p.add_argument("--learning_rate", default=0.05, type=float)
-    p.add_argument("--max_depth", default=6, type=int)
-    p.add_argument("--subsample", default=0.9, type=float)
-    p.add_argument("--colsample_bytree", default=0.9, type=float)
-    p.add_argument("--reg_lambda", default=1.0, type=float)
-    # визуализации
-    p.add_argument("--top_features", default=30, type=int)
-    p.add_argument("--show_plots", action="store_true")
-    args = p.parse_args()
 
+    # сплиты
+    p.add_argument("--test_size", type=float, default=0.20)
+    p.add_argument("--dev_size_from_train", type=float, default=0.125, help="доля от train → dev (~0.125 даёт 10%)")
+    p.add_argument("--seed", type=int, default=42)
+
+    # XGB гиперпараметры
+    p.add_argument("--n_estimators", type=int, default=2000)
+    p.add_argument("--early_stopping_rounds", type=int, default=50)
+    p.add_argument("--learning_rate", type=float, default=0.05)
+    p.add_argument("--max_depth", type=int, default=6)
+    p.add_argument("--subsample", type=float, default=0.9)
+    p.add_argument("--colsample_bytree", type=float, default=0.9)
+    p.add_argument("--reg_lambda", type=float, default=1.0)
+    p.add_argument("--reg_alpha", type=float, default=0.0)
+    p.add_argument("--min_child_weight", type=float, default=5.0)
+    p.add_argument("--gamma", type=float, default=1.0)
+    p.add_argument("--max_delta_step", type=float, default=1.0)
+    p.add_argument("--use_scale_pos_weight", action="store_true", help="включить scale_pos_weight из дисбаланса train")
+
+    # веса классов в sample_weight
+    p.add_argument("--w0", type=float, default=2.0, help="вес класса 0 (No injury)")
+    p.add_argument("--w1", type=float, default=1.0, help="вес класса 1 (Injury)")
+
+    # стратегия порога
+    p.add_argument("--thr_mode", type=str, default="tnr_constrained", choices=["f1","tnr_constrained"])
+    p.add_argument("--min_recall1", type=float, default=0.93, help="ограничение на recall класса 1")
+    p.add_argument("--min_precision1", type=float, default=0.95, help="ограничение на precision класса 1")
+    p.add_argument("--fixed_thr", type=float, default=None, help="если задано — использовать фиксированный порог")
+
+    # калибровка
+    p.add_argument("--calibrate", type=str, default="none", choices=["none","isotonic","platt"])
+
+    # визуализации
+    p.add_argument("--top_features", type=int, default=30)
+    p.add_argument("--show_plots", action="store_true")
+
+    args = p.parse_args()
     ensure_dir(args.out_dir)
 
     # схема суставов (для имён фич)
@@ -404,12 +473,12 @@ if __name__ == "__main__":
         downsample=args.downsample, workers=args.loader_workers
     )
 
-    # 2) Сплит 70/20/10
+    # 2) Сплиты 70/10/20 по умолчанию
     X_train_full, X_test, y_train_full, y_test = train_test_split(
-        X_all, y_all, test_size=0.20, random_state=42, stratify=y_all
+        X_all, y_all, test_size=args.test_size, random_state=args.seed, stratify=y_all
     )
     X_train, X_dev, y_train, y_dev = train_test_split(
-        X_train_full, y_train_full, test_size=0.125, random_state=42, stratify=y_train_full
+        X_train_full, y_train_full, test_size=args.dev_size_from_train, random_state=args.seed, stratify=y_train_full
     )
 
     print("\n=== Split stats ===")
@@ -423,21 +492,26 @@ if __name__ == "__main__":
     X_dev_s   = scaler.transform(X_dev)
     X_test_s  = scaler.transform(X_test)
 
-    # 4) Обучение XGB с early stopping и F1-threshold
-    dev_metrics, test_metrics, thr, model = train_xgb(
-    X_train_s, X_dev_s, X_test_s, y_train, y_dev, y_test,
-    out_dir=args.out_dir,
-    n_estimators=args.n_estimators,
-    learning_rate=args.learning_rate,
-    max_depth=args.max_depth,
-    subsample=args.subsample,
-    colsample_bytree=args.colsample_bytree,
-    reg_lambda=args.reg_lambda,
-    early_stopping_rounds=args.early_stopping_rounds,
-    random_state=42,
-    min_recall1=args.min_recall1,   # <-- добавили
-    )   
-
+    # 4) Обучение XGB + порог
+    dev_metrics, test_metrics, thr, model, prob_dev, prob_test = train_xgb(
+        X_train_s, X_dev_s, X_test_s, y_train, y_dev, y_test,
+        out_dir=args.out_dir,
+        n_estimators=args.n_estimators,
+        learning_rate=args.learning_rate,
+        max_depth=args.max_depth,
+        subsample=args.subsample,
+        colsample_bytree=args.colsample_bytree,
+        reg_lambda=args.reg_lambda,
+        reg_alpha=args.reg_alpha,
+        min_child_weight=args.min_child_weight,
+        gamma=args.gamma,
+        max_delta_step=args.max_delta_step,
+        early_stopping_rounds=args.early_stopping_rounds,
+        random_state=args.seed,
+        w0=args.w0, w1=args.w1, use_scale_pos_weight=args.use_scale_pos_weight,
+        thr_mode=args.thr_mode, min_recall1=args.min_recall1, min_precision1=args.min_precision1, fixed_thr=args.fixed_thr,
+        calibrate=args.calibrate
+    )
 
     # 5) Сохранения
     joblib.dump({"model": model, "scaler": scaler}, os.path.join(args.out_dir, "model.joblib"))
@@ -447,45 +521,25 @@ if __name__ == "__main__":
         json.dump(test_metrics, f, ensure_ascii=False, indent=2)
 
     # 6) Визуализации
-    # повторим предсказания (с учётом best_iteration)
-    kw={}
-    if hasattr(model,"best_iteration_") or hasattr(model,"best_iteration"):
-        bi = getattr(model,"best_iteration_", None)
-        if bi is None: bi = getattr(model,"best_iteration", None)
-        if bi is not None: kw={"iteration_range":(0, bi+1)}
-    prob_dev  = model.predict_proba(X_dev_s,  **kw)[:,1]
-    prob_test = model.predict_proba(X_test_s, **kw)[:,1]
-
     images={}
-    # Confusion
     _plot_confusion(np.array(dev_metrics["confusion_matrix"]), "DEV Confusion Matrix",  os.path.join(args.out_dir,"cm_dev.png"));  images["cm_dev"]=os.path.join(args.out_dir,"cm_dev.png")
     _plot_confusion(np.array(test_metrics["confusion_matrix"]), "TEST Confusion Matrix", os.path.join(args.out_dir,"cm_test.png")); images["cm_test"]=os.path.join(args.out_dir,"cm_test.png")
-    # ROC/PR/F1
     _plot_roc(y_dev, prob_dev, "DEV ROC", os.path.join(args.out_dir,"roc_dev.png"));     images["roc_dev"]=os.path.join(args.out_dir,"roc_dev.png")
     _plot_pr(y_dev,  prob_dev, "DEV PR",  os.path.join(args.out_dir,"pr_dev.png"));      images["pr_dev"]=os.path.join(args.out_dir,"pr_dev.png")
     _plot_f1_threshold(y_dev, prob_dev, thr, "DEV F1 vs threshold", os.path.join(args.out_dir,"f1_dev.png")); images["f1_dev"]=os.path.join(args.out_dir,"f1_dev.png")
     _plot_roc(y_test, prob_test, "TEST ROC", os.path.join(args.out_dir,"roc_test.png")); images["roc_test"]=os.path.join(args.out_dir,"roc_test.png")
     _plot_pr(y_test,  prob_test,"TEST PR",  os.path.join(args.out_dir,"pr_test.png"));   images["pr_test"]=os.path.join(args.out_dir,"pr_test.png")
 
-    # Feature importance
     feat_names = classical_feature_names(schema, X_train_s.shape[1])
     if _plot_feature_importance(model, feat_names, args.top_features,
                                 "Feature importance (top)",
                                 os.path.join(args.out_dir,"feature_importance_top.png")):
         images["fi"]=os.path.join(args.out_dir,"feature_importance_top.png")
 
-    # HTML + inline
     _write_html_report(args.out_dir, dev_metrics, test_metrics, images, thr)
-    if args.show_plots:
-        try:
-            from IPython.display import display, HTML, Image as IPyImage
-            display(HTML("<h3>DEV/Test plots</h3>"))
-            for k in ["cm_dev","roc_dev","pr_dev","f1_dev","cm_test","roc_test","pr_test","fi"]:
-                if k in images: display(IPyImage(filename=images[k]))
-        except Exception as e:
-            print(f"[inline-display disabled] {e}")
+    _display_inline(images, args.show_plots)
 
-    # 7) Лог в консоль
+    # 7) Лог
     print("\n=== DEV METRICS (threshold tuned here) ===")
     for k in ["accuracy","f1","roc_auc","confusion_matrix"]:
         print(f"{k}: {dev_metrics[k]}")
