@@ -2,11 +2,11 @@
 # -*- coding: utf-8 -*-
 from typing import List, Tuple, Dict
 from tqdm import tqdm
-import os, json, argparse, math, random
+import os, json, argparse, random
 import numpy as np
 import pandas as pd
 import matplotlib
-matplotlib.use("Agg")           # сохраняем графики без GUI
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from sklearn.metrics import roc_curve, auc
 
@@ -52,20 +52,13 @@ def sanitize_seq(a: np.ndarray) -> np.ndarray:
     a = np.nan_to_num(a, nan=0.0, posinf=0.0, neginf=0.0)
     return a.astype(np.float32, copy=False)
 
-def best_threshold_by_f1(y_true, p):
-    from sklearn.metrics import precision_recall_curve
-    pr, rc, th = precision_recall_curve(y_true, p)
-    if len(th) == 0: return 0.5
-    f1 = 2*pr[:-1]*rc[:-1]/np.clip(pr[:-1]+rc[:-1], 1e-12, None)
-    return float(th[int(np.nanargmax(f1))])
-
 def best_threshold(y_true, p, mode="bal_acc", fixed=None, target_spec=None):
-    """Устойчивый выбор порога."""
+    """Устойчивый выбор порога, чтобы не залипать на одном классе."""
     import numpy as np
     from sklearn.metrics import precision_recall_curve, roc_curve, f1_score, balanced_accuracy_score
 
     p = np.asarray(p, dtype=np.float64)
-    p = np.clip(p, 1e-7, 1 - 1e-7)   # защита от крайностей
+    p = np.clip(p, 1e-7, 1 - 1e-7)
 
     if fixed is not None:
         return float(fixed)
@@ -90,7 +83,7 @@ def best_threshold(y_true, p, mode="bal_acc", fixed=None, target_spec=None):
 
     if mode in ("roc_j", "youden", "spec"):
         fpr, tpr, th = roc_curve(y_true, p)
-        m = ~np.isinf(th)             # убрать inf
+        m = ~np.isinf(th)  # убрать inf
         fpr, tpr, th = fpr[m], tpr[m], th[m]
         spec = 1.0 - fpr
         if mode != "spec":
@@ -128,7 +121,7 @@ def possible_npy_paths(data_dir: str, rel: str) -> List[str]:
     if rel.endswith(".json"):
         base_nojson = rel[:-5]
         push(os.path.join(data_dir, base_nojson + ".npy"))
-        push(os.path.join(data_dir, rel + ".npy"))          # .json.npy
+        push(os.path.join(data_dir, rel + ".npy"))  # .json.npy
 
     if rel.endswith(".json.npy"):
         push(os.path.join(data_dir, rel.replace(".json.npy", ".npy")))
@@ -314,32 +307,33 @@ def build_tcn_model(
     tcn_pool="max",
     dense_units=64,
     dense_dropout=0.3,
+    norm_type="layer",  # "layer" | "batch" | "none"
 ):
-    """
-    Temporal Convolutional Network:
-    - residual-блоки: 2× Conv1D (causal) с одинаковой дилатацией
-    - BatchNorm + ReLU + Dropout внутри блока
-    - Агрегация по времени: GlobalMaxPooling1D (по умолч.), можно avg
-    """
     tf, layers, models = lazy_tf()
+
+    def _norm(x):
+        if norm_type == "layer":
+            return layers.LayerNormalization(epsilon=1e-5)(x)
+        elif norm_type == "batch":
+            return layers.BatchNormalization(epsilon=1e-3)(x)
+        else:
+            return x
 
     def tcn_block(x, filters, kernel_size, dilation_rate, dropout):
         y = layers.Conv1D(filters, kernel_size, padding="causal",
-                          dilation_rate=dilation_rate)(x)
-        y = layers.BatchNormalization(epsilon=1e-3)(y)
+                          dilation_rate=dilation_rate,
+                          kernel_initializer="he_normal", use_bias=True)(x)
+        y = _norm(y)
         y = layers.Activation("relu")(y)
-        y = layers.Dropout(dropout)(y)
+        if dropout and dropout > 0:
+            y = layers.Dropout(dropout)(y)
 
         y = layers.Conv1D(filters, kernel_size, padding="causal",
-                          dilation_rate=dilation_rate)(y)
-        y = layers.BatchNormalization(epsilon=1e-3)(y)
+                          dilation_rate=dilation_rate,
+                          kernel_initializer="he_normal", use_bias=True)(y)
+        y = _norm(y)
 
-        # residual match
-        if x.shape[-1] != filters:
-            res = layers.Conv1D(filters, 1, padding="same")(x)
-        else:
-            res = x
-
+        res = x if x.shape[-1] == filters else layers.Conv1D(filters, 1, padding="same")(x)
         y = layers.Add()([res, y])
         y = layers.Activation("relu")(y)
         return y
@@ -353,14 +347,15 @@ def build_tcn_model(
     if tcn_pool.lower() == "avg":
         x = layers.GlobalAveragePooling1D()(x)
     else:
-        x = layers.GlobalMaxPooling1D()(x)  # дефолт как раньше
+        x = layers.GlobalMaxPooling1D()(x)
 
     x = layers.Dropout(dense_dropout)(x)
     x = layers.Dense(dense_units, activation="relu")(x)
     out = layers.Dense(1, activation="sigmoid", dtype="float32")(x)
 
     model = models.Model(inp, out)
-    opt = tf.keras.optimizers.Adam(learning_rate=learning_rate, clipnorm=1.0)
+    opt = tf.keras.optimizers.Adam(learning_rate=learning_rate, epsilon=1e-7,
+                                   amsgrad=True, clipnorm=1.0)
     model.compile(optimizer=opt, loss="binary_crossentropy", metrics=["accuracy"])
     return model
 
@@ -381,24 +376,24 @@ def main():
     ap.add_argument("--label_col", default="No inj/ inj")
     ap.add_argument("--out_dir", default="output_run_tcn")
     ap.add_argument("--epochs", type=int, default=20)
-    ap.add_argument("--batch_size", type=int, default=16)  # локальный BS (умножается на #GPU)
+    ap.add_argument("--batch_size", type=int, default=16)
     ap.add_argument("--downsample", type=int, default=1)
-    ap.add_argument("--max_len", default="auto")           # "auto" -> 95 перцентиль
-    ap.add_argument("--gpus", default="all")               # "all" | "cpu" | "0,1"
+    ap.add_argument("--max_len", default="auto")
+    ap.add_argument("--gpus", default="all")
     ap.add_argument("--mixed_precision", action="store_true")
     ap.add_argument("--no_xla", action="store_true", help="Disable XLA JIT")
     ap.add_argument("--lr", type=float, default=1e-3, help="initial learning rate")
 
-    # ---- TCN hyperparams (все опциональные, дефолты как раньше) ----
-    ap.add_argument("--tcn_filters", type=int, default=64, help="Число каналов в Conv1D")
-    ap.add_argument("--tcn_kernel", type=int, default=5, help="Размер ядра Conv1D")
-    ap.add_argument("--tcn_dilations", type=str, default="1,2,4,8",
-                    help="Список дилатаций через запятую, напр. '1,2,4,8'")
-    ap.add_argument("--tcn_block_dropout", type=float, default=0.2, help="Dropout внутри TCN-блоков")
-    ap.add_argument("--tcn_pool", type=str, choices=["max","avg"], default="max",
-                    help="Агрегация по времени: max или avg")
-    ap.add_argument("--tcn_dense_units", type=int, default=64, help="Юниты в Dense-слое головы")
-    ap.add_argument("--tcn_dense_dropout", type=float, default=0.3, help="Dropout перед Dense")
+    # ---- TCN hyperparams ----
+    ap.add_argument("--tcn_filters", type=int, default=64)
+    ap.add_argument("--tcn_kernel", type=int, default=5)
+    ap.add_argument("--tcn_dilations", type=str, default="1,2,4,8")
+    ap.add_argument("--tcn_block_dropout", type=float, default=0.2)
+    ap.add_argument("--tcn_pool", type=str, choices=["max","avg"], default="max")
+    ap.add_argument("--tcn_dense_units", type=int, default=64)
+    ap.add_argument("--tcn_dense_dropout", type=float, default=0.3)
+    ap.add_argument("--norm", choices=["layer","batch","none"], default="layer",
+                    help="нормализация внутри TCN-блоков")
 
     # прочее
     ap.add_argument("--peek", type=int, default=0,
@@ -475,7 +470,7 @@ def main():
 
     if args.mixed_precision:
         from tensorflow.keras import mixed_precision as mp
-        mp.set_global_policy("mixed_float16")  # выходной Dense уже float32
+        mp.set_global_policy("mixed_float16")  # выход Dense уже float32
 
     strategy = tf.distribute.MirroredStrategy() if len(gpus) > 1 else None
     replicas = strategy.num_replicas_in_sync if strategy else 1
@@ -501,7 +496,7 @@ def main():
     print(f"TCN config: filters={args.tcn_filters}, kernel={args.tcn_kernel}, "
           f"dilations={dilations}, block_dropout={args.tcn_block_dropout}, "
           f"pool={args.tcn_pool}, dense_units={args.tcn_dense_units}, "
-          f"dense_dropout={args.tcn_dense_dropout}")
+          f"dense_dropout={args.tcn_dense_dropout}, norm={args.norm}")
 
     # Строим модель (TCN)
     ctx = strategy.scope() if strategy else contextlib_null()
@@ -517,12 +512,13 @@ def main():
             tcn_pool=args.tcn_pool,
             dense_units=args.tcn_dense_units,
             dense_dropout=args.tcn_dense_dropout,
+            norm_type=args.norm,
         )
 
     # Коллбеки
     cb = [
         tf.keras.callbacks.EarlyStopping(monitor="val_loss", patience=6, restore_best_weights=True),
-        tf.keras.callbacks.ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=2, min_lr=1e-6)
+        tf.keras.callbacks.ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=2, min_lr=1e-6),
     ]
 
     # Обучение
