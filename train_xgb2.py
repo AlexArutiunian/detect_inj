@@ -54,6 +54,83 @@ def best_threshold_by_f1(y_true, proba):
     best_idx = int(np.nanargmax(f1_vals))
     return float(th[max(0, min(best_idx, len(th)-1))])
 
+import numpy as np
+import json
+import os
+
+def choose_threshold_constrained(
+    y_true, proba,
+    min_recall1=0.93,
+    min_precision1=None,        # можно оставить None, тогда требуем только recall
+    prefer="tnr",               # чем среди допустимых порогов максимизировать: "tnr" | "f1" | "balacc"
+    warn=True,
+    compromise_weights=(10.0, 5.0, 1.0, 0.2)  # w_rec_shortfall, w_prec_shortfall, w_tnr_reward, w_rec_reward
+):
+    """
+    Возвращает (thr, info_dict).
+    Если есть пороги, удовлетворяющие ограничениям, выбирает лучший по `prefer`.
+    Если НЕТ — выбирает лучший компромисс и печатает предупреждение.
+    """
+    y_true = np.asarray(y_true).astype(int)
+    proba  = np.asarray(proba, dtype=float)
+
+    ths = np.r_[0.0, np.unique(proba), 1.0]
+
+    def stats_at(t):
+        pred = (proba >= t).astype(int)
+        TP = np.sum((y_true == 1) & (pred == 1))
+        FN = np.sum((y_true == 1) & (pred == 0))
+        TN = np.sum((y_true == 0) & (pred == 0))
+        FP = np.sum((y_true == 0) & (pred == 1))
+        rec1 = TP / max(TP + FN, 1)
+        prec1 = TP / max(TP + FP, 1)
+        tnr = TN / max(TN + FP, 1)             # specificity класса 0
+        f1 = (2*prec1*rec1) / max(prec1 + rec1, 1e-12)
+        balacc = 0.5 * (tnr + rec1)
+        return dict(thr=float(t), TP=int(TP), FN=int(FN), TN=int(TN), FP=int(FP),
+                    recall1=float(rec1), precision1=float(prec1),
+                    tnr=float(tnr), f1=float(f1), balacc=float(balacc))
+
+    stats = [stats_at(t) for t in ths]
+
+    # допустимые пороги
+    feasible = []
+    for s in stats:
+        ok_rec = (s["recall1"] >= min_recall1)
+        ok_pre = (True if (min_precision1 is None) else (s["precision1"] >= min_precision1))
+        if ok_rec and ok_pre:
+            feasible.append(s)
+
+    if feasible:
+        key = dict(tnr="tnr", f1="f1", balacc="balacc")[prefer]
+        best = max(feasible, key=lambda s: s[key])
+        best["feasible"] = True
+        return best["thr"], best
+
+    # --- Лучший компромисс, если ограничений достичь нельзя
+    w_rec_short, w_prec_short, w_tnr_reward, w_rec_reward = compromise_weights
+    def compromise_score(s):
+        v_rec  = max(0.0, min_recall1   - s["recall1"])
+        v_prec = max(0.0, (min_precision1 if min_precision1 is not None else 0.0) - s["precision1"])
+        # штраф за нарушения и поощрение за TNR/recall
+        return -(w_rec_short*v_rec + w_prec_short*v_prec) + (w_tnr_reward*s["tnr"] + w_rec_reward*s["recall1"])
+
+    best = max(stats, key=compromise_score)
+    best["feasible"] = False
+    best["violations"] = {
+        "recall1_shortfall": float(max(0.0, min_recall1 - best["recall1"])),
+        "precision1_shortfall": float(max(0.0, (min_precision1 if min_precision1 is not None else 0.0) - best["precision1"]))
+    }
+    if warn:
+        print("[warn] No threshold on DEV satisfies the constraints "
+              f"(recall1 ≥ {min_recall1}" +
+              ("" if min_precision1 is None else f", precision1 ≥ {min_precision1}") +
+              ").")
+        print(f"[warn] Using best-compromise thr={best['thr']:.3f} "
+              f"(TNR={best['tnr']:.3f}, recall1={best['recall1']:.3f}, precision1={best['precision1']:.3f}).")
+    return best["thr"], best
+
+
 def thr_tnr_with_constraints(y_true, proba, min_recall1=0.93, min_precision1=0.95):
     """Максимизируем TNR (specificity класса 0) при одновременных ограничениях:
        recall_1 >= min_recall1 и precision_1 >= min_precision1."""
@@ -381,7 +458,13 @@ def train_xgb(
         thr = float(fixed_thr)
     else:
         if thr_mode == "f1":
-            thr = best_threshold_by_f1(y_dev, prob_dev)
+            thr = thr, thr_info = choose_threshold_constrained(
+                y_dev, prob_dev,
+                min_recall1=args.min_recall1,
+                min_precision1=getattr(args, "min_precision1", None),  # если есть флаг
+                prefer="tnr",     # можно: "tnr" | "f1" | "balacc"
+                warn=True
+            )
         elif thr_mode == "tnr_constrained":
             thr, stats = thr_tnr_with_constraints(y_dev, prob_dev,
                                                   min_recall1=min_recall1,
@@ -449,6 +532,10 @@ if __name__ == "__main__":
     p.add_argument("--min_recall1", type=float, default=0.93, help="ограничение на recall класса 1")
     p.add_argument("--min_precision1", type=float, default=0.95, help="ограничение на precision класса 1")
     p.add_argument("--fixed_thr", type=float, default=None, help="если задано — использовать фиксированный порог")
+
+    p.add_argument("--thr_prefer", type=str, default="tnr", choices=["tnr","f1","balacc"],
+                help="что максимизировать среди допустимых порогов")
+
 
     # калибровка
     p.add_argument("--calibrate", type=str, default="none", choices=["none","isotonic","platt"])
