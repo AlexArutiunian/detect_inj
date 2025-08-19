@@ -267,34 +267,68 @@ def train_xgb(X_train, X_dev, X_test, y_train, y_dev, y_test, out_dir,
 
     use_best = False
     # 1) Современный способ: callbacks
+        # === вместо твоего блока fit(...) вставь это ===
+    # Веса классов в обучении: усиливаем класс 0 (No Injury)
+    w0, w1 = 2.0, 1.0   # подбирай по DEV (1.5–3.0 обычно ок)
+    sw_train = np.where(y_train == 0, w0, w1).astype(np.float32)
+    sw_dev   = np.where(y_dev   == 0, w0, w1).astype(np.float32)
+
+    use_best = False
+
+    # 1) Современный способ: callbacks EarlyStopping
     try:
         if xgb_callback is not None:
             es = xgb_callback.EarlyStopping(
                 rounds=early_stopping_rounds, save_best=True, maximize=True
             )
-            model.fit(
-                X_train, y_train,
-                eval_set=[(X_dev, y_dev)],
-                callbacks=[es],
-                verbose=False
-            )
+            try:
+                # новые версии поддерживают eval_sample_weight
+                model.fit(
+                    X_train, y_train,
+                    sample_weight=sw_train,
+                    eval_set=[(X_dev, y_dev)],
+                    eval_sample_weight=[sw_dev],
+                    callbacks=[es],
+                    verbose=False
+                )
+            except TypeError:
+                # старые версии без eval_sample_weight
+                model.fit(
+                    X_train, y_train,
+                    sample_weight=sw_train,
+                    eval_set=[(X_dev, y_dev)],
+                    callbacks=[es],
+                    verbose=False
+                )
             use_best = True
         else:
             raise TypeError("callbacks not available")
     except TypeError:
         # 2) Классический способ: early_stopping_rounds в fit()
         try:
-            model.fit(
-                X_train, y_train,
-                eval_set=[(X_dev, y_dev)],
-                early_stopping_rounds=early_stopping_rounds,
-                verbose=False
-            )
+            try:
+                model.fit(
+                    X_train, y_train,
+                    sample_weight=sw_train,
+                    eval_set=[(X_dev, y_dev)],
+                    eval_sample_weight=[sw_dev],
+                    early_stopping_rounds=early_stopping_rounds,
+                    verbose=False
+                )
+            except TypeError:
+                model.fit(
+                    X_train, y_train,
+                    sample_weight=sw_train,
+                    eval_set=[(X_dev, y_dev)],
+                    early_stopping_rounds=early_stopping_rounds,
+                    verbose=False
+                )
             use_best = True
         except TypeError:
-            # 3) Очень старая версия: без ES
-            print("[warn] early stopping недоступен в этой версии xgboost — обучаю без него.")
-            model.fit(X_train, y_train, verbose=False)
+            # 3) Очень старая версия: без early stopping
+            print("[warn] early stopping недоступен — обучаю без него.")
+            model.fit(X_train, y_train, sample_weight=sw_train, verbose=False)
+
 
     # Предсказания с учётом лучшей итерации, если она есть
     kw = {}
