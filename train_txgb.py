@@ -47,7 +47,7 @@ def compute_metrics(y_true, y_pred, y_prob):
 
 import numpy as np
 
-def thr_max_tnr_at_min_recall(y_true, proba, min_recall1=0.97):
+def thr_max_tnr_at_min_recall(y_true, proba, min_recall1=0.93):
     """Выбрать порог, максимизирующий TNR (specificity класса 0),
        при ограничении Recall класса 1 >= min_recall1."""
     ths = np.unique(proba)
