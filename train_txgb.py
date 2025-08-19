@@ -270,7 +270,7 @@ def train_xgb(X_train, X_dev, X_test, y_train, y_dev, y_test, out_dir,
     # 1) Современный способ: callbacks
         # === вместо твоего блока fit(...) вставь это ===
     # Веса классов в обучении: усиливаем класс 0 (No Injury)
-    w0, w1 = 2.0, 1.0   # подбирай по DEV (1.5–3.0 обычно ок)
+    w0, w1 = 3.0, 1.0   # подбирай по DEV (1.5–3.0 обычно ок)
     sw_train = np.where(y_train == 0, w0, w1).astype(np.float32)
     sw_dev   = np.where(y_dev   == 0, w0, w1).astype(np.float32)
 
