@@ -5,6 +5,7 @@
 import os, json, argparse
 import numpy as np, pandas as pd
 from tqdm import tqdm
+from xgboost import XGBClassifier, callback as xgb_callback
 
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
@@ -12,7 +13,7 @@ from sklearn.metrics import (accuracy_score, f1_score, roc_auc_score,
                              confusion_matrix, classification_report,
                              roc_curve, precision_recall_curve,
                              average_precision_score)
-from xgboost import XGBClassifier
+
 import joblib
 
 # Matplotlib без GUI
@@ -239,32 +240,52 @@ def train_xgb(X_train, X_dev, X_test, y_train, y_dev, y_test, out_dir,
         n_jobs=-1
     )
 
-    model.fit(X_train, y_train,
-              eval_set=[(X_dev, y_dev)],
-              verbose=False,
-              early_stopping_rounds=early_stopping_rounds)
+    # ---- вместо early_stopping_rounds=... в fit используем callback ----
+    es = xgb_callback.EarlyStopping(
+        rounds=early_stopping_rounds,
+        save_best=True,  # сохраняет лучший бустер
+        maximize=True    # мы оптимизируем AUC
+    )
 
-    # корректное использование лучшей итерации
+    model.fit(
+        X_train, y_train,
+        eval_set=[(X_dev, y_dev)],
+        callbacks=[es],
+        verbose=False
+    )
+
+    # --- корректно используем лучшую итерацию при predict_proba ---
     kw = {}
-    if hasattr(model, "best_iteration_") or hasattr(model, "best_iteration"):
+    best_it = getattr(model, "best_iteration", None)
+    if best_it is None:
         best_it = getattr(model, "best_iteration_", None)
-        if best_it is None: best_it = getattr(model, "best_iteration", None)
-        if best_it is not None:
-            kw = {"iteration_range": (0, best_it+1)}
+    best_ntree_limit = getattr(model, "best_ntree_limit", None)
 
-    prob_dev  = model.predict_proba(X_dev,  **kw)[:,1]
+    # Новые версии: iteration_range
+    try:
+        if best_it is not None:
+            kw = {"iteration_range": (0, int(best_it)+1)}
+    except TypeError:
+        kw = {}
+
+    # Старые версии: ntree_limit
+    if not kw and best_ntree_limit is not None:
+        kw = {"ntree_limit": int(best_ntree_limit)}
+
+    prob_dev  = model.predict_proba(X_dev,  **kw)[:, 1]
     thr       = best_threshold_by_f1(y_dev, prob_dev)
-    pred_dev  = (prob_dev>=thr).astype(int)
+    pred_dev  = (prob_dev >= thr).astype(int)
     dev_metrics = compute_metrics(y_dev, pred_dev, prob_dev)
 
-    prob_test = model.predict_proba(X_test, **kw)[:,1]
-    pred_test = (prob_test>=thr).astype(int)
+    prob_test = model.predict_proba(X_test, **kw)[:, 1]
+    pred_test = (prob_test >= thr).astype(int)
     test_metrics = compute_metrics(y_test, pred_test, prob_test)
 
-    with open(os.path.join(out_dir,"threshold.txt"),"w") as f:
+    with open(os.path.join(out_dir, "threshold.txt"), "w") as f:
         f.write(str(thr))
 
     return dev_metrics, test_metrics, thr, model
+
 
 
 # ---------- MAIN ----------
