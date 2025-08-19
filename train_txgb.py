@@ -47,7 +47,7 @@ def compute_metrics(y_true, y_pred, y_prob):
 
 import numpy as np
 
-def thr_max_tnr_at_min_recall(y_true, proba, min_recall1=0.93):
+def thr_max_tnr_at_min_recall(y_true, proba, min_recall1=0.8):
     """Выбрать порог, максимизирующий TNR (specificity класса 0),
        при ограничении Recall класса 1 >= min_recall1."""
     ths = np.unique(proba)
@@ -245,8 +245,7 @@ def _display_inline(images, show):
 def train_xgb(X_train, X_dev, X_test, y_train, y_dev, y_test, out_dir,
               n_estimators=2000, learning_rate=0.05, max_depth=6,
               subsample=0.9, colsample_bytree=0.9, reg_lambda=1.0,
-              early_stopping_rounds=50, random_state=42,
-              min_recall1=0.93):  
+              early_stopping_rounds=50, random_state=42):
 
     pos, neg = int(np.sum(y_train == 1)), int(np.sum(y_train == 0))
     spw = (neg / max(pos, 1)) if pos > 0 else 1.0
@@ -347,8 +346,8 @@ def train_xgb(X_train, X_dev, X_test, y_train, y_dev, y_test, out_dir,
             if best_ntree_limit is not None:
                 kw = {"ntree_limit": int(best_ntree_limit)}
 
-    prob_dev  = model.predict_proba(X_dev, **kw)[:, 1]
-    thr, _ = thr_max_tnr_at_min_recall(y_dev, prob_dev, min_recall1=min_recall1)
+    prob_dev  = model.predict_proba(X_dev,  **kw)[:, 1]
+    thr, _       =  thr_max_tnr_at_min_recall(y_dev, prob_dev)
     pred_dev  = (prob_dev >= thr).astype(int)
     dev_metrics = compute_metrics(y_dev, pred_dev, prob_dev)
 
@@ -366,8 +365,6 @@ def train_xgb(X_train, X_dev, X_test, y_train, y_dev, y_test, out_dir,
 # ---------- MAIN ----------
 if __name__ == "__main__":
     p = argparse.ArgumentParser(description="XGBoost injury/no-injury (NPY -> aggregated features)")
-    p.add_argument("--min_recall1", type=float, default=0.93,
-                   help="минимальный recall класса 1 (injury) при оптимизации порога по TNR")
     p.add_argument("--csv", required=True, type=str)
     p.add_argument("--data_dir", required=True, type=str, help="папка с .npy")
     p.add_argument("--filename_col", default="filename", type=str)
@@ -425,19 +422,17 @@ if __name__ == "__main__":
 
     # 4) Обучение XGB с early stopping и F1-threshold
     dev_metrics, test_metrics, thr, model = train_xgb(
-    X_train_s, X_dev_s, X_test_s, y_train, y_dev, y_test,
-    out_dir=args.out_dir,
-    n_estimators=args.n_estimators,
-    learning_rate=args.learning_rate,
-    max_depth=args.max_depth,
-    subsample=args.subsample,
-    colsample_bytree=args.colsample_bytree,
-    reg_lambda=args.reg_lambda,
-    early_stopping_rounds=args.early_stopping_rounds,
-    random_state=42,
-    min_recall1=args.min_recall1,   # <-- добавили
-    )   
-
+        X_train_s, X_dev_s, X_test_s, y_train, y_dev, y_test,
+        out_dir=args.out_dir,
+        n_estimators=args.n_estimators,
+        learning_rate=args.learning_rate,
+        max_depth=args.max_depth,
+        subsample=args.subsample,
+        colsample_bytree=args.colsample_bytree,
+        reg_lambda=args.reg_lambda,
+        early_stopping_rounds=args.early_stopping_rounds,
+        random_state=42
+    )
 
     # 5) Сохранения
     joblib.dump({"model": model, "scaler": scaler}, os.path.join(args.out_dir, "model.joblib"))
