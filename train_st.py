@@ -337,7 +337,7 @@ def make_datasets(items, labels, max_len, feat_dim, V, C, bs, downsample, mean, 
     def make(indices, shuffle=False, drop_remainder=False):
         ds = tf.data.Dataset.from_generator(gen(indices), output_signature=sig)
         if shuffle:
-            ds = ds.shuffle(4096, reshuffle_each_iteration=True)
+            ds = ds.shuffle(64, reshuffle_each_iteration=True)
         ds = ds.map(pad_map, num_parallel_calls=AUTOTUNE)
         ds = ds.batch(bs, drop_remainder=drop_remainder)
         ds = ds.prefetch(AUTOTUNE)
