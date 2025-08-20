@@ -349,7 +349,9 @@ def make_datasets(items, labels, max_len, feat_dim, V, C, bs, downsample, mean, 
 def build_stgcn_model(T_max: int, V: int, C: int, A_norm: np.ndarray,
                       learning_rate: float = 1e-3, mixed_precision: bool=False,
                       temporal_kernel: int = 9,
-                      channels_list: List[int] = [128, 64], dropout: float = 0.1):
+                      channels_list: List[int] = [128, 64],
+                      temporal_strides: List[int] | None = None,
+                      dropout: float = 0.1):
     tf, layers, models = lazy_tf()
 
     A_tf = tf.constant(A_norm, dtype=tf.float32)
@@ -362,16 +364,16 @@ def build_stgcn_model(T_max: int, V: int, C: int, A_norm: np.ndarray,
         x2 = layers.Activation('relu')(x2)
         return x2
 
-    def stgcn_block(x, out_ch):
+    def stgcn_block(x, out_ch, stride_t: int = 1):
         s = spatial_gcn(x, out_ch)
-        t = layers.Conv2D(out_ch, kernel_size=(temporal_kernel, 1), padding='same')(s)  # свёртка по времени
+        t = layers.Conv2D(out_ch, kernel_size=(temporal_kernel, 1), strides=(stride_t, 1), padding='same')(s)  # свёртка по времени с шагом
         t = layers.BatchNormalization()(t)
         t = layers.Activation('relu')(t)
         if dropout and dropout > 0:
             t = layers.Dropout(dropout)(t)
         # residual
-        if x.shape[-1] != out_ch:
-            r = layers.Conv2D(out_ch, kernel_size=(1,1), padding='same')(x)
+        if x.shape[-1] != out_ch or stride_t != 1:
+            r = layers.Conv2D(out_ch, kernel_size=(1,1), strides=(stride_t,1), padding='same')(x)
             r = layers.BatchNormalization()(r)
         else:
             r = x
@@ -379,10 +381,13 @@ def build_stgcn_model(T_max: int, V: int, C: int, A_norm: np.ndarray,
         out = layers.Activation('relu')(out)
         return out
 
+    if temporal_strides is None:
+        temporal_strides = [1] * len(channels_list)
+
     inp = layers.Input(shape=(T_max, V, C))
     x = inp
-    for ch in channels_list:
-        x = stgcn_block(x, ch)
+    for ch, st in zip(channels_list, temporal_strides):
+        x = stgcn_block(x, ch, stride_t=int(st))
 
     x = layers.GlobalAveragePooling2D()(x)  # усреднение по (T,V)
     x = layers.Dense(64, activation='relu')(x)
@@ -424,7 +429,9 @@ def main():
     ap.add_argument("--stgcn_adjacency", choices=["identity","ring","full"], default="ring",
                     help="Предустановленная структура графа, если не указан edges_json")
     ap.add_argument("--temporal_kernel", type=int, default=9, help="Размер ядра по времени в ST-GCN")
-    ap.add_argument("--stgcn_channels", type=str, default="128,64", help="Список каналов блоков, через запятую")
+ap.add_argument("--stgcn_channels", type=str, default="128,64", help="Список каналов блоков, через запятую")
+ap.add_argument("--temporal_strides", type=str, default="2,2", help="Шаг по времени в каждом блоке, через запятую (downsample по времени)")
+    ap.add_argument("--sample_for_norm", type=int, default=256, help="Сколько клипов брать для оценки mean/std (ускоряет старт)")")
 
     args = ap.parse_args()
 
@@ -494,7 +501,7 @@ def main():
 
     # Норм-статы по train
     ensure_dir(args.out_dir)
-    mean, std = compute_norm_stats([items[i] for i in idx_train], feat_dim, args.downsample, max_len)
+    mean, std = compute_norm_stats([items[i] for i in idx_train], feat_dim, args.downsample, max_len, sample_items=int(args.sample_for_norm))
     np.savez_compressed(os.path.join(args.out_dir, "norm_stats.npz"), mean=mean, std=std, max_len=max_len, V=V, C=C)
 
     # TF / стратегия
@@ -529,6 +536,12 @@ def main():
 
     # Параметры ST-GCN
     channels_list = [int(x) for x in str(args.stgcn_channels).split(',') if str(x).strip()]
+    # подготовим страйды по времени (если их меньше, добьём единицами)
+    temporal_strides = [int(x) for x in str(args.temporal_strides).split(',') if str(x).strip()]
+    if len(temporal_strides) < len(channels_list):
+        temporal_strides += [1] * (len(channels_list) - len(temporal_strides))
+    else:
+        temporal_strides = temporal_strides[:len(channels_list)]
 
     # Строим модель
     ctx = strategy.scope() if strategy else contextlib_null()
@@ -538,7 +551,13 @@ def main():
                                   mixed_precision=args.mixed_precision,
                                   temporal_kernel=int(args.temporal_kernel),
                                   channels_list=channels_list,
+                                  temporal_strides=temporal_strides,
                                   dropout=0.1)
+
+    # короткая прогонка одной пачки — убедиться, что формы корректны
+    for bx, by in train_ds.take(1):
+        print("warmup batch:", bx.shape, by.shape)
+        break
 
     # Коллбеки
     cb = [
