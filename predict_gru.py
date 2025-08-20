@@ -11,7 +11,7 @@ GRU inference with confidence (полный скрипт)
   (B) --csv + --data_dir: сопоставляет пути из CSV с файлами в data_dir
   (C) позиционные аргументы: явный список путей к .npy/.json.npy (с попыткой найти в --data_dir)
 - Возвращает CSV с колонками:
-    path, prob, pred, confidence, logit, entropy, (опц.) prob_std
+    path, prob, pred, confidence, logit, entropy, (опц.) prob_std, inj_group
   где:
     prob        — вероятность класса 1 (из сигмоиды)
     pred        — бинарный предсказанный класс по threshold
@@ -19,6 +19,7 @@ GRU inference with confidence (полный скрипт)
     logit       — log(p/(1-p))
     entropy     — -[p ln p + (1-p) ln(1-p)], чем меньше — тем «увереннее»
     prob_std    — std по MC Dropout (если --mc_passes > 1)
+    inj_group   — группировка по вероятности inj: "inj 50–60%", "inj 60–80%", "inj >80%" (пусто, если p<0.5)
 - Совместимо с Dropout-MC: при --mc_passes > 1 делает несколько стохастических прогонов (training=True).
 
 Замечания:
@@ -472,15 +473,43 @@ def main():
         out["prob_std"] = probs_std.astype(np.float32)
 
     df = pd.DataFrame(out)
+
+    # 7.1) Группы по вероятности inj: 50–60, 60–80, >80 (p в долях)
+    def _inj_group(p: float) -> str:
+        if p >= 0.8:
+            return "inj >80%"
+        if p >= 0.6:
+            return "inj 60–80%"
+        if p >= 0.5:
+            return "inj 50–60%"
+        return ""  # вне групп (p<0.5)
+
+    df["inj_group"] = [
+        _inj_group(float(p)) for p in df["prob"].tolist()
+    ]
+
+    # Сортировка: по группам в порядке 50–60 → 60–80 → >80, затем по prob по убыванию
+    cat_order = pd.api.types.CategoricalDtype([
+        "inj 50–60%", "inj 60–80%", "inj >80%", ""
+    ], ordered=True)
+    df["inj_group"] = df["inj_group"].astype(cat_order)
+    df = df.sort_values(["inj_group", "prob"], ascending=[True, False]).reset_index(drop=True)
+
+    # 7.2) запись CSV
     df.to_csv(args.out_csv, index=False, float_format="%.6f")
 
     # 8) краткий отчёт
     n = len(df)
     n_pos = int(df["pred"].sum())
     n_neg = n - n_pos
+    g50_60 = int((df["inj_group"] == "inj 50–60%").sum())
+    g60_80 = int((df["inj_group"] == "inj 60–80%").sum())
+    g80p   = int((df["inj_group"] == "inj >80%").sum())
+
     print(f"Saved predictions to: {args.out_csv}")
     print(f"Used threshold: {thr}")
     print(f"Total: {n} | pred=1: {n_pos} | pred=0: {n_neg}")
+    print(f"Buckets (inj ≥50%): 50–60%={g50_60} | 60–80%={g60_80} | >80%={g80p}")
     if "prob_std" in df.columns:
         print(f"MC Dropout: passes={args.mc_passes} | mean std={df['prob_std'].mean():.6f}")
 
