@@ -239,27 +239,46 @@ def entropy_binary(p: np.ndarray) -> np.ndarray:
 #     ЗАГРУЗКА МОДЕЛИ
 # ==========================
 
-def load_any_model(model_path: str):
+def load_any_model(model_path: str, unsafe_deser: bool = False):
     """
     Пытается загрузить модель в следующем порядке:
     - tf.keras.models.load_model (SavedModel/.h5/.keras в новых TF)
     - keras.saving.load_model (Keras 3)
     - ещё раз tf.keras для каталогов SavedModel
+
+    Параметр unsafe_deser включает небезопасную десериализацию Lambda в Keras 3
+    (нужно, если модель содержит Lambda-слои, сохранённые с python lambda).
     """
     import os
     try:
+        import keras
+        if unsafe_deser:
+            try:
+                # Разрешаем небезопасную десериализацию, иначе Keras 3 падает на Lambda
+                keras.config.enable_unsafe_deserialization()
+            except Exception:
+                pass
         import tensorflow as tf  # noqa
-        return tf.keras.models.load_model(model_path)
+        try:
+            # Некоторые версии tf.keras пробрасывают параметр в Keras 3
+            return tf.keras.models.load_model(model_path, safe_mode=not unsafe_deser)
+        except TypeError:
+            # Если safe_mode не поддерживается сигнатурой
+            return tf.keras.models.load_model(model_path)
     except Exception as e_tf:
         try:
             import keras  # noqa
-            # Keras 3 (standalone)
-            return keras.saving.load_model(model_path)
+            try:
+                return keras.saving.load_model(model_path, safe_mode=not unsafe_deser)
+            except TypeError:
+                return keras.saving.load_model(model_path)
         except Exception as e_k:
             if os.path.isdir(model_path):
-                # на случай SavedModel-каталога
                 import tensorflow as tf  # noqa
-                return tf.keras.models.load_model(model_path)
+                try:
+                    return tf.keras.models.load_model(model_path, safe_mode=not unsafe_deser)
+                except TypeError:
+                    return tf.keras.models.load_model(model_path)
             raise RuntimeError(
                 f"Не удалось загрузить модель '{model_path}'. "
                 f"tf.keras: {type(e_tf).__name__}; keras: {type(e_k).__name__}"
@@ -408,6 +427,8 @@ def main():
 
     # compute device
     ap.add_argument("--gpus", default="all", help='"all" | "cpu" | "0,1"')
+    ap.add_argument("--unsafe_deser", action="store_true",
+                    help="Разрешить небезопасную десериализацию Lambda (Keras 3)")
 
     args = ap.parse_args()
 
@@ -433,7 +454,7 @@ def main():
 
     # 2) норм-статы и модель
     mean, std, max_len = load_norm_stats(args.norm_stats)
-    model = load_any_model(args.model)
+    model = load_any_model(args.model, unsafe_deser=args.unsafe_deser)
 
     # 3) датасет
     ds = make_dataset(paths, mean, std, max_len, args.downsample, args.batch_size)
@@ -505,12 +526,8 @@ def main():
         _inj_group(float(p), int(y)) for p, y in zip(df["prob"].tolist(), df["pred"].tolist())
     ]
 
-    # Сортировка: по группам уверенности (50–60 → 60–80 → >80), затем по confidence убыв.
-    conf_order = pd.api.types.CategoricalDtype([
-        "conf 50–60%", "conf 60–80%", "conf >80%", ""
-    ], ordered=True)
-    df["confidence_group"] = df["confidence_group"].astype(conf_order)
-    df = df.sort_values(["confidence_group", "confidence"], ascending=[True, False]).reset_index(drop=True)
+    # Сортировка: по убыванию общей уверенности
+    df = df.sort_values(["confidence"], ascending=[False]).reset_index(drop=True)
 
     # 7.2) запись CSV
     df.to_csv(args.out_csv, index=False, float_format="%.6f")
