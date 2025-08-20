@@ -429,9 +429,9 @@ def main():
     ap.add_argument("--stgcn_adjacency", choices=["identity","ring","full"], default="ring",
                     help="Предустановленная структура графа, если не указан edges_json")
     ap.add_argument("--temporal_kernel", type=int, default=9, help="Размер ядра по времени в ST-GCN")
-ap.add_argument("--stgcn_channels", type=str, default="128,64", help="Список каналов блоков, через запятую")
-ap.add_argument("--temporal_strides", type=str, default="2,2", help="Шаг по времени в каждом блоке, через запятую (downsample по времени)")
-    ap.add_argument("--sample_for_norm", type=int, default=256, help="Сколько клипов брать для оценки mean/std (ускоряет старт)")")
+    ap.add_argument("--stgcn_channels", type=str, default="128,64", help="Список каналов блоков, через запятую")
+    ap.add_argument("--temporal_strides", type=str, default="2,2", help="Шаг по времени в каждом блоке, через запятую (downsample по времени)")
+    ap.add_argument("--sample_for_norm", type=int, default=256, help="Сколько клипов брать для оценки mean/std (ускоряет старт)")
 
     args = ap.parse_args()
 
