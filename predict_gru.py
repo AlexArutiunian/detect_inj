@@ -11,7 +11,7 @@ GRU inference with confidence (полный скрипт)
   (B) --csv + --data_dir: сопоставляет пути из CSV с файлами в data_dir
   (C) позиционные аргументы: явный список путей к .npy/.json.npy (с попыткой найти в --data_dir)
 - Возвращает CSV с колонками:
-    path, prob, pred, confidence, logit, entropy, (опц.) prob_std, inj_group
+    path, prob, pred, confidence, logit, entropy, (опц.) prob_std, inj_group, confidence_group
   где:
     prob        — вероятность класса 1 (из сигмоиды)
     pred        — бинарный предсказанный класс по threshold
@@ -20,6 +20,7 @@ GRU inference with confidence (полный скрипт)
     entropy     — -[p ln p + (1-p) ln(1-p)], чем меньше — тем «увереннее»
     prob_std    — std по MC Dropout (если --mc_passes > 1)
     inj_group   — группировка по вероятности inj: "inj 50–60%", "inj 60–80%", "inj >80%" (пусто, если p<0.5)
+    confidence_group — группировка по общей уверенности: "conf 50–60%", "conf 60–80%", "conf >80%" (пусто, если <50%)
 - Совместимо с Dropout-MC: при --mc_passes > 1 делает несколько стохастических прогонов (training=True).
 
 Замечания:
@@ -474,26 +475,42 @@ def main():
 
     df = pd.DataFrame(out)
 
-    # 7.1) Группы по вероятности inj: 50–60, 60–80, >80 (p в долях)
-    def _inj_group(p: float) -> str:
+    # 7.1) Группы по уверенности (любой класс): 50–60, 60–80, >80
+    def _conf_group(c: float) -> str:
+        if c >= 0.8:
+            return "conf >80%"
+        if c >= 0.6:
+            return "conf 60–80%"
+        if c >= 0.5:
+            return "conf 50–60%"
+        return ""
+
+    df["confidence_group"] = [
+        _conf_group(float(c)) for c in df["confidence"].tolist()
+    ]
+
+    # (опционально) inj_group как справочная колонка только для pred==1
+    def _inj_group(p: float, y: int) -> str:
+        if y != 1:
+            return ""
         if p >= 0.8:
             return "inj >80%"
         if p >= 0.6:
             return "inj 60–80%"
         if p >= 0.5:
             return "inj 50–60%"
-        return ""  # вне групп (p<0.5)
+        return ""
 
     df["inj_group"] = [
-        _inj_group(float(p)) for p in df["prob"].tolist()
+        _inj_group(float(p), int(y)) for p, y in zip(df["prob"].tolist(), df["pred"].tolist())
     ]
 
-    # Сортировка: по группам в порядке 50–60 → 60–80 → >80, затем по prob по убыванию
-    cat_order = pd.api.types.CategoricalDtype([
-        "inj 50–60%", "inj 60–80%", "inj >80%", ""
+    # Сортировка: по группам уверенности (50–60 → 60–80 → >80), затем по confidence убыв.
+    conf_order = pd.api.types.CategoricalDtype([
+        "conf 50–60%", "conf 60–80%", "conf >80%", ""
     ], ordered=True)
-    df["inj_group"] = df["inj_group"].astype(cat_order)
-    df = df.sort_values(["inj_group", "prob"], ascending=[True, False]).reset_index(drop=True)
+    df["confidence_group"] = df["confidence_group"].astype(conf_order)
+    df = df.sort_values(["confidence_group", "confidence"], ascending=[True, False]).reset_index(drop=True)
 
     # 7.2) запись CSV
     df.to_csv(args.out_csv, index=False, float_format="%.6f")
@@ -502,14 +519,11 @@ def main():
     n = len(df)
     n_pos = int(df["pred"].sum())
     n_neg = n - n_pos
-    g50_60 = int((df["inj_group"] == "inj 50–60%").sum())
-    g60_80 = int((df["inj_group"] == "inj 60–80%").sum())
-    g80p   = int((df["inj_group"] == "inj >80%").sum())
+    c50_60 = int((df["confidence_group"] == "conf 50–60%").sum())
+    c60_80 = int((df["confidence_group"] == "conf 60–80%").sum())
+    c80p   = int((df["confidence_group"] == "conf >80%").sum())
 
-    print(f"Saved predictions to: {args.out_csv}")
-    print(f"Used threshold: {thr}")
-    print(f"Total: {n} | pred=1: {n_pos} | pred=0: {n_neg}")
-    print(f"Buckets (inj ≥50%): 50–60%={g50_60} | 60–80%={g60_80} | >80%={g80p}")
+    print(f"Buckets (confidence ≥50%): 50–60%={c50_60} | 60–80%={c60_80} | >80%={c80p}")
     if "prob_std" in df.columns:
         print(f"MC Dropout: passes={args.mc_passes} | mean std={df['prob_std'].mean():.6f}")
 
