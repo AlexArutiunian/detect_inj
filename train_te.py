@@ -53,20 +53,18 @@ def sanitize_seq(a: np.ndarray) -> np.ndarray:
     Приводит произвольный массив к форме (T, F):
     - заменяет NaN/Inf на 0
     - выбирает самую длинную ось как время и переносит её на 0
-    - остальные оси сплющиваются в признаки
+    - остальные оси сплющивает в признаки
     """
     a = np.nan_to_num(a, nan=0.0, posinf=0.0, neginf=0.0)
 
     if a.ndim == 1:
-        a = a[:, None]  # (T,) -> (T, 1)
-
+        a = a[:, None]  # (T,) -> (T,1)
     elif a.ndim >= 2:
-        # считаем, что ось времени — самая длинная
-        t_axis = int(np.argmax(a.shape))
+        t_axis = int(np.argmax(a.shape))   # предполагаем, что время — самая длинная ось
         if t_axis != 0:
             a = np.moveaxis(a, t_axis, 0)  # время -> ось 0
         if a.ndim > 2:
-            a = a.reshape(a.shape[0], -1)  # (T, ... ) -> (T, F)
+            a = a.reshape(a.shape[0], -1)  # (T, ...)->(T,F)
 
     return a.astype(np.float32, copy=False)
 
@@ -89,7 +87,7 @@ def compute_metrics(y_true, y_pred, y_prob):
 
 # ---------------------- маппинг путей ----------------------
 def possible_npy_paths(data_dir: str, rel: str) -> List[str]:
-    """Генерирует разумные варианты путей (.json, .npy, .json.npy и базовые имена)."""
+    """Генерирует все разумные варианты путей (учёт .json, .npy, .json.npy, базовое имя)."""
     rel = (rel or "").strip().replace("\\", "/").lstrip("/")
     cands = []
 
@@ -97,18 +95,22 @@ def possible_npy_paths(data_dir: str, rel: str) -> List[str]:
         if x not in cands:
             cands.append(x)
 
+    # как есть и с .npy
     push(os.path.join(data_dir, rel))
     if not rel.endswith(".npy"):
         push(os.path.join(data_dir, rel + ".npy"))
 
+    # варианты с .json → .npy и .json.npy
     if rel.endswith(".json"):
         base_nojson = rel[:-5]
         push(os.path.join(data_dir, base_nojson + ".npy"))
-        push(os.path.join(data_dir, rel + ".npy"))
+        push(os.path.join(data_dir, rel + ".npy"))          # .json.npy
 
+    # если уже .json.npy — попробуем без .json
     if rel.endswith(".json.npy"):
         push(os.path.join(data_dir, rel.replace(".json.npy", ".npy")))
 
+    # только базовое имя
     b = os.path.basename(rel)
     push(os.path.join(data_dir, b))
     if not b.endswith(".npy"):
@@ -160,7 +162,6 @@ def build_items(csv_path: str, data_dir: str,
         shape_txt = ""
 
         if not rel:
-            print(rel)
             stats["no_file"] += 1
             status = "empty-filename"
             if len(skipped_examples)<10: skipped_examples.append((status, str(row.to_dict())))
@@ -171,9 +172,8 @@ def build_items(csv_path: str, data_dir: str,
         else:
             path = pick_existing_path(possible_npy_paths(data_dir, rel))
             if not path:
-                
                 stats["no_file"] += 1
-                
+                status = "not-found"
                 if len(skipped_examples)<10: skipped_examples.append((status, rel))
             else:
                 try:
@@ -182,7 +182,6 @@ def build_items(csv_path: str, data_dir: str,
                     if x.ndim != 2 or x.shape[0] < 2:
                         stats["too_short"] += 1
                         status = "too-short"
-                        print(status, path, "shape:", x.shape)
                         if len(skipped_examples)<10: skipped_examples.append((status, os.path.basename(path)))
                     else:
                         items_x.append(path)
@@ -199,7 +198,7 @@ def build_items(csv_path: str, data_dir: str,
         if debug_index:
             print(f"[{i:05d}] csv='{rel}' | label_raw='{lab_raw}' -> {status}"
                   + (f" | path='{resolved}' {shape_txt}" if resolved else ""))
-    print(stats)
+
     return items_x, items_y, stats, skipped_examples
 
 def probe_stats(items: List[Tuple[str,int]], downsample: int = 1, pctl: int = 95):
@@ -252,8 +251,8 @@ def make_datasets(items, labels, max_len, feat_dim, bs, downsample, mean, std, r
                 p = items[i]
                 y = labels[i]
                 arr = np.load(p, allow_pickle=False, mmap_mode="r")
-                x = sanitize_seq(arr)
-                x = x[::max(1, downsample)]
+                x = sanitize_seq(arr)                 # <-- сначала нормализуем форму
+                x = x[::max(1, downsample)]           # <-- потом downsample по времени
                 if x.shape[0] < 2:
                     continue
                 if x.shape[0] > max_len:
@@ -286,6 +285,16 @@ def make_datasets(items, labels, max_len, feat_dim, bs, downsample, mean, std, r
 
     return make
 
+# ====== Transformer Encoder вместо RNN ======
+def _sinusoidal_pe(max_len: int, d_model: int) -> np.ndarray:
+    pos = np.arange(max_len)[:, None]
+    i   = np.arange(d_model)[None, :]
+    angle_rates = 1 / np.power(10000, (2*(i//2)) / np.float32(d_model))
+    angles = pos * angle_rates
+    pe = np.zeros((max_len, d_model), dtype=np.float32)
+    pe[:, 0::2] = np.sin(angles[:, 0::2])
+    pe[:, 1::2] = np.cos(angles[:, 1::2])
+    return pe[None, :, :]  # (1, L, D)
 
 def build_transformer_model(input_shape, learning_rate=1e-3, mixed_precision=False,
                             d_model=128, num_heads=4, ff_dim=256, num_layers=3,
@@ -350,24 +359,28 @@ class contextlib_null:
 
 # ---------------------- main ----------------------
 def main():
-    ap = argparse.ArgumentParser("GRU binary classifier over NPY sequences")
+    ap = argparse.ArgumentParser("Transformer-Encoder binary classifier over NPY sequences")
     ap.add_argument("--csv", required=True)
     ap.add_argument("--data_dir", required=True)
     ap.add_argument("--filename_col", default="filename")
     ap.add_argument("--label_col", default="No inj/ inj")
-    ap.add_argument("--out_dir", default="output_run_gru")
+    ap.add_argument("--out_dir", default="output_run_transformer")
     ap.add_argument("--epochs", type=int, default=20)
     ap.add_argument("--batch_size", type=int, default=16)  # локальный BS (умножается на #GPU)
     ap.add_argument("--downsample", type=int, default=1)
     ap.add_argument("--max_len", default="auto")           # "auto" -> 95 перцентиль
     ap.add_argument("--gpus", default="all")               # "all" | "cpu" | "0,1"
     ap.add_argument("--mixed_precision", action="store_true")
-    ap.add_argument("--print_csv_preview", action="store_true",
-                    help="Показать первые 5 строк CSV и частоты меток")
-    ap.add_argument("--debug_index", action="store_true",
-                    help="Печатать статус каждой строки при индексации")
-    ap.add_argument("--peek", type=int, default=0,
-                    help="Показать N успешно сопоставленных путей (форма массива)")
+    ap.add_argument("--print_csv_preview", action="store_true")
+    ap.add_argument("--debug_index", action="store_true")
+    ap.add_argument("--peek", type=int, default=0)
+    # гиперпараметры трансформера
+    ap.add_argument("--d_model", type=int, default=128)
+    ap.add_argument("--num_heads", type=int, default=4)
+    ap.add_argument("--ff_dim", type=int, default=256)
+    ap.add_argument("--num_layers", type=int, default=3)
+    ap.add_argument("--dropout", type=float, default=0.2)
+    ap.add_argument("--attn_dropout", type=float, default=0.1)
     args = ap.parse_args()
 
     # Видимость GPU до импорта TF
@@ -413,7 +426,7 @@ def main():
     else:
         max_len = int(args.max_len)
         aa = np.load(paths[0], allow_pickle=False, mmap_mode="r")
-        aa = sanitize_seq(aa)
+        aa = sanitize_seq(aa)                # <-- важно
         feat_dim = int(aa.shape[1])
     print(f"max_len={max_len} | feat_dim={feat_dim}")
 
@@ -458,10 +471,20 @@ def main():
     class_weight = {0: float(w[0]), 1: float(w[1])}
     print("class_weight:", class_weight)
 
-    # Строим модель
+    # Модель (Transformer)
     ctx = strategy.scope() if strategy else contextlib_null()
     with ctx:
-        model = build_transformer_model((max_len, feat_dim), learning_rate=1e-3, mixed_precision=args.mixed_precision)
+        model = build_transformer_model(
+            (max_len, feat_dim),
+            learning_rate=1e-3,
+            mixed_precision=args.mixed_precision,
+            d_model=args.d_model,
+            num_heads=args.num_heads,
+            ff_dim=args.ff_dim,
+            num_layers=args.num_layers,
+            dropout=args.dropout,
+            attn_dropout=args.attn_dropout,
+        )
 
     # Коллбеки
     cb = [
@@ -507,5 +530,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
