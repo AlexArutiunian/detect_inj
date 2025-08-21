@@ -48,7 +48,6 @@ def label_to_int(v):
     if s in ("no injury", "0"): return 0
     return None
 
-# === ВАЖНО: универсальная нормализация формы ===
 def sanitize_seq(a: np.ndarray) -> np.ndarray:
     """
     Приводит произвольный массив к форме (T, F):
@@ -57,14 +56,16 @@ def sanitize_seq(a: np.ndarray) -> np.ndarray:
     - остальные оси сплющивает в признаки
     """
     a = np.nan_to_num(a, nan=0.0, posinf=0.0, neginf=0.0)
+
     if a.ndim == 1:
-        a = a[:, None]                    # (T,) -> (T,1)
+        a = a[:, None]  # (T,) -> (T,1)
     elif a.ndim >= 2:
-        t_axis = int(np.argmax(a.shape))  # считаем, что время — самая длинная ось
+        t_axis = int(np.argmax(a.shape))   # предполагаем, что время — самая длинная ось
         if t_axis != 0:
-            a = np.moveaxis(a, t_axis, 0) # время -> ось 0
+            a = np.moveaxis(a, t_axis, 0)  # время -> ось 0
         if a.ndim > 2:
-            a = a.reshape(a.shape[0], -1) # (T, ...)->(T,F)
+            a = a.reshape(a.shape[0], -1)  # (T, ...)->(T,F)
+
     return a.astype(np.float32, copy=False)
 
 def best_threshold_by_f1(y_true, p):
@@ -86,20 +87,30 @@ def compute_metrics(y_true, y_pred, y_prob):
 
 # ---------------------- маппинг путей ----------------------
 def possible_npy_paths(data_dir: str, rel: str) -> List[str]:
+    """Генерирует все разумные варианты путей (учёт .json, .npy, .json.npy, базовое имя)."""
     rel = (rel or "").strip().replace("\\", "/").lstrip("/")
     cands = []
+
     def push(x):
         if x not in cands:
             cands.append(x)
+
+    # как есть и с .npy
     push(os.path.join(data_dir, rel))
     if not rel.endswith(".npy"):
         push(os.path.join(data_dir, rel + ".npy"))
+
+    # варианты с .json → .npy и .json.npy
     if rel.endswith(".json"):
         base_nojson = rel[:-5]
         push(os.path.join(data_dir, base_nojson + ".npy"))
-        push(os.path.join(data_dir, rel + ".npy"))  # .json.npy
+        push(os.path.join(data_dir, rel + ".npy"))          # .json.npy
+
+    # если уже .json.npy — попробуем без .json
     if rel.endswith(".json.npy"):
         push(os.path.join(data_dir, rel.replace(".json.npy", ".npy")))
+
+    # только базовое имя
     b = os.path.basename(rel)
     push(os.path.join(data_dir, b))
     if not b.endswith(".npy"):
@@ -109,6 +120,7 @@ def possible_npy_paths(data_dir: str, rel: str) -> List[str]:
         push(os.path.join(data_dir, b + ".npy"))
     if b.endswith(".json.npy"):
         push(os.path.join(data_dir, b.replace(".json.npy", ".npy")))
+
     return cands
 
 def pick_existing_path(cands: List[str]) -> str | None:
@@ -166,7 +178,7 @@ def build_items(csv_path: str, data_dir: str,
             else:
                 try:
                     arr = np.load(path, allow_pickle=False, mmap_mode="r")
-                    x = sanitize_seq(arr)  # <-- приводим к (T,F)
+                    x = sanitize_seq(arr)
                     if x.ndim != 2 or x.shape[0] < 2:
                         stats["too_short"] += 1
                         status = "too-short"
@@ -187,10 +199,6 @@ def build_items(csv_path: str, data_dir: str,
             print(f"[{i:05d}] csv='{rel}' | label_raw='{lab_raw}' -> {status}"
                   + (f" | path='{resolved}' {shape_txt}" if resolved else ""))
 
-    # для диагностики
-    print(stats)
-    if skipped_examples:
-        print("Skipped examples (up to 10):", skipped_examples[:10])
     return items_x, items_y, stats, skipped_examples
 
 def probe_stats(items: List[Tuple[str,int]], downsample: int = 1, pctl: int = 95):
@@ -198,7 +206,7 @@ def probe_stats(items: List[Tuple[str,int]], downsample: int = 1, pctl: int = 95
     feat = None
     for p, _ in items:
         arr = np.load(p, allow_pickle=False, mmap_mode="r")
-        x = sanitize_seq(arr)                     # <-- нормализуем
+        x = sanitize_seq(arr)
         L = int(x.shape[0] // max(1, downsample))
         if x.ndim != 2 or L < 1:
             continue
@@ -215,8 +223,8 @@ def compute_norm_stats(items: List[Tuple[str,int]], feat_dim: int, downsample: i
     m2   = np.zeros(feat_dim, dtype=np.float64)
     for p, _ in pool:
         arr = np.load(p, allow_pickle=False, mmap_mode="r")
-        x = sanitize_seq(arr)                     # <-- нормализуем
-        x = x[::max(1, downsample)]               # <-- потом downsample
+        x = sanitize_seq(arr)
+        x = x[::max(1, downsample)]
         if x.shape[0] > max_len_cap: x = x[:max_len_cap]
         for t in range(x.shape[0]):
             count += 1
@@ -243,8 +251,8 @@ def make_datasets(items, labels, max_len, feat_dim, bs, downsample, mean, std, r
                 p = items[i]
                 y = labels[i]
                 arr = np.load(p, allow_pickle=False, mmap_mode="r")
-                x = sanitize_seq(arr)             # <-- нормализуем
-                x = x[::max(1, downsample)]       # <-- потом downsample
+                x = sanitize_seq(arr)                 # <-- сначала нормализуем форму
+                x = x[::max(1, downsample)]           # <-- потом downsample по времени
                 if x.shape[0] < 2:
                     continue
                 if x.shape[0] > max_len:
@@ -276,6 +284,17 @@ def make_datasets(items, labels, max_len, feat_dim, bs, downsample, mean, std, r
         return ds
 
     return make
+
+# ====== Transformer Encoder вместо RNN ======
+def _sinusoidal_pe(max_len: int, d_model: int) -> np.ndarray:
+    pos = np.arange(max_len)[:, None]
+    i   = np.arange(d_model)[None, :]
+    angle_rates = 1 / np.power(10000, (2*(i//2)) / np.float32(d_model))
+    angles = pos * angle_rates
+    pe = np.zeros((max_len, d_model), dtype=np.float32)
+    pe[:, 0::2] = np.sin(angles[:, 0::2])
+    pe[:, 1::2] = np.cos(angles[:, 1::2])
+    return pe[None, :, :]  # (1, L, D)
 
 def build_transformer_model(input_shape, learning_rate=1e-3, mixed_precision=False,
                             d_model=128, num_heads=4, ff_dim=256, num_layers=3,
@@ -333,6 +352,7 @@ def build_transformer_model(input_shape, learning_rate=1e-3, mixed_precision=Fal
     model.compile(optimizer=opt, loss="binary_crossentropy", metrics=["accuracy"])
     return model
 
+# заглушка контекста, если нет стратегии
 class contextlib_null:
     def __enter__(self): return None
     def __exit__(self, *exc): return False
@@ -346,10 +366,10 @@ def main():
     ap.add_argument("--label_col", default="No inj/ inj")
     ap.add_argument("--out_dir", default="output_run_transformer")
     ap.add_argument("--epochs", type=int, default=20)
-    ap.add_argument("--batch_size", type=int, default=16)
+    ap.add_argument("--batch_size", type=int, default=16)  # локальный BS (умножается на #GPU)
     ap.add_argument("--downsample", type=int, default=1)
-    ap.add_argument("--max_len", default="auto")
-    ap.add_argument("--gpus", default="all")
+    ap.add_argument("--max_len", default="auto")           # "auto" -> 95 перцентиль
+    ap.add_argument("--gpus", default="all")               # "all" | "cpu" | "0,1"
     ap.add_argument("--mixed_precision", action="store_true")
     ap.add_argument("--print_csv_preview", action="store_true")
     ap.add_argument("--debug_index", action="store_true")
@@ -363,7 +383,7 @@ def main():
     ap.add_argument("--attn_dropout", type=float, default=0.1)
     args = ap.parse_args()
 
-    # GPU
+    # Видимость GPU до импорта TF
     if args.gpus.lower() == "cpu":
         os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
     elif args.gpus.lower() != "all":
@@ -399,24 +419,24 @@ def main():
             except Exception as e:
                 print(f"FAIL to load for peek: {pth} -> {type(e).__name__}")
 
-    # max_len/feat_dim
+    # Статы по длине/размеру признака
     if str(args.max_len).strip().lower() == "auto":
         max_len, feat_dim = probe_stats(items, downsample=args.downsample, pctl=95)
         max_len = int(max(8, min(max_len, 20000)))
     else:
         max_len = int(args.max_len)
         aa = np.load(paths[0], allow_pickle=False, mmap_mode="r")
-        aa = sanitize_seq(aa)         # <-- важно
+        aa = sanitize_seq(aa)                # <-- важно
         feat_dim = int(aa.shape[1])
     print(f"max_len={max_len} | feat_dim={feat_dim}")
 
-    # Сплиты...
+    # Сплит 70/10/20
     from sklearn.model_selection import train_test_split
     idx = np.arange(len(paths))
     idx_train_full, idx_test = train_test_split(idx, test_size=0.20, random_state=42, stratify=labels_all)
     idx_train, idx_dev = train_test_split(idx_train_full, test_size=0.125, random_state=42, stratify=labels_all[idx_train_full])
 
-    # Норм-статы
+    # Норм-статы по train
     ensure_dir(args.out_dir)
     mean, std = compute_norm_stats([items[i] for i in idx_train], feat_dim, args.downsample, max_len)
     np.savez_compressed(os.path.join(args.out_dir, "norm_stats.npz"), mean=mean, std=std, max_len=max_len)
@@ -427,9 +447,10 @@ def main():
     for g in gpus:
         try: tf.config.experimental.set_memory_growth(g, True)
         except Exception: pass
+
     if args.mixed_precision:
         from tensorflow.keras import mixed_precision as mp
-        mp.set_global_policy("mixed_float16")
+        mp.set_global_policy("mixed_float16")  # выходной Dense уже float32
 
     strategy = tf.distribute.MirroredStrategy() if len(gpus) > 1 else None
     replicas = strategy.num_replicas_in_sync if strategy else 1
@@ -450,24 +471,28 @@ def main():
     class_weight = {0: float(w[0]), 1: float(w[1])}
     print("class_weight:", class_weight)
 
-    # --- твой build_transformer_model должен быть выше ---
-    model = build_transformer_model(
-        (max_len, feat_dim),
-        learning_rate=1e-3,
-        mixed_precision=args.mixed_precision,
-        d_model=args.d_model,
-        num_heads=args.num_heads,
-        ff_dim=args.ff_dim,
-        num_layers=args.num_layers,
-        dropout=args.dropout,
-        attn_dropout=args.attn_dropout,
-    )
+    # Модель (Transformer)
+    ctx = strategy.scope() if strategy else contextlib_null()
+    with ctx:
+        model = build_transformer_model(
+            (max_len, feat_dim),
+            learning_rate=1e-3,
+            mixed_precision=args.mixed_precision,
+            d_model=args.d_model,
+            num_heads=args.num_heads,
+            ff_dim=args.ff_dim,
+            num_layers=args.num_layers,
+            dropout=args.dropout,
+            attn_dropout=args.attn_dropout,
+        )
 
+    # Коллбеки
     cb = [
         tf.keras.callbacks.EarlyStopping(monitor="val_loss", patience=6, restore_best_weights=True),
         tf.keras.callbacks.ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=2, min_lr=1e-6)
     ]
 
+    # Обучение
     hist = model.fit(train_ds,
                      validation_data=dev_ds,
                      epochs=args.epochs,
@@ -475,6 +500,7 @@ def main():
                      callbacks=cb,
                      verbose=1)
 
+    # Предсказания и метрики
     prob_dev  = model.predict(dev_ds,  verbose=0).reshape(-1).astype(np.float32)
     y_dev     = labels_all[idx_dev]
     thr = best_threshold_by_f1(y_dev, prob_dev)
@@ -488,6 +514,7 @@ def main():
     test_metrics = compute_metrics(y_test, pred_test, prob_test)
     save_plots(hist, args.out_dir, y_test, prob_test)
 
+    # Сохранения
     model.save(os.path.join(args.out_dir, "model.keras"))
     with open(os.path.join(args.out_dir, "threshold.txt"), "w") as f: f.write(str(thr))
     with open(os.path.join(args.out_dir, "metrics_dev.json"), "w", encoding="utf-8") as f:
