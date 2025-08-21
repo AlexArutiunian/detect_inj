@@ -2,15 +2,20 @@
 # -*- coding: utf-8 -*-
 
 """
-top_joints_from_model.py
-Aggregates per-joint importance for classical models (RF/XGB) and SVM.
+analysis.py — Per-joint importance for classical models (RF/XGB/SVM).
 
-- RF/XGB: use feature_importances_
-- SVM (linear): use |coef_|
-- SVM (non-linear, e.g. RBF) or any model without importances: use permutation importance
-  (needs raw data to rebuild classical features; pass --csv/--data_dir/--input_format)
+- RF/XGB: feature_importances_
+- SVM (linear): |coef_|
+- SVM (non-linear, e.g. RBF) or any model w/o importances: permutation importance
+  (needs raw data: pass --csv and --data_dir/--npy_dir)
 
-Features layout must match train3.py: 6 stats × 3 axes × |joints| = 18*|joints|
+NPY поддержка:
+- Принимает (T, F), (T, J, 3) и произвольные перестановки осей.
+- Самая длинная ось считается временем T, остальные оси сплющиваются в F.
+
+Агрегация по суставам:
+- 6 статистик × 3 оси = 18 фич на сустав.
+- Если длина вектора важностей кратна 18, можно авто-сгенерировать схему суставов (--auto_joints).
 """
 
 import os
@@ -19,15 +24,21 @@ import argparse
 import numpy as np
 import joblib
 import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from typing import List, Tuple, Optional
 
-# Optional: permutation importance if needed
 from sklearn.inspection import permutation_importance
 from sklearn.metrics import f1_score, roc_auc_score
 
-# ---------- Default joints schema (can be overridden via --schema_json)
+# ---------- Константы для разметки фич ----------
+STAT_NAMES = ["mean","std","min","max","dmean","dstd"]   # 6
+AXES = ["x","y","z"]                                     # 3
+FEATS_PER_JOINT = len(STAT_NAMES) * len(AXES)            # 18
+
+# ---------- Дефолтная схема (можно переопределить --schema_json) ----------
 DEFAULT_JOINTS = [
   "L_foot_1","L_foot_2","L_foot_3","L_foot_4",
   "L_shank_1","L_shank_2","L_shank_3","L_shank_4",
@@ -38,28 +49,68 @@ DEFAULT_JOINTS = [
   "pelvis_1","pelvis_2","pelvis_3","pelvis_4"
 ]
 
-STAT_NAMES = ["mean","std","min","max","dmean","dstd"]   # as in train3.py
-AXES = ["x","y","z"]
-FEATS_PER_JOINT = len(STAT_NAMES) * len(AXES)            # 6*3 = 18
+# ---------- Метки ----------
+def label_to_int(v):
+    if v is None: return None
+    s = str(v).strip().lower()
+    if s == "injury": return 1
+    if s == "no injury": return 0
+    return None
 
-# ---------- Utils to load schema / model ----------
+# ---------- Резолвер путей к .npy ----------
+def possible_npy_paths(data_dir: str, rel: str) -> List[str]:
+    rel = (rel or "").strip().replace("\\", "/").lstrip("/")
+    cands: List[str] = []
+    def push(x: str):
+        if x and x not in cands:
+            cands.append(x)
+    push(os.path.join(data_dir, rel))
+    if not rel.endswith(".npy"):
+        push(os.path.join(data_dir, rel + ".npy"))
+    if rel.endswith(".json"):
+        base_nojson = rel[:-5]
+        push(os.path.join(data_dir, base_nojson + ".npy"))
+        push(os.path.join(data_dir, rel + ".npy"))  # .json.npy
+    if rel.endswith(".json.npy"):
+        push(os.path.join(data_dir, rel.replace(".json.npy", ".npy")))
+    b = os.path.basename(rel)
+    push(os.path.join(data_dir, b))
+    if not b.endswith(".npy"):
+        push(os.path.join(data_dir, b + ".npy"))
+    if b.endswith(".json"):
+        push(os.path.join(data_dir, b[:-5] + ".npy"))
+        push(os.path.join(data_dir, b + ".npy"))
+    if b.endswith(".json.npy"):
+        push(os.path.join(data_dir, b.replace(".json.npy", ".npy")))
+    return cands
 
-def load_joints(schema_json: Optional[str]) -> List[str]:
-    if schema_json and os.path.exists(schema_json):
-        with open(schema_json, "r", encoding="utf-8") as f:
-            return list(json.load(f))
-    return list(DEFAULT_JOINTS)
+def pick_existing_path(cands: List[str]) -> Optional[str]:
+    for p in cands:
+        if os.path.exists(p):
+            return p
+    return None
 
-def load_model_bundle(model_path: str):
-    """Return (model, scaler_or_None). In train3.py, model.joblib stores dict {'model':..., 'scaler':...}."""
-    obj = joblib.load(model_path)
-    if isinstance(obj, dict):
-        return obj.get("model", obj), obj.get("scaler", None)
-    return obj, None
+# ---------- Универсальная нормализация формы (T,F) ----------
+def sanitize_seq(a: np.ndarray) -> np.ndarray:
+    """
+    Привести массив к (T, F):
+      - NaN/Inf -> 0
+      - выбрать самую длинную ось как время (T)
+      - остальные оси сплющить в F
+    """
+    a = np.nan_to_num(a, nan=0.0, posinf=0.0, neginf=0.0)
+    if a.ndim == 1:
+        a = a[:, None]
+    else:
+        t_axis = int(np.argmax(a.shape))
+        if t_axis != 0:
+            a = np.moveaxis(a, t_axis, 0)
+        if a.ndim > 2:
+            a = a.reshape(a.shape[0], -1)
+    return a.astype(np.float32, copy=False)
 
-# ---------- Classical feature extraction (copy of logic from train3.py) ----------
-
-def _features_from_seq(seq_np: np.ndarray) -> np.ndarray:
+# ---------- Классические фичи (как в train3.py) ----------
+def features_from_seq(seq_np: np.ndarray) -> np.ndarray:
     seq = seq_np.astype(np.float32, copy=False)
     dif = np.diff(seq, axis=0)
     stat = np.concatenate([
@@ -69,113 +120,99 @@ def _features_from_seq(seq_np: np.ndarray) -> np.ndarray:
     ]).astype(np.float32, copy=False)
     return np.nan_to_num(stat, nan=0.0, posinf=0.0, neginf=0.0)
 
-def _map_to_npy_path(data_dir: str, rel_path: str) -> str:
-    base = rel_path[:-5] if rel_path.endswith(".json") else rel_path
-    if not base.endswith(".npy"):
-        base = base + ".npy"
-    return os.path.join(data_dir, base)
+# ---------- Загрузка схемы суставов ----------
+def load_joints(schema_json: Optional[str], auto_joints: Optional[int]=None) -> List[str]:
+    if schema_json and os.path.exists(schema_json):
+        with open(schema_json, "r", encoding="utf-8") as f:
+            return list(json.load(f))
+    if auto_joints is not None and auto_joints > 0:
+        return [f"joint_{i+1}" for i in range(int(auto_joints))]
+    return list(DEFAULT_JOINTS)
 
-def _safe_json_load(path):
-    try:
-        import orjson
-        with open(path, "rb") as f:
-            return orjson.loads(f.read())
-    except Exception:
-        import json as _json
-        with open(path, "r", encoding="utf-8") as f:
-            return _json.load(f)
+# ---------- Загрузка модели ----------
+def load_model_bundle(model_path: str):
+    obj = joblib.load(model_path)
+    if isinstance(obj, dict):
+        return obj.get("model", obj), obj.get("scaler", None)
+    return obj, None
 
-def _stack_motion_frames_with_schema(md: dict, schema_joints: List[str]) -> Optional[np.ndarray]:
-    present = [j for j in schema_joints if j in md]
-    if not present:
-        return None
-    T = min(len(md[j]) for j in present)
-    if T <= 1:
-        return None
-    cols = []
-    for j in schema_joints:
-        if j in md:
-            arr = np.asarray(md[j], dtype=np.float32)[:T]   # (T,3)
-        else:
-            arr = np.full((T, 3), np.nan, dtype=np.float32)
-        cols.append(arr)
-    return np.concatenate(cols, axis=1)  # (T, 3*|schema|)
-
-def _load_meta(csv_path: str, filename_col: str, label_col: str) -> pd.DataFrame:
-    meta = pd.read_csv(csv_path, usecols=[filename_col, label_col])
-    # map labels like in train3.py
-    def label_to_int(v):
-        if v is None: return None
-        s = str(v).strip().lower()
-        if s == "injury": return 1
-        if s == "no injury": return 0
-        return None
-    meta["y"] = meta[label_col].map(label_to_int)
-    meta = meta[pd.notnull(meta[filename_col]) & pd.notnull(meta["y"])].copy()
-    return meta
-
-def build_features(
+# ---------- Построение фич из данных ----------
+def build_features_from_files(
     csv_path: str,
     data_dir: str,
-    input_format: str,               # "npy" | "json"
+    input_format: str,
     joints: List[str],
     filename_col: str,
     label_col: str,
     downsample: int = 1
 ) -> Tuple[np.ndarray, np.ndarray]:
-    meta = _load_meta(csv_path, filename_col, label_col)
-    X_list, y_list = [], []
+    meta = pd.read_csv(csv_path, usecols=[filename_col, label_col]).copy()
+    meta["y"] = meta[label_col].map(label_to_int)
+    meta = meta[pd.notnull(meta[filename_col]) & pd.notnull(meta["y"])]
 
+    X_list, y_list = [], []
     if input_format == "npy":
         for _, row in meta.iterrows():
-            p = _map_to_npy_path(data_dir, str(row[filename_col]).strip())
-            if not os.path.exists(p):
-                continue
+            fn = str(row[filename_col]).strip()
+            p = pick_existing_path(possible_npy_paths(data_dir, fn))
+            if not p: continue
             try:
                 arr = np.load(p, allow_pickle=False, mmap_mode="r")
-                if arr.ndim != 2 or arr.shape[0] < 2:
-                    continue
-                seq = arr[::max(1, downsample)]
-                X_list.append(_features_from_seq(np.asarray(seq)))
+                x = sanitize_seq(arr)                # (T,F)
+                if x.shape[0] < 2: continue
+                if downsample > 1: x = x[::downsample]
+                X_list.append(features_from_seq(x))
                 y_list.append(int(row["y"]))
             except Exception:
                 continue
-    else:  # json
-        for _, row in meta.iterrows():
-            p = os.path.join(data_dir, str(row[filename_col]).strip())
-            if not os.path.exists(p) and not p.endswith(".json"):
-                p2 = p + ".json"
-                if os.path.exists(p2):
-                    p = p2
-            if not os.path.exists(p):
-                continue
+    else:  # JSON
+        def safe_json_load(path):
             try:
-                data = _safe_json_load(p)
-                # motion key default "running" in train3; allow both 'running' and 'walking'
+                import orjson
+                with open(path, "rb") as f:
+                    return orjson.loads(f.read())
+            except Exception:
+                with open(path, "r", encoding="utf-8") as f:
+                    return json.load(f)
+        def stack_motion(md: dict, schema_joints: List[str]) -> Optional[np.ndarray]:
+            present = [j for j in schema_joints if j in md]
+            if not present: return None
+            T = min(len(md[j]) for j in present)
+            if T <= 1: return None
+            cols = []
+            for j in schema_joints:
+                if j in md:
+                    arr = np.asarray(md[j], dtype=np.float32)[:T]
+                else:
+                    arr = np.full((T, 3), np.nan, dtype=np.float32)
+                cols.append(arr)
+            return np.concatenate(cols, axis=1)  # (T, 3*|schema|)
+        for _, row in meta.iterrows():
+            base = os.path.join(data_dir, str(row[filename_col]).strip())
+            p = base if os.path.exists(base) else (base + ".json" if os.path.exists(base + ".json") else "")
+            if not p: continue
+            try:
+                data = safe_json_load(p)
                 motion = None
                 for k in ("running", "walking"):
                     if k in data and isinstance(data[k], dict):
                         motion = data[k]; break
-                if motion is None:
-                    continue
-                seq = _stack_motion_frames_with_schema(motion, joints)
-                if seq is None or seq.shape[0] < 2:
-                    continue
-                if downsample > 1:
-                    seq = seq[::downsample]
-                X_list.append(_features_from_seq(np.asarray(seq)))
+                if motion is None: continue
+                seq = stack_motion(motion, joints)
+                if seq is None or seq.shape[0] < 2: continue
+                if downsample > 1: seq = seq[::downsample]
+                X_list.append(features_from_seq(seq))
                 y_list.append(int(row["y"]))
             except Exception:
                 continue
 
     if not X_list:
-        raise RuntimeError("Failed to build any feature rows for permutation importance.")
+        raise RuntimeError("Не удалось построить ни одной строки фич из данных.")
     X = np.stack(X_list).astype(np.float32, copy=False)
     y = np.array(y_list, dtype=np.int32)
     return X, y
 
-# ---------- Mapping features -> joints ----------
-
+# ---------- Соответствие фич суставам ----------
 def build_feature_name_map(joints: List[str]) -> List[str]:
     names = []
     for j in joints:
@@ -188,163 +225,168 @@ def aggregate_joint_importance(importances: np.ndarray, joints: List[str]) -> pd
     expected = FEATS_PER_JOINT * len(joints)
     if importances.size != expected:
         raise ValueError(
-            f"Len of importances = {importances.size}, expected by schema: {expected} "
-            f"(18 features × {len(joints)} joints)."
+            f"Длина важностей = {importances.size}, ожидается {expected} "
+            f"(18 фич × {len(joints)} суставов). Проверьте схему суставов и модель."
         )
-    joint_scores = []
+    block = FEATS_PER_JOINT
+    scores = []
     for j_idx, jname in enumerate(joints):
-        start = j_idx * FEATS_PER_JOINT
-        end = start + FEATS_PER_JOINT
-        score = float(np.sum(importances[start:end]))
-        joint_scores.append((jname, score))
-    df = pd.DataFrame(joint_scores, columns=["joint", "importance_sum"])
+        s = j_idx * block
+        e = s + block
+        val = float(np.sum(importances[s:e]))
+        scores.append((jname, val))
+    df = pd.DataFrame(scores, columns=["joint", "importance_sum"])
     tot = df["importance_sum"].sum()
-    df["importance_norm"] = df["importance_sum"] / tot if tot > 0 else 0.0
-    return df.sort_values("importance_sum", ascending=False).reset_index(drop=True)
+    df["importance_norm"] = df["importance_sum"] / (tot + 1e-12)
+    return df.sort_values("importance_sum", ascending=False, ignore_index=True)
 
-# ---------- Plot ----------
-
+# ---------- Визуализация ----------
 def plot_joint_importance(df: pd.DataFrame, topn: int, title: str, plot_path: str, show: bool=True, dpi: int=160):
     top = df.head(max(1, int(topn))).copy()
     top = top.iloc[::-1]
-    top["importance_pct"] = 100 * top["importance_sum"]
-    h = max(3.5, 0.3 * len(top))
-    plt.figure(figsize=(8, h))
+    top["importance_pct"] = 100.0 * top["importance_norm"]
+    h = max(3.5, 0.35 * len(top))
+    plt.figure(figsize=(9, h))
     plt.barh(top["joint"], top["importance_pct"])
-    plt.xlabel("Importance (%)")
+    plt.xlabel("Importance (%) of total")
     plt.title(title)
     for i, v in enumerate(top["importance_pct"]):
         plt.text(v, i, f" {v:.1f}%", va="center")
-    plt.xlim(0, top["importance_pct"].max() * 1.1 if len(top) else 1)
+    xmax = top["importance_pct"].max() if len(top) else 1.0
+    plt.xlim(0, max(1.0, xmax * 1.1))
     plt.tight_layout()
     plt.savefig(plot_path, dpi=dpi)
     if show:
-        plt.show()
+        try: plt.show()
+        except Exception: pass
     plt.close()
     print(f"[OK] Plot saved: {plot_path}")
 
-# ---------- Importance getters ----------
-
+# ---------- Извлечение важностей ----------
 def get_rf_xgb_importances(model) -> Optional[np.ndarray]:
     imp = getattr(model, "feature_importances_", None)
-    if imp is None:
-        return None
-    return np.asarray(imp, dtype=float)
+    return None if imp is None else np.asarray(imp, dtype=float)
 
 def get_linear_svm_importances(model) -> Optional[np.ndarray]:
-    # SVC(kernel='linear') or LinearSVC -> coef_ exists (shape: [1, n_features] for binary)
     coef = getattr(model, "coef_", None)
-    if coef is None:
-        return None
-    coef = np.asarray(coef, dtype=float).ravel()
-    return np.abs(coef)
+    if coef is None: return None
+    return np.abs(np.asarray(coef, dtype=float).ravel())
 
-def get_permutation_importances(model, scaler, X: np.ndarray, y: np.ndarray,
-                                scoring: str = "f1", n_repeats: int = 10, random_state: int = 42) -> np.ndarray:
-    # scale if scaler is provided (as saved in train3.py)
+def permutation_importances(model, scaler, X: np.ndarray, y: np.ndarray,
+                            scoring: str = "f1", n_repeats: int = 10, random_state: int = 42) -> np.ndarray:
     Xs = scaler.transform(X) if scaler is not None else X
-    # Use probability if available for roc_auc
     if scoring == "roc_auc":
-        # ensure we have predict_proba or decision_function
-        def _predict_proba_like(est, X_):
+        def _proba_like(est, X_):
             if hasattr(est, "predict_proba"):
                 return est.predict_proba(X_)[:, 1]
             if hasattr(est, "decision_function"):
-                # map decision scores to [0,1] via rank or sigmoid-like scaling
                 d = est.decision_function(X_)
-                # simple normalization to (0,1)
                 d = (d - d.min()) / (d.max() - d.min() + 1e-9)
                 return d
-            # fallback to predictions
             return est.predict(X_)
-        scorer = lambda est, X_, y_: roc_auc_score(y_, _predict_proba_like(est, X_))
+        scorer = lambda est, X_, y_: roc_auc_score(y_, _proba_like(est, X_))
     else:
         scorer = lambda est, X_, y_: f1_score(y_, est.predict(X_))
+    r = permutation_importance(model, Xs, y, scoring=scorer,
+                               n_repeats=n_repeats, random_state=random_state, n_jobs=-1)
+    return np.maximum(r.importances_mean, 0.0)
 
-    r = permutation_importance(
-        model, Xs, y, scoring=scorer, n_repeats=n_repeats, random_state=random_state, n_jobs=-1
-    )
-    return np.maximum(r.importances_mean, 0.0)  # clip negatives to 0 for nicer chart
+# ---------- Автовывод количества суставов из длины вектора важностей ----------
+def maybe_auto_joints_count(importances_len: int) -> Optional[int]:
+    # importances_len = 18 * J
+    if importances_len % FEATS_PER_JOINT == 0:
+        return importances_len // FEATS_PER_JOINT
+    return None
 
 # ---------- Main ----------
-
 def main():
-    ap = argparse.ArgumentParser(description="Per-joint importance for RF/XGB/SVM models.")
-    ap.add_argument("--model_joblib", required=True, help="Path to model.joblib (as saved by train3.py).")
-    ap.add_argument("--schema_json", default="", help="Optional JSON with joints list; defaults to built-in.")
-    ap.add_argument("--topn_plot", type=int, default=20, help="How many top joints to plot.")
-    ap.add_argument("--plot_path", default="top_joints_importance.png", help="Where to save the plot.")
-    ap.add_argument("--no_show", action="store_true", help="Do not display plot, only save.")
-    ap.add_argument("--title", default="Joint Importance (sum over 18 features per joint)", help="Plot title.")
-    ap.add_argument("--topn", type=int, default=15, help="How many joints to print to console.")
+    ap = argparse.ArgumentParser(description="Per-joint importance for RF/XGB/SVM (with optional permutation importance).")
+    ap.add_argument("--model_joblib", required=True, help="Путь к model.joblib (из train3.py).")
+    ap.add_argument("--schema_json", default="", help="JSON со списком суставов (если не задано — дефолт или авто).")
+    ap.add_argument("--auto_joints", action="store_true",
+                    help="Игнорировать схему и сгенерировать имена суставов из длины вектора важностей (если кратно 18).")
 
-    # For permutation importance on SVM RBF (or any model w/o importances)
-    ap.add_argument("--csv", default="", help="CSV with metadata (filename, label). Required for permutation importance.")
-    ap.add_argument("--data_dir", default="", help="Directory with JSON/NPY files.")
-    ap.add_argument("--input_format", choices=["npy", "json"], default="npy", help="Source format for building features.")
+    # Данные (только если понадобится permutation importance)
+    ap.add_argument("--csv", default="", help="CSV (filename, label). Нужно, если у модели нет importances/coef_.")
+    ap.add_argument("--data_dir", default="", help="Папка с файлами (JSON/NPY).")
+    ap.add_argument("--npy_dir", default="", help="Синоним data_dir для совместимости со старыми скриптами.")
+    ap.add_argument("--input_format", choices=["npy","json"], default="npy")
     ap.add_argument("--filename_col", default="filename")
     ap.add_argument("--label_col", default="No inj/ inj")
-    ap.add_argument("--downsample", type=int, default=1, help="Temporal downsample step (>=1).")
-    ap.add_argument("--pi_scoring", choices=["f1", "roc_auc"], default="f1", help="Metric for permutation importance.")
-    ap.add_argument("--pi_repeats", type=int, default=10, help="n_repeats for permutation importance.")
+    ap.add_argument("--downsample", type=int, default=1)
+
+    # Вывод
+    ap.add_argument("--topn", type=int, default=15, help="Сколько показать в консоли.")
+    ap.add_argument("--topn_plot", type=int, default=20, help="Сколько нарисовать на графике.")
+    ap.add_argument("--plot_path", default="top_joints.png")
+    ap.add_argument("--no_show", action="store_true")
+    ap.add_argument("--title", default="Joint Importance (sum over 18 features)")
+    ap.add_argument("--save_csv", default="", help="Путь для сохранения CSV с важностями суставов.")
+
+    # Permutation importance
+    ap.add_argument("--pi_scoring", choices=["f1","roc_auc"], default="f1")
+    ap.add_argument("--pi_repeats", type=int, default=10)
 
     args = ap.parse_args()
 
-    joints = load_joints(args.schema_json)
-    print(f"[INFO] Joints in schema: {len(joints)} (expected features = 18×|joints| = {FEATS_PER_JOINT*len(joints)})")
-
     model, scaler = load_model_bundle(args.model_joblib)
 
-    # 1) Try tree importances (RF/XGB)
+    # 1) Попробуем прямые важности
     importances = get_rf_xgb_importances(model)
-
-    # 2) If none, try linear SVM coefs
     if importances is None:
         importances = get_linear_svm_importances(model)
 
-    # 3) If still none — run permutation importance (needs data)
+    data_dir = args.data_dir or args.npy_dir
+
+    # 2) Если нет — считаем permutation importance по данным
     if importances is None:
-        if not args.csv or not args.data_dir:
+        if not args.csv or not data_dir:
             raise RuntimeError(
-                "The model has no importances/coefficients. "
-                "For SVM with non-linear kernel, please provide --csv and --data_dir to compute permutation importance."
+                "У модели нет feature_importances_/coef_. "
+                "Для SVM с RBF (или др. моделей) укажите --csv и --data_dir (или --npy_dir) для permutation importance."
             )
-        # Rebuild classical features exactly like in train3.py
-        X, y = build_features(
+        # joints предварительно: если есть schema_json — читаем, иначе дефолт (можно будет переопределить дальше)
+        joints = load_joints(args.schema_json)
+        X, y = build_features_from_files(
             csv_path=args.csv,
-            data_dir=args.data_dir,
+            data_dir=data_dir,
             input_format=args.input_format,
             joints=joints,
             filename_col=args.filename_col,
             label_col=args.label_col,
             downsample=max(1, int(args.downsample)),
         )
-        # Permutation importance on the full set (or you can subsample here if it's huge)
-        print(f"[INFO] Running permutation importance on {X.shape[0]} samples × {X.shape[1]} features...")
-        importances = get_permutation_importances(
-            model, scaler, X, y, scoring=args.pi_scoring, n_repeats=args.pi_repeats
+        print(f"[INFO] Permutation importance на {X.shape[0]} сэмплах × {X.shape[1]} фичах...")
+        importances = permutation_importances(
+            model, scaler, X, y, scoring=args.pi_scoring, n_repeats=int(args.pi_repeats)
         )
+        # после PI мы точно знаем len(importances) => можно автоинферить joints, если просили
+        auto_J = maybe_auto_joints_count(importances.size) if args.auto_joints else None
+        joints = load_joints(args.schema_json, auto_joints=auto_J)
+    else:
+        # у нас есть вектор важностей напрямую от модели => можно автоинферить joints при желании
+        auto_J = maybe_auto_joints_count(importances.size) if args.auto_joints else None
+        joints = load_joints(args.schema_json, auto_joints=auto_J)
 
-    # Sanity check: length must match features layout
-    expected_len = FEATS_PER_JOINT * len(joints)
-    if importances.size != expected_len:
+    # Проверим соответствие длины
+    expected = FEATS_PER_JOINT * len(joints)
+    if importances.size != expected:
         raise ValueError(
-            f"Importances length = {importances.size}, but expected {expected_len} "
-            f"(18 × {len(joints)} joints). Check that your model was trained on classical features "
-            f"with the same joints schema."
+            f"Длина важностей = {importances.size}, ожидается {expected} (18×|joints|). "
+            f"Либо передайте корректную --schema_json, либо используйте флаг --auto_joints."
         )
 
-    # Aggregate to joints
-    df = aggregate_joint_importance(importances, joints)
+    # Агрегация по суставам
+    df = aggregate_joint_importance(np.asarray(importances, dtype=float), joints)
 
-    # Print TOP-N
+    # Консольный топ
     topn = max(1, int(args.topn))
     print("\n=== TOP joints (sum of importances over 18 features per joint) ===")
     for i, row in df.head(topn).iterrows():
-        print(f"{i+1:2d}. {row['joint']:>12s}  importance_sum={row['importance_sum']:.6f}  "
-              f"(norm={row['importance_norm']:.4f})")
+        print(f"{i+1:2d}. {row['joint']:>16s}  "
+              f"sum={row['importance_sum']:.6f}  norm={row['importance_norm']:.4f}")
 
-    # Plot
+    # Плот
     plot_joint_importance(
         df=df,
         topn=args.topn_plot,
@@ -353,6 +395,11 @@ def main():
         show=not args.no_show,
         dpi=160
     )
+
+    # CSV
+    if args.save_csv:
+        df.to_csv(args.save_csv, index=False, encoding="utf-8")
+        print(f"[OK] CSV saved: {args.save_csv}")
 
 if __name__ == "__main__":
     main()
