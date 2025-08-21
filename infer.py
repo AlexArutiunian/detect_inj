@@ -101,18 +101,35 @@ def pick_existing_path(cands: List[str]) -> Optional[str]:
     for p in cands:
         if os.path.exists(p): return p
     return None
-
 def choose_paths_scan_then_csv(data_dir: str,
                                csv_path: Optional[str],
                                filename_col: str,
                                recursive: bool,
                                input_format: str) -> List[str]:
-    disk = list_files_with_ext(data_dir, ".npy" if input_format=="npy" else ".json", recursive=recursive)
+    """
+    1) Сканируем data_dir (по расширению из input_format) -> список файлов на диске.
+    2) Если задан CSV — берём пересечение с CSV, НО c нормализацией:
+       для каждой CSV-строки пробуем все кандидаты через possible_paths(...),
+       совпадаем либо по абсолютному существующему файлу, либо по basename из скана.
+    """
+    # 1) что лежит на диске
+    ext = ".npy" if input_format == "npy" else ".json"
+    disk_files = list_files_with_ext(data_dir, ext, recursive=recursive)
+
     if not csv_path or not os.path.exists(csv_path):
         if csv_path and not os.path.exists(csv_path):
             print(f"[warn] CSV '{csv_path}' не найден; используем только файлы на диске.", file=sys.stderr)
-        return disk
+        return disk_files
 
+    # индексы для быстрых совпадений
+    disk_set = set(os.path.normpath(p) for p in disk_files)
+    by_base: dict[str, str] = {}
+    for p in disk_files:
+        b = os.path.basename(p)
+        if b not in by_base:  # первое вхождение
+            by_base[b] = p
+
+    # 2) читаем CSV и сопоставляем с диском
     df = pd.read_csv(csv_path)
     cols = {c.lower().strip(): c for c in df.columns}
     fn_col = cols.get(filename_col.lower(), filename_col)
@@ -121,30 +138,38 @@ def choose_paths_scan_then_csv(data_dir: str,
             if "file" in c.lower() or "name" in c.lower():
                 fn_col = c; break
 
-    wanted = [_norm_rel_with_suffix(str(v), input_format) for v in df[fn_col].astype(str).tolist()]
-
-    by_rel = {}
-    for p in disk:
-        rel = os.path.relpath(p, data_dir).replace("\\", "/")
-        by_rel[_norm_rel_with_suffix(rel, input_format)] = p
-
-    by_base = {}
-    for p in disk:
-        b = os.path.basename(p)
-        if b not in by_base: by_base[b] = p
-
-    chosen, missing = [], 0
-    for w in wanted:
-        p = by_rel.get(w) or by_base.get(os.path.basename(w))
-        if p: chosen.append(p)
-        else: missing += 1
+    chosen: list[str] = []
+    missing = 0
+    for raw in df[fn_col].astype(str).tolist():
+        # переберём все разумные кандидаты путей (json<->npy тоже)
+        cands = possible_paths(data_dir, raw, input_format)
+        hit = None
+        for c in cands:
+            nc = os.path.normpath(c)
+            if os.path.exists(nc):
+                hit = nc; break
+            # попробуем совпасть по basename со сканом
+            b = os.path.basename(nc)
+            if b in by_base:
+                hit = by_base[b]; break
+        if hit:
+            chosen.append(hit)
+        else:
+            missing += 1
 
     if missing:
         print(f"[warn] В CSV указано файлов, которых нет на диске: {missing}", file=sys.stderr)
-    extra = len(disk) - len(chosen)
+    extra = len(disk_files) - len(set(chosen))
     if extra > 0:
         print(f"[info] На диске есть файлов вне CSV: {extra}", file=sys.stderr)
-    return chosen
+
+    # уберём дубликаты и вернём в стабильном порядке
+    seen, out = set(), []
+    for p in chosen:
+        if p not in seen:
+            seen.add(p); out.append(p)
+    return out
+
 
 def resolve_inputs_from_csv(csv_path: str, data_dir: str, filename_col: str, input_format: str) -> List[str]:
     if not os.path.exists(csv_path):
