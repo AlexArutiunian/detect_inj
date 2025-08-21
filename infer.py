@@ -378,6 +378,71 @@ def _register_custom_objects():
     # def masked_max(inputs): ...
 
     return {"masked_mean": masked_mean, "valid_mask": valid_mask}
+
+# ---------- Custom objects for Keras-3 Lambda deserialization ----------
+def _register_custom_objects():
+    import tensorflow as tf
+    import keras
+
+    @keras.saving.register_keras_serializable(package="custom")
+    def masked_mean(inputs):
+        # поддержка [x, mask] и просто x
+        if isinstance(inputs, (list, tuple)):
+            x = inputs[0]
+            mask = inputs[1] if len(inputs) > 1 else None
+        else:
+            x = inputs
+            mask = None
+
+        x = tf.convert_to_tensor(x)
+        if mask is not None:
+            mask = tf.cast(mask, x.dtype)
+            mask = tf.expand_dims(mask, axis=-1)      # (B,T,1)
+            num = tf.reduce_sum(x * mask, axis=1)     # (B,D)
+            den = tf.reduce_sum(mask, axis=1) + 1e-8  # (B,1)
+            y = num / den
+        else:
+            y = tf.reduce_mean(x, axis=1)             # (B,D)
+
+        # дать хинт формы: (None, D)
+        if x.shape.rank is not None and x.shape.rank >= 2:
+            y.set_shape([None, x.shape[-1]])
+        return y
+
+    @keras.saving.register_keras_serializable(package="custom")
+    def valid_mask(x):
+        x = tf.convert_to_tensor(x)
+        m = tf.reduce_sum(tf.abs(x), axis=-1) > 0.0   # (B,T)
+        m = tf.cast(m, tf.float32)
+        if x.shape.rank is not None and x.shape.rank >= 2:
+            m.set_shape([None, x.shape[1]])
+        return m
+
+    # Подменяем Lambda так, чтобы она умела возвращать форму
+    @keras.saving.register_keras_serializable(package="custom")
+    class SafeLambda(keras.layers.Lambda):
+        # Keras вызывает compute_output_shape до вызова call():
+        def compute_output_shape(self, input_shape):
+            # input_shape может быть Tuple или List[Tuple] (если inputs=[x, mask])
+            s = input_shape[0] if isinstance(input_shape, (list, tuple)) and input_shape and isinstance(input_shape[0], (list, tuple)) else input_shape
+            # ожидаем (None, T, D) -> (None, D)
+            try:
+                batch = s[0] if isinstance(s, (list, tuple)) else None
+                feat  = s[-1] if isinstance(s, (list, tuple)) else None
+                if feat is not None:
+                    return (batch, feat)
+            except Exception:
+                pass
+            # fallback — пусть решает базовый класс
+            return super().compute_output_shape(input_shape)
+
+    # Вернём все объекты для custom_objects
+    return {
+        "masked_mean": masked_mean,
+        "valid_mask": valid_mask,
+        # ВАЖНО: ключ ровно 'Lambda', чтобы заменить класс слоя в конфиге
+        "Lambda": SafeLambda,
+    }
     
     
 def load_any_model(model_path: str, unsafe_deser: bool = False):
