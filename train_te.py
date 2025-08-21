@@ -49,7 +49,23 @@ def label_to_int(v):
     return None
 
 def sanitize_seq(a: np.ndarray) -> np.ndarray:
+    """
+    Приводит произвольный массив к форме (T, F):
+    - заменяет NaN/Inf на 0
+    - выбирает самую длинную ось как время и переносит её на 0
+    - остальные оси сплющивает в признаки
+    """
     a = np.nan_to_num(a, nan=0.0, posinf=0.0, neginf=0.0)
+
+    if a.ndim == 1:
+        a = a[:, None]  # (T,) -> (T,1)
+    elif a.ndim >= 2:
+        t_axis = int(np.argmax(a.shape))   # предполагаем, что время — самая длинная ось
+        if t_axis != 0:
+            a = np.moveaxis(a, t_axis, 0)  # время -> ось 0
+        if a.ndim > 2:
+            a = a.reshape(a.shape[0], -1)  # (T, ...)->(T,F)
+
     return a.astype(np.float32, copy=False)
 
 def best_threshold_by_f1(y_true, p):
@@ -162,7 +178,8 @@ def build_items(csv_path: str, data_dir: str,
             else:
                 try:
                     arr = np.load(path, allow_pickle=False, mmap_mode="r")
-                    if arr.ndim != 2 or arr.shape[0] < 2:
+                    x = sanitize_seq(arr)
+                    if x.ndim != 2 or x.shape[0] < 2:
                         stats["too_short"] += 1
                         status = "too-short"
                         if len(skipped_examples)<10: skipped_examples.append((status, os.path.basename(path)))
@@ -172,7 +189,7 @@ def build_items(csv_path: str, data_dir: str,
                         stats["ok"] += 1
                         status = "OK"
                         resolved = path
-                        shape_txt = f"shape={tuple(arr.shape)}"
+                        shape_txt = f"shape={tuple(x.shape)}"
                 except Exception as e:
                     stats["error"] += 1
                     status = f"np-load:{type(e).__name__}"
@@ -189,9 +206,11 @@ def probe_stats(items: List[Tuple[str,int]], downsample: int = 1, pctl: int = 95
     feat = None
     for p, _ in items:
         arr = np.load(p, allow_pickle=False, mmap_mode="r")
-        if arr.ndim != 2 or arr.shape[0] < 2: continue
-        if feat is None: feat = int(arr.shape[1])
-        L = int(arr.shape[0] // max(1, downsample))
+        x = sanitize_seq(arr)
+        L = int(x.shape[0] // max(1, downsample))
+        if x.ndim != 2 or L < 1:
+            continue
+        if feat is None: feat = int(x.shape[1])
         if L > 0: lengths.append(L)
     max_len = int(np.percentile(lengths, pctl)) if lengths else 256
     return max_len, feat or 1
@@ -204,7 +223,8 @@ def compute_norm_stats(items: List[Tuple[str,int]], feat_dim: int, downsample: i
     m2   = np.zeros(feat_dim, dtype=np.float64)
     for p, _ in pool:
         arr = np.load(p, allow_pickle=False, mmap_mode="r")
-        x = sanitize_seq(arr[::max(1, downsample)])
+        x = sanitize_seq(arr)
+        x = x[::max(1, downsample)]
         if x.shape[0] > max_len_cap: x = x[:max_len_cap]
         for t in range(x.shape[0]):
             count += 1
@@ -231,7 +251,8 @@ def make_datasets(items, labels, max_len, feat_dim, bs, downsample, mean, std, r
                 p = items[i]
                 y = labels[i]
                 arr = np.load(p, allow_pickle=False, mmap_mode="r")
-                x = sanitize_seq(arr[::max(1, downsample)])
+                x = sanitize_seq(arr)                 # <-- сначала нормализуем форму
+                x = x[::max(1, downsample)]           # <-- потом downsample по времени
                 if x.shape[0] < 2:
                     continue
                 if x.shape[0] > max_len:
@@ -264,9 +285,8 @@ def make_datasets(items, labels, max_len, feat_dim, bs, downsample, mean, std, r
 
     return make
 
-# ====== НОВОЕ: Transformer Encoder вместо GRU ======
+# ====== Transformer Encoder вместо RNN ======
 def _sinusoidal_pe(max_len: int, d_model: int) -> np.ndarray:
-    """[1, max_len, d_model] синусоидальная позиционная энкодировка."""
     pos = np.arange(max_len)[:, None]
     i   = np.arange(d_model)[None, :]
     angle_rates = 1 / np.power(10000, (2*(i//2)) / np.float32(d_model))
@@ -275,83 +295,54 @@ def _sinusoidal_pe(max_len: int, d_model: int) -> np.ndarray:
     pe[:, 0::2] = np.sin(angles[:, 0::2])
     pe[:, 1::2] = np.cos(angles[:, 1::2])
     return pe[None, :, :]  # (1, L, D)
-def build_transformer_model(
-        input_shape,               # (max_len, feat_dim)
-        learning_rate=1e-3,
-        mixed_precision=False,
-        d_model=128,
-        num_heads=4,
-        ff_dim=256,
-        num_layers=3,
-        dropout=0.2,
-        attn_dropout=0.1,
-    ):
-    tf, layers, models = lazy_tf()
 
+def build_transformer_model(input_shape, learning_rate=1e-3, mixed_precision=False,
+                            d_model=128, num_heads=4, ff_dim=256, num_layers=3,
+                            dropout=0.2, attn_dropout=0.1):
+    tf, layers, models = lazy_tf()
     max_len, feat_dim = input_shape
 
-    # Вход
     inp = layers.Input(shape=input_shape, name="seq_input")  # (B, T, F)
 
-    # ===== маски =====
-    # валидные таймстепы: там, где строка не вся из нулей (паддинг у нас нули)
-    valid_mask = layers.Lambda(
-        lambda t: tf.reduce_any(tf.not_equal(t, 0.0), axis=-1),
-        name="valid_mask"
-    )(inp)  # (B, T) bool
+    # маски (валидные таймстепы: строка не из нулей)
+    valid_mask = layers.Lambda(lambda t: tf.reduce_any(tf.not_equal(t, 0.0), axis=-1),
+                               name="valid_mask")(inp)  # (B, T) bool
+    key_mask = layers.Lambda(lambda m: tf.expand_dims(tf.cast(m, tf.bool), axis=1),
+                             name="key_mask")(valid_mask)  # (B, 1, T) bool
 
-    # key padding mask для MHA (B, 1, T) — XLA-дружелюбно, без einsum
-    key_mask = layers.Lambda(
-        lambda m: tf.expand_dims(tf.cast(m, tf.bool), axis=1),
-        name="key_mask"
-    )(valid_mask)  # (B, 1, T) bool
-
-    # ===== проектирование + позиции =====
-    x = layers.Dense(d_model, name="proj")(inp)  # (B, T, D)
-
-    # фиксированная синусоидальная PE
-    pe_np = _sinusoidal_pe(max_len, d_model)
-    pe = tf.constant(pe_np, dtype=tf.float32)
-    x = layers.Lambda(lambda z: z + tf.cast(pe, z.dtype),
-                      name="add_positional_encoding")(x)
-
+    # проекция + позиции
+    x = layers.Dense(d_model, name="proj")(inp)
+    pe = tf.constant(_sinusoidal_pe(max_len, d_model), dtype=tf.float32)
+    x = layers.Lambda(lambda z: z + tf.cast(pe, z.dtype), name="add_positional_encoding")(x)
     x = layers.Dropout(dropout, name="drop_in")(x)
 
-    # ===== стек энкодеров =====
+    # энкодерные блоки
     for i in range(num_layers):
-        # MHA блок (pre-LN)
         x_norm = layers.LayerNormalization(epsilon=1e-6, name=f"ln1_{i}")(x)
         attn_out = layers.MultiHeadAttention(
-            num_heads=num_heads,
-            key_dim=d_model // num_heads,
-            dropout=attn_dropout,
-            name=f"mha_{i}",
-        )(x_norm, x_norm, attention_mask=key_mask)   # <— подаём key padding mask
-        x = layers.Add(name=f"res_attn_{i}")(
-            [x, layers.Dropout(dropout, name=f"drop_attn_{i}")(attn_out)]
-        )
+            num_heads=num_heads, key_dim=d_model // num_heads,
+            dropout=attn_dropout, name=f"mha_{i}",
+        )(x_norm, x_norm, attention_mask=key_mask)
+        x = layers.Add(name=f"res_attn_{i}")([x, layers.Dropout(dropout, name=f"drop_attn_{i}")(attn_out)])
 
-        # FFN блок
         y = layers.LayerNormalization(epsilon=1e-6, name=f"ln2_{i}")(x)
         y = layers.Dense(ff_dim, activation="relu", name=f"ffn_{i}_dense1")(y)
         y = layers.Dropout(dropout, name=f"ffn_{i}_drop1")(y)
         y = layers.Dense(d_model, name=f"ffn_{i}_dense2")(y)
-        x = layers.Add(name=f"res_ffn_{i}")(
-            [x, layers.Dropout(dropout, name=f"ffn_{i}_drop2")(y)]
-        )
+        x = layers.Add(name=f"res_ffn_{i}")([x, layers.Dropout(dropout, name=f"ffn_{i}_drop2")(y)])
 
-    # ===== маскированный mean pooling =====
+    # masked mean pooling
     def masked_mean(args):
         h, m = args  # h:(B,T,D), m:(B,T)
         m = tf.cast(m, h.dtype)
-        m = tf.expand_dims(m, -1)               # (B,T,1)
-        s = tf.reduce_sum(h * m, axis=1)        # (B,D)
-        c = tf.reduce_sum(m, axis=1) + 1e-6     # (B,1)
+        m = tf.expand_dims(m, -1)
+        s = tf.reduce_sum(h * m, axis=1)
+        c = tf.reduce_sum(m, axis=1) + 1e-6
         return s / c
 
-    pooled = layers.Lambda(masked_mean, name="masked_mean_pool")([x, valid_mask])  # (B, D)
+    pooled = layers.Lambda(masked_mean, name="masked_mean_pool")([x, valid_mask])
 
-    # ===== классификатор =====
+    # голова
     z = layers.Dropout(0.3, name="head_drop")(pooled)
     z = layers.Dense(64, activation="relu", name="head_dense")(z)
     out = layers.Dense(1, activation="sigmoid", dtype="float32", name="out")(z)
@@ -361,6 +352,10 @@ def build_transformer_model(
     model.compile(optimizer=opt, loss="binary_crossentropy", metrics=["accuracy"])
     return model
 
+# заглушка контекста, если нет стратегии
+class contextlib_null:
+    def __enter__(self): return None
+    def __exit__(self, *exc): return False
 
 # ---------------------- main ----------------------
 def main():
@@ -376,13 +371,10 @@ def main():
     ap.add_argument("--max_len", default="auto")           # "auto" -> 95 перцентиль
     ap.add_argument("--gpus", default="all")               # "all" | "cpu" | "0,1"
     ap.add_argument("--mixed_precision", action="store_true")
-    ap.add_argument("--print_csv_preview", action="store_true",
-                    help="Показать первые 5 строк CSV и частоты меток")
-    ap.add_argument("--debug_index", action="store_true",
-                    help="Печатать статус каждой строки при индексации")
-    ap.add_argument("--peek", type=int, default=0,
-                    help="Показать N успешно сопоставленных путей (форма массива)")
-    # опционально гиперпараметры трансформера через CLI
+    ap.add_argument("--print_csv_preview", action="store_true")
+    ap.add_argument("--debug_index", action="store_true")
+    ap.add_argument("--peek", type=int, default=0)
+    # гиперпараметры трансформера
     ap.add_argument("--d_model", type=int, default=128)
     ap.add_argument("--num_heads", type=int, default=4)
     ap.add_argument("--ff_dim", type=int, default=256)
@@ -413,16 +405,17 @@ def main():
         print("\n=== CSV preview (first 5 rows) ===")
         df_preview = pd.read_csv(args.csv)
         print(df_preview.head(5).to_string(index=False))
-        if "No inj/ inj" in df_preview.columns:
-            print("\nLabel value counts in 'No inj/ inj':")
-            print(df_preview["No inj/ inj"].value_counts(dropna=False))
+        if args.label_col in df_preview.columns:
+            print(f"\nLabel value counts in '{args.label_col}':")
+            print(df_preview[args.label_col].value_counts(dropna=False))
 
     if args.peek > 0:
         print(f"\n=== Peek first {min(args.peek, len(items))} matched items ===")
         for (pth, lab) in items[:args.peek]:
             try:
                 arr = np.load(pth, allow_pickle=False, mmap_mode="r")
-                print(f"OK  label={lab} | {pth} | shape={arr.shape}")
+                x = sanitize_seq(arr)
+                print(f"OK  label={lab} | {pth} | shape={x.shape}")
             except Exception as e:
                 print(f"FAIL to load for peek: {pth} -> {type(e).__name__}")
 
@@ -433,6 +426,7 @@ def main():
     else:
         max_len = int(args.max_len)
         aa = np.load(paths[0], allow_pickle=False, mmap_mode="r")
+        aa = sanitize_seq(aa)                # <-- важно
         feat_dim = int(aa.shape[1])
     print(f"max_len={max_len} | feat_dim={feat_dim}")
 
@@ -477,7 +471,7 @@ def main():
     class_weight = {0: float(w[0]), 1: float(w[1])}
     print("class_weight:", class_weight)
 
-    # Модель (Transformer вместо GRU)
+    # Модель (Transformer)
     ctx = strategy.scope() if strategy else contextlib_null()
     with ctx:
         model = build_transformer_model(
@@ -533,11 +527,6 @@ def main():
     print("\n=== TEST (using DEV threshold) ===")
     print(test_metrics["report"])
     print("Saved to:", args.out_dir)
-
-# заглушка контекста, если нет стратегии
-class contextlib_null:
-    def __enter__(self): return None
-    def __exit__(self, *exc): return False
 
 if __name__ == "__main__":
     main()
