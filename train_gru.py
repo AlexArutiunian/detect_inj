@@ -49,22 +49,26 @@ def label_to_int(v):
     return None
 
 def sanitize_seq(a: np.ndarray) -> np.ndarray:
+    """
+    Приводит произвольный массив к форме (T, F):
+    - заменяет NaN/Inf на 0
+    - выбирает самую длинную ось как время и переносит её на 0
+    - остальные оси сплющиваются в признаки
+    """
     a = np.nan_to_num(a, nan=0.0, posinf=0.0, neginf=0.0)
 
-    # если это один признак во времени
     if a.ndim == 1:
-        a = a[:, None]
+        a = a[:, None]  # (T,) -> (T, 1)
 
-    # если данных 3D или больше — переносим ось времени в 0 и сплющиваем остальные
-    if a.ndim >= 3:
-        # предполагаем, что время — самая длинная ось; при другой организации замените логику
+    elif a.ndim >= 2:
+        # считаем, что ось времени — самая длинная
         t_axis = int(np.argmax(a.shape))
         if t_axis != 0:
-            a = np.moveaxis(a, t_axis, 0)
-        a = a.reshape(a.shape[0], -1)
+            a = np.moveaxis(a, t_axis, 0)  # время -> ось 0
+        if a.ndim > 2:
+            a = a.reshape(a.shape[0], -1)  # (T, ... ) -> (T, F)
 
     return a.astype(np.float32, copy=False)
-
 
 def best_threshold_by_f1(y_true, p):
     from sklearn.metrics import precision_recall_curve
@@ -85,7 +89,7 @@ def compute_metrics(y_true, y_pred, y_prob):
 
 # ---------------------- маппинг путей ----------------------
 def possible_npy_paths(data_dir: str, rel: str) -> List[str]:
-    """Генерирует все разумные варианты путей (учёт .json, .npy, .json.npy, базовое имя)."""
+    """Генерирует разумные варианты путей (.json, .npy, .json.npy и базовые имена)."""
     rel = (rel or "").strip().replace("\\", "/").lstrip("/")
     cands = []
 
@@ -93,22 +97,18 @@ def possible_npy_paths(data_dir: str, rel: str) -> List[str]:
         if x not in cands:
             cands.append(x)
 
-    # как есть и с .npy
     push(os.path.join(data_dir, rel))
     if not rel.endswith(".npy"):
         push(os.path.join(data_dir, rel + ".npy"))
 
-    # варианты с .json → .npy и .json.npy
     if rel.endswith(".json"):
         base_nojson = rel[:-5]
         push(os.path.join(data_dir, base_nojson + ".npy"))
-        push(os.path.join(data_dir, rel + ".npy"))          # .json.npy
+        push(os.path.join(data_dir, rel + ".npy"))
 
-    # если уже .json.npy — попробуем без .json
     if rel.endswith(".json.npy"):
         push(os.path.join(data_dir, rel.replace(".json.npy", ".npy")))
 
-    # только базовое имя
     b = os.path.basename(rel)
     push(os.path.join(data_dir, b))
     if not b.endswith(".npy"):
@@ -148,7 +148,6 @@ def build_items(csv_path: str, data_dir: str,
 
     items_x, items_y = [], []
     stats = {"ok":0, "no_file":0, "bad_label":0, "too_short":0, "error":0}
-    
     skipped_examples = []
 
     for i, row in tqdm(df.iterrows(), total=len(df), desc="Indexing"):
@@ -170,7 +169,6 @@ def build_items(csv_path: str, data_dir: str,
             if len(skipped_examples)<10: skipped_examples.append((status, rel))
         else:
             path = pick_existing_path(possible_npy_paths(data_dir, rel))
-            print(path)
             if not path:
                 stats["no_file"] += 1
                 status = "not-found"
@@ -178,11 +176,11 @@ def build_items(csv_path: str, data_dir: str,
             else:
                 try:
                     arr = np.load(path, allow_pickle=False, mmap_mode="r")
-                  
-                    if arr.ndim != 3 or arr.shape[0] < 2:
+                    x = sanitize_seq(arr)
+                    if x.ndim != 2 or x.shape[0] < 2:
                         stats["too_short"] += 1
                         status = "too-short"
-                        print(status, path, "dim: ", arr.ndim)
+                        print(status, path, "shape:", x.shape)
                         if len(skipped_examples)<10: skipped_examples.append((status, os.path.basename(path)))
                     else:
                         items_x.append(path)
@@ -190,7 +188,7 @@ def build_items(csv_path: str, data_dir: str,
                         stats["ok"] += 1
                         status = "OK"
                         resolved = path
-                        shape_txt = f"shape={tuple(arr.shape)}"
+                        shape_txt = f"shape={tuple(x.shape)}"
                 except Exception as e:
                     stats["error"] += 1
                     status = f"np-load:{type(e).__name__}"
@@ -207,9 +205,11 @@ def probe_stats(items: List[Tuple[str,int]], downsample: int = 1, pctl: int = 95
     feat = None
     for p, _ in items:
         arr = np.load(p, allow_pickle=False, mmap_mode="r")
-        if arr.ndim != 2 or arr.shape[0] < 2: continue
-        if feat is None: feat = int(arr.shape[1])
-        L = int(arr.shape[0] // max(1, downsample))
+        x = sanitize_seq(arr)
+        L = int(x.shape[0] // max(1, downsample))
+        if x.ndim != 2 or L < 1:
+            continue
+        if feat is None: feat = int(x.shape[1])
         if L > 0: lengths.append(L)
     max_len = int(np.percentile(lengths, pctl)) if lengths else 256
     return max_len, feat or 1
@@ -222,7 +222,8 @@ def compute_norm_stats(items: List[Tuple[str,int]], feat_dim: int, downsample: i
     m2   = np.zeros(feat_dim, dtype=np.float64)
     for p, _ in pool:
         arr = np.load(p, allow_pickle=False, mmap_mode="r")
-        x = sanitize_seq(arr[::max(1, downsample)])
+        x = sanitize_seq(arr)
+        x = x[::max(1, downsample)]
         if x.shape[0] > max_len_cap: x = x[:max_len_cap]
         for t in range(x.shape[0]):
             count += 1
@@ -249,7 +250,8 @@ def make_datasets(items, labels, max_len, feat_dim, bs, downsample, mean, std, r
                 p = items[i]
                 y = labels[i]
                 arr = np.load(p, allow_pickle=False, mmap_mode="r")
-                x = sanitize_seq(arr[::max(1, downsample)])
+                x = sanitize_seq(arr)
+                x = x[::max(1, downsample)]
                 if x.shape[0] < 2:
                     continue
                 if x.shape[0] > max_len:
@@ -297,6 +299,11 @@ def build_gru_model(input_shape, learning_rate=1e-3, mixed_precision=False):
     model.compile(optimizer=opt, loss="binary_crossentropy", metrics=["accuracy"])
     return model
 
+# заглушка контекста, если нет стратегии
+class contextlib_null:
+    def __enter__(self): return None
+    def __exit__(self, *exc): return False
+
 # ---------------------- main ----------------------
 def main():
     ap = argparse.ArgumentParser("GRU binary classifier over NPY sequences")
@@ -332,7 +339,6 @@ def main():
         label_col=args.label_col,
         debug_index=args.debug_index
     )
-    print(items_x, items_y)
     assert items_x and items_y, "Не найдено валидных .npy и меток"
     items = list(zip(items_x, items_y))
     paths = items_x
@@ -342,26 +348,28 @@ def main():
         print("\n=== CSV preview (first 5 rows) ===")
         df_preview = pd.read_csv(args.csv)
         print(df_preview.head(5).to_string(index=False))
-        if "No inj/ inj" in df_preview.columns:
-            print("\nLabel value counts in 'No inj/ inj':")
-            print(df_preview["No inj/ inj"].value_counts(dropna=False))
+        if args.label_col in df_preview.columns:
+            print(f"\nLabel value counts in '{args.label_col}':")
+            print(df_preview[args.label_col].value_counts(dropna=False))
 
     if args.peek > 0:
         print(f"\n=== Peek first {min(args.peek, len(items))} matched items ===")
         for (pth, lab) in items[:args.peek]:
             try:
                 arr = np.load(pth, allow_pickle=False, mmap_mode="r")
-                print(f"OK  label={lab} | {pth} | shape={arr.shape}")
+                x = sanitize_seq(arr)
+                print(f"OK  label={lab} | {pth} | shape={x.shape}")
             except Exception as e:
                 print(f"FAIL to load for peek: {pth} -> {type(e).__name__}")
 
     # Статы по длине/размеру признака
-    if args.max_len.strip().lower() == "auto":
+    if str(args.max_len).strip().lower() == "auto":
         max_len, feat_dim = probe_stats(items, downsample=args.downsample, pctl=95)
         max_len = int(max(8, min(max_len, 20000)))
     else:
         max_len = int(args.max_len)
         aa = np.load(paths[0], allow_pickle=False, mmap_mode="r")
+        aa = sanitize_seq(aa)
         feat_dim = int(aa.shape[1])
     print(f"max_len={max_len} | feat_dim={feat_dim}")
 
@@ -452,11 +460,6 @@ def main():
     print("\n=== TEST (using DEV threshold) ===")
     print(test_metrics["report"])
     print("Saved to:", args.out_dir)
-
-# заглушка контекста, если нет стратегии
-class contextlib_null:
-    def __enter__(self): return None
-    def __exit__(self, *exc): return False
 
 if __name__ == "__main__":
     main()
