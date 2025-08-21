@@ -4,20 +4,20 @@
 ST-GCN бинарный классификатор для последовательностей из .npy
 (замена GRU на Spatio-Temporal Graph Convolutional Network)
 
-Ожидается, что вход — это массив формы (T, F), где F = V*C.
-V — число узлов графа (например, суставов), C — число каналов на узел (например, x,y,(z)).
-Если V и C не заданы, они выводятся автоматически (3->2->1).
+Вход может быть:
+  - 2D (T, F)
+  - 3D (T, J, C)
 
-Граф (аджacency) можно задать:
+sanitize_seq универсально приводит вход к (T, F), где F = V*C.
+V и C выводятся автоматически (3->2->1), если не заданы.
+
+Граф (adjacency) можно задать:
   * --edges_json путь к JSON-списку рёбер [[i,j], ...] (0- или 1-индексация)
   * --stgcn_adjacency {identity,ring,full} — предустановки (по умолчанию ring)
-
-Прочее: логика загрузки данных, нормализация, разбиение, сохранение метрик/графиков —
-оставлены из исходного скрипта.
 """
 from typing import List, Tuple, Dict
 from tqdm import tqdm
-import os, json, argparse, math, random
+import os, json, argparse, random
 import numpy as np
 import pandas as pd
 import matplotlib
@@ -64,7 +64,21 @@ def label_to_int(v):
     return None
 
 def sanitize_seq(a: np.ndarray) -> np.ndarray:
+    """
+    Приводит массив к (T, F):
+      - заменяет NaN/Inf на 0
+      - выбирает самую длинную ось как время и переносит её на 0
+      - остальные оси сплющивает в признаки
+    """
     a = np.nan_to_num(a, nan=0.0, posinf=0.0, neginf=0.0)
+    if a.ndim == 1:
+        a = a[:, None]  # (T,) -> (T,1)
+    elif a.ndim >= 2:
+        t_axis = int(np.argmax(a.shape))      # предполагаем: самая длинная ось — время
+        if t_axis != 0:
+            a = np.moveaxis(a, t_axis, 0)     # время -> ось 0
+        if a.ndim > 2:
+            a = a.reshape(a.shape[0], -1)     # (T, ... ) -> (T, F)
     return a.astype(np.float32, copy=False)
 
 def best_threshold_by_f1(y_true, p):
@@ -89,7 +103,6 @@ def possible_npy_paths(data_dir: str, rel: str) -> List[str]:
     """Генерирует все разумные варианты путей (учёт .json, .npy, .json.npy, базовое имя)."""
     rel = (rel or "").strip().replace("\\", "/").lstrip("/")
     cands = []
-
     def push(x):
         if x not in cands:
             cands.append(x)
@@ -177,7 +190,8 @@ def build_items(csv_path: str, data_dir: str,
             else:
                 try:
                     arr = np.load(path, allow_pickle=False, mmap_mode="r")
-                    if arr.ndim != 2 or arr.shape[0] < 2:
+                    x = sanitize_seq(arr)  # <— приводим к (T,F)
+                    if x.ndim != 2 or x.shape[0] < 2:
                         stats["too_short"] += 1
                         status = "too-short"
                         if len(skipped_examples)<10: skipped_examples.append((status, os.path.basename(path)))
@@ -187,7 +201,7 @@ def build_items(csv_path: str, data_dir: str,
                         stats["ok"] += 1
                         status = "OK"
                         resolved = path
-                        shape_txt = f"shape={tuple(arr.shape)}"
+                        shape_txt = f"shape={tuple(x.shape)}"
                 except Exception as e:
                     stats["error"] += 1
                     status = f"np-load:{type(e).__name__}"
@@ -204,9 +218,11 @@ def probe_stats(items: List[Tuple[str,int]], downsample: int = 1, pctl: int = 95
     feat = None
     for p, _ in items:
         arr = np.load(p, allow_pickle=False, mmap_mode="r")
-        if arr.ndim != 2 or arr.shape[0] < 2: continue
-        if feat is None: feat = int(arr.shape[1])
-        L = int(arr.shape[0] // max(1, downsample))
+        x = sanitize_seq(arr)                        # <— сначала нормализуем форму
+        L = int(x.shape[0] // max(1, downsample))    # <— затем учитываем downsample
+        if x.ndim != 2 or L < 1:
+            continue
+        if feat is None: feat = int(x.shape[1])
         if L > 0: lengths.append(L)
     max_len = int(np.percentile(lengths, pctl)) if lengths else 256
     return max_len, feat or 1
@@ -219,7 +235,8 @@ def compute_norm_stats(items: List[Tuple[str,int]], feat_dim: int, downsample: i
     m2   = np.zeros(feat_dim, dtype=np.float64)
     for p, _ in pool:
         arr = np.load(p, allow_pickle=False, mmap_mode="r")
-        x = sanitize_seq(arr[::max(1, downsample)])
+        x = sanitize_seq(arr)              # <— нормализуем форму
+        x = x[::max(1, downsample)]       # <— then downsample
         if x.shape[0] > max_len_cap: x = x[:max_len_cap]
         for t in range(x.shape[0]):
             count += 1
@@ -259,12 +276,8 @@ def load_edges_json(path: str, V: int) -> List[Tuple[int,int]]:
             a, b = int(e["src"]), int(e["dst"])
         else:
             a, b = int(e[0]), int(e[1])
-        # поддержка 1-индексации
-        if a >= 1 and b >= 1 and (a > V or b > V):
-            # если явно больше V, оставляем как есть (возможно V тоже 1-индексировано)
-            pass
-        # нормируем в 0..V-1, если нужно
-        if a >= 1 and b >= 1 and (V == max(a,b)):
+        # поддержка 1-индексации → нормализуем в 0..V-1, если похоже на 1-based
+        if a >= 1 and b >= 1 and (a <= V and b <= V):
             a -= 1; b -= 1
         edges.append((max(0, min(V-1, a)), max(0, min(V-1, b))))
     return edges
@@ -303,20 +316,21 @@ def make_datasets(items, labels, max_len, feat_dim, V, C, bs, downsample, mean, 
                 p = items[i]
                 y = labels[i]
                 arr = np.load(p, allow_pickle=False, mmap_mode="r")
-                x = sanitize_seq(arr[::max(1, downsample)])
+                x = sanitize_seq(arr)                 # (T,F) универсально
+                x = x[::max(1, downsample)]           # downsample по времени
                 if x.shape[0] < 2:
                     continue
                 if x.shape[0] > max_len:
                     x = x[:max_len]
-                # нормализация покомпонентно (по F), затем reshape в (T,V,C)
+                # нормализация по признакам (F), потом reshape в (T,V,C)
                 x = (x - mean) / std
                 T = x.shape[0]
-                # fallback, если F не делится как ожидалось — добиваем нулями
                 F = x.shape[1]
                 if F != V*C:
-                    pad_f = (V*C) - (F % (V*C)) if F % (V*C) != 0 else 0
-                    if pad_f > 0:
-                        x = np.pad(x, [[0,0],[0,pad_f]], mode='constant')
+                    # добиваем нулями до ближайшего кратного V*C
+                    need = V*C - (F % (V*C)) if (F % (V*C)) != 0 else 0
+                    if need > 0:
+                        x = np.pad(x, [[0,0],[0,need]], mode='constant')
                 x = x.reshape(T, V, C)
                 yield x, np.int32(y)
         return _g
@@ -366,7 +380,7 @@ def build_stgcn_model(T_max: int, V: int, C: int, A_norm: np.ndarray,
 
     def stgcn_block(x, out_ch, stride_t: int = 1):
         s = spatial_gcn(x, out_ch)
-        t = layers.Conv2D(out_ch, kernel_size=(temporal_kernel, 1), strides=(stride_t, 1), padding='same')(s)  # свёртка по времени с шагом
+        t = layers.Conv2D(out_ch, kernel_size=(temporal_kernel, 1), strides=(stride_t, 1), padding='same')(s)  # свёртка по времени
         t = layers.BatchNormalization()(t)
         t = layers.Activation('relu')(t)
         if dropout and dropout > 0:
@@ -457,18 +471,19 @@ def main():
         print("\n=== CSV preview (first 5 rows) ===")
         df_preview = pd.read_csv(args.csv)
         print(df_preview.head(5).to_string(index=False))
-        if "No inj/ inj" in df_preview.columns:
-            print("\nLabel value counts in 'No inj/ inj':")
-            print(df_preview["No inj/ inj"].value_counts(dropna=False))
+        if args.label_col in df_preview.columns:
+            print(f"\nLabel value counts in '{args.label_col}':")
+            print(df_preview[args.label_col].value_counts(dropna=False))
 
     if args.peek > 0:
         print(f"\n=== Peek first {min(args.peek, len(items))} matched items ===")
         for (pth, lab) in items[:args.peek]:
             try:
                 arr = np.load(pth, allow_pickle=False, mmap_mode="r")
-                print(f"OK  label={lab} | {pth} | shape={arr.shape}")
+                x = sanitize_seq(arr)
+                print(f"OK  label={lab} | {pth} | shape_sanitized={x.shape} | raw_ndim={arr.ndim}")
             except Exception as e:
-                print(f"FAIL to load for peek: {pth} -> {type(e).__name__}")
+                print(f"FAIL to load for peek: {pth} -> {type(e).__name__}: {e}")
 
     # Статы по длине/размеру признака
     if str(args.max_len).strip().lower() == "auto":
@@ -477,6 +492,7 @@ def main():
     else:
         max_len = int(args.max_len)
         aa = np.load(paths[0], allow_pickle=False, mmap_mode="r")
+        aa = sanitize_seq(aa)  # <— ВАЖНО
         feat_dim = int(aa.shape[1])
     print(f"max_len={max_len} | feat_dim={feat_dim}")
 
@@ -536,7 +552,6 @@ def main():
 
     # Параметры ST-GCN
     channels_list = [int(x) for x in str(args.stgcn_channels).split(',') if str(x).strip()]
-    # подготовим страйды по времени (если их меньше, добьём единицами)
     temporal_strides = [int(x) for x in str(args.temporal_strides).split(',') if str(x).strip()]
     if len(temporal_strides) < len(channels_list):
         temporal_strides += [1] * (len(channels_list) - len(temporal_strides))
