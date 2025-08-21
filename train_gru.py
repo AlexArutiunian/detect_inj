@@ -164,11 +164,11 @@ def build_items(csv_path: str, data_dir: str,
             else:
                 try:
                     arr = np.load(path, allow_pickle=False, mmap_mode="r")
-                    print(arr)
+                  
                     if arr.ndim != 2 or arr.shape[0] < 2:
                         stats["too_short"] += 1
                         status = "too-short"
-                        print(path)
+                        print(status, path, "dim: ", arr.ndim)
                         if len(skipped_examples)<10: skipped_examples.append((status, os.path.basename(path)))
                     else:
                         items_x.append(path)
