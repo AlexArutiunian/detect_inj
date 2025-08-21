@@ -171,8 +171,10 @@ def build_items(csv_path: str, data_dir: str,
         else:
             path = pick_existing_path(possible_npy_paths(data_dir, rel))
             if not path:
+                
                 stats["no_file"] += 1
                 status = "not-found"
+                print(status, " ", path)
                 if len(skipped_examples)<10: skipped_examples.append((status, rel))
             else:
                 try:
