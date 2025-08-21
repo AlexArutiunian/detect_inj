@@ -49,12 +49,25 @@ def label_to_int(v):
     return None
 
 def sanitize_seq(a: np.ndarray) -> np.ndarray:
+    """
+    Приводит массив к (T, F):
+    - заменяет NaN/Inf на 0
+    - переносит самую длинную ось как время (ось 0)
+    - остальные оси сплющивает в признаки
+    """
     a = np.nan_to_num(a, nan=0.0, posinf=0.0, neginf=0.0)
+    if a.ndim == 1:
+        a = a[:, None]  # (T,) -> (T,1)
+    elif a.ndim >= 2:
+        t_axis = int(np.argmax(a.shape))      # предполагаем: самая длинная ось — время
+        if t_axis != 0:
+            a = np.moveaxis(a, t_axis, 0)     # время -> ось 0
+        if a.ndim > 2:
+            a = a.reshape(a.shape[0], -1)     # (T, ...)->(T,F)
     return a.astype(np.float32, copy=False)
 
 def best_threshold(y_true, p, mode="bal_acc", fixed=None, target_spec=None):
     """Устойчивый выбор порога, чтобы не залипать на одном классе."""
-    import numpy as np
     from sklearn.metrics import precision_recall_curve, roc_curve, f1_score, balanced_accuracy_score
 
     p = np.asarray(p, dtype=np.float64)
@@ -192,7 +205,8 @@ def build_items(csv_path: str, data_dir: str,
             else:
                 try:
                     arr = np.load(path, allow_pickle=False, mmap_mode="r")
-                    if arr.ndim != 2 or arr.shape[0] < 2:
+                    x = sanitize_seq(arr)  # <-- универсально к (T,F)
+                    if x.ndim != 2 or x.shape[0] < 2:
                         stats["too_short"] += 1
                         status = "too-short"
                         if len(skipped_examples)<10: skipped_examples.append((status, os.path.basename(path)))
@@ -202,7 +216,7 @@ def build_items(csv_path: str, data_dir: str,
                         stats["ok"] += 1
                         status = "OK"
                         resolved = path
-                        shape_txt = f"shape={tuple(arr.shape)}"
+                        shape_txt = f"shape={tuple(x.shape)}"
                 except Exception as e:
                     stats["error"] += 1
                     status = f"np-load:{type(e).__name__}"
@@ -219,9 +233,11 @@ def probe_stats(items: List[Tuple[str,int]], downsample: int = 1, pctl: int = 95
     feat = None
     for p, _ in items:
         arr = np.load(p, allow_pickle=False, mmap_mode="r")
-        if arr.ndim != 2 or arr.shape[0] < 2: continue
-        if feat is None: feat = int(arr.shape[1])
-        L = int(arr.shape[0] // max(1, downsample))
+        x = sanitize_seq(arr)  # <-- сначала нормализуем
+        L = int(x.shape[0] // max(1, downsample))
+        if x.ndim != 2 or L < 1:
+            continue
+        if feat is None: feat = int(x.shape[1])
         if L > 0: lengths.append(L)
     max_len = int(np.percentile(lengths, pctl)) if lengths else 256
     return max_len, feat or 1
@@ -234,7 +250,8 @@ def compute_norm_stats(items: List[Tuple[str,int]], feat_dim: int, downsample: i
     m2   = np.zeros(feat_dim, dtype=np.float64)
     for p, _ in pool:
         arr = np.load(p, allow_pickle=False, mmap_mode="r")
-        x = sanitize_seq(arr[::max(1, downsample)])
+        x = sanitize_seq(arr)              # <-- нормализуем
+        x = x[::max(1, downsample)]        # <-- потом downsample по времени
         if x.shape[0] > max_len_cap: x = x[:max_len_cap]
         for t in range(x.shape[0]):
             count += 1
@@ -261,7 +278,8 @@ def make_datasets(items, labels, max_len, feat_dim, bs, downsample, mean, std, r
                 p = items[i]
                 y = labels[i]
                 arr = np.load(p, allow_pickle=False, mmap_mode="r")
-                x = sanitize_seq(arr[::max(1, downsample)])
+                x = sanitize_seq(arr)           # <-- нормализуем
+                x = x[::max(1, downsample)]     # <-- потом downsample
                 if x.shape[0] < 2:
                     continue
                 if x.shape[0] > max_len:
@@ -436,7 +454,8 @@ def main():
         for (pth, lab) in items[:args.peek]:
             try:
                 arr = np.load(pth, allow_pickle=False, mmap_mode="r")
-                print(f"OK  label={lab} | {pth} | shape={arr.shape}")
+                x = sanitize_seq(arr)
+                print(f"OK  label={lab} | {pth} | shape={x.shape}")
             except Exception as e:
                 print(f"FAIL to load for peek: {pth} -> {type(e).__name__}")
 
@@ -447,6 +466,7 @@ def main():
     else:
         max_len = int(args.max_len)
         aa = np.load(paths[0], allow_pickle=False, mmap_mode="r")
+        aa = sanitize_seq(aa)  # <-- важно
         feat_dim = int(aa.shape[1])
     print(f"max_len={max_len} | feat_dim={feat_dim}")
 
