@@ -11,6 +11,7 @@ import argparse
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
+from typing import List, Optional
 
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
@@ -62,6 +63,27 @@ def print_split_stats(name, y):
     n = len(y); n1 = int(np.sum(y == 1)); n0 = n - n1
     p1 = (n1 / n * 100) if n else 0.0; p0 = (n0 / n * 100) if n else 0.0
     print(f"[{name}] total={n} | Injury=1: {n1} ({p1:.1f}%) | No Injury=0: {n0} ({p0:.1f}%)")
+
+# ---------- Универсальный нормализатор формы ----------
+def sanitize_seq(a: np.ndarray) -> np.ndarray:
+    """
+    Приводит массив к (T, F):
+    - NaN/Inf -> 0
+    - выбирает самую длинную ось как время и переносит её на 0
+    - остальные оси сплющивает в признаки
+    """
+    a = np.nan_to_num(a, nan=0.0, posinf=0.0, neginf=0.0)
+
+    if a.ndim == 1:
+        a = a[:, None]  # (T,) -> (T,1)
+    elif a.ndim >= 2:
+        t_axis = int(np.argmax(a.shape))  # самая длинная ось — время
+        if t_axis != 0:
+            a = np.moveaxis(a, t_axis, 0)  # время -> ось 0
+        if a.ndim > 2:
+            a = a.reshape(a.shape[0], -1)  # (T, ..., ...) -> (T, F)
+
+    return a.astype(np.float32, copy=False)
 
 # ===================== JSON utils (для input_format=json) =====================
 
@@ -121,7 +143,7 @@ def discover_joint_schema(csv_path, data_dir, motion_key,
 # ===================== ФИЧИ ДЛЯ "КЛАССИКИ" =====================
 
 def _features_from_seq(seq_np):
-    """seq_np: (T, F=3*|schema|) -> агрегированные статистики для классики."""
+    """seq_np: (T, F=3*|schema| или просто F) -> агрегированные статистики для классики."""
     seq = seq_np.astype(np.float32, copy=False)
     dif = np.diff(seq, axis=0)
     stat = np.concatenate([
@@ -181,19 +203,56 @@ def load_features_from_json(csv_path, data_dir, motion_key="running",
 
 # ---- NPY -> фичи ----
 
-def _map_to_npy_path(data_dir, rel_path):
-    base = rel_path[:-5] if rel_path.endswith(".json") else rel_path
-    if not base.endswith(".npy"):
-        base = base + ".npy"
-    return os.path.join(data_dir, base)
+def possible_npy_paths(data_dir: str, rel: str) -> List[str]:
+    """Генерирует разумные варианты путей (.npy, .json.npy и базовые имена)."""
+    rel = (rel or "").strip().replace("\\", "/").lstrip("/")
+    cands: List[str] = []
+
+    def push(x: str):
+        if x and x not in cands:
+            cands.append(x)
+
+    # как есть
+    push(os.path.join(data_dir, rel))
+    if not rel.endswith(".npy"):
+        push(os.path.join(data_dir, rel + ".npy"))
+
+    if rel.endswith(".json"):
+        base_nojson = rel[:-5]
+        push(os.path.join(data_dir, base_nojson + ".npy"))
+        push(os.path.join(data_dir, rel + ".npy"))  # .json.npy
+
+    if rel.endswith(".json.npy"):
+        push(os.path.join(data_dir, rel.replace(".json.npy", ".npy")))
+
+    b = os.path.basename(rel)
+    push(os.path.join(data_dir, b))
+    if not b.endswith(".npy"):
+        push(os.path.join(data_dir, b + ".npy"))
+    if b.endswith(".json"):
+        push(os.path.join(data_dir, b[:-5] + ".npy"))
+        push(os.path.join(data_dir, b + ".npy"))
+    if b.endswith(".json.npy"):
+        push(os.path.join(data_dir, b.replace(".json.npy", ".npy")))
+
+    return cands
+
+def pick_existing_path(cands: List[str]) -> Optional[str]:
+    for p in cands:
+        if os.path.exists(p):
+            return p
+    return None
 
 def _feats_from_npy_task(args):
     npy_path, y, downsample = args
     try:
         arr = np.load(npy_path, allow_pickle=False, mmap_mode="r")
-        if arr.ndim != 2 or arr.shape[0] < 2: return None
-        seq = arr[::downsample] if downsample > 1 else arr
-        return (_features_from_seq(np.asarray(seq)), int(y))
+        x = sanitize_seq(arr)                       # приведение к (T,F)
+        if x.shape[0] < 2:
+            return None
+        if downsample > 1:
+            x = x[::downsample]
+        return (_features_from_seq(np.asarray(x)), int(y))
     except Exception:
         return None
 
@@ -205,9 +264,9 @@ def load_features_from_npy(csv_path, npy_dir, filename_col="filename", label_col
         fn = str(row[filename_col]).strip() if pd.notnull(row.get(filename_col)) else ""
         y = label_to_int(row.get(label_col))
         if not fn or y is None: continue
-        p = _map_to_npy_path(npy_dir, fn)
-       
-        if os.path.exists(p): tasks.append((p, y, int(max(1, downsample))))
+        p = pick_existing_path(possible_npy_paths(npy_dir, fn))
+        if p:
+            tasks.append((p, y, int(max(1, downsample))))
 
     results = []
     if workers and workers > 0:
@@ -242,8 +301,9 @@ def _build_index(csv_path, data_dir_or_npy_dir, filename_col, label_col, input_f
                 p2 = p + ".json"
                 if os.path.exists(p2): p = p2
         else:
-            p = _map_to_npy_path(data_dir_or_npy_dir, fn)
-        if os.path.exists(p): items.append((p, int(y)))
+            p = pick_existing_path(possible_npy_paths(data_dir_or_npy_dir, fn))
+        if p and os.path.exists(p):
+            items.append((p, int(y)))
     return items
 
 def _probe_max_len_json(file_label_pairs, motion_key, schema_joints, pctl=95, sample_max=None):
@@ -269,8 +329,9 @@ def _probe_max_len_npy(file_label_pairs, pctl=95, sample_max=None):
     for p, _ in tqdm(it, desc="Probe(NPY)", dynamic_ncols=True, mininterval=0.2):
         try:
             arr = np.load(p, allow_pickle=False, mmap_mode="r")
-            if arr.ndim == 2 and arr.shape[0] > 1:
-                L.append(int(arr.shape[0]))
+            x = sanitize_seq(arr)                  # привести к (T,F)
+            if x.ndim == 2 and x.shape[0] > 1:
+                L.append(int(x.shape[0]))
         except Exception:
             continue
     if not L: return None
@@ -519,7 +580,6 @@ def _plot_confusion(cm, title, path):
     ax.set_xlabel('Predicted label'); ax.set_ylabel('True label')
     ax.set_xticks([0,1]); ax.set_yticks([0,1])
     ax.set_xticklabels(CLASS_NAMES, rotation=15, ha='right'); ax.set_yticklabels(CLASS_NAMES)
-    # подписи ячеек: counts + % 
     for i in range(2):
         for j in range(2):
             ax.text(j, i, f"{cm[i,j]}\n{cmn[i,j]:.2f}", ha="center", va="center", fontsize=10,
@@ -835,9 +895,12 @@ if __name__ == "__main__":
                     p, y = self.items[i]
                     try:
                         arr = np.load(p, allow_pickle=False, mmap_mode="r")
-                        if arr.ndim != 2 or arr.shape[0] < 2: continue
-                        seq = arr[::self.downsample] if self.downsample > 1 else arr
-                        X_batch.append(np.asarray(seq, dtype=np.float32))
+                        x = sanitize_seq(arr)                 # (T,F)
+                        if x.shape[0] < 2:
+                            continue
+                        if self.downsample > 1:
+                            x = x[::self.downsample]
+                        X_batch.append(x.astype(np.float32))
                         y_batch.append(y)
                     except Exception:
                         continue
@@ -903,7 +966,6 @@ if __name__ == "__main__":
         )
 
         # ---- Визуализации (нейросеть) ----
-        # Снова соберём предсказания для графиков
         def _collect(seq):
             ys, ps = [], []
             for Xb, yb in seq:
