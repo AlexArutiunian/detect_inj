@@ -307,26 +307,62 @@ def is_classical_path(p: str) -> bool:
     low = p.lower()
     return low.endswith(".joblib") or low.endswith(".pkl")
 
+
+# --- Кастомные функции, которые могли попасть в Lambda при обучении ---
+def _register_custom_objects():
+    try:
+        import keras, tensorflow as tf
+
+        @keras.saving.register_keras_serializable(package="custom")
+        def masked_mean(inputs):
+            # inputs = [x, mask]; x: (B, T, D), mask: (B, T) в {0,1}
+            x, mask = inputs
+            mask = tf.cast(mask, x.dtype)
+            mask = tf.expand_dims(mask, axis=-1)           # (B,T,1)
+            num = tf.reduce_sum(x * mask, axis=1)          # (B,D)
+            den = tf.reduce_sum(mask, axis=1) + 1e-8       # (B,1)
+            return num / den
+
+        # можно добавить другие при необходимости:
+        # @keras.saving.register_keras_serializable(package="custom")
+        # def masked_max(inputs): ...
+
+        return {"masked_mean": masked_mean}
+    except Exception:
+        return {}
 def load_any_model(model_path: str, unsafe_deser: bool = False):
     import os
+    custom_objects = _register_custom_objects()
     try:
         import keras
         if unsafe_deser:
             try: keras.config.enable_unsafe_deserialization()
             except Exception: pass
         import tensorflow as tf  # noqa
-        try:    return tf.keras.models.load_model(model_path, safe_mode=not unsafe_deser)
-        except TypeError: return tf.keras.models.load_model(model_path)
+        try:
+            return tf.keras.models.load_model(
+                model_path, safe_mode=not unsafe_deser, custom_objects=custom_objects
+            )
+        except TypeError:
+            return tf.keras.models.load_model(model_path, custom_objects=custom_objects)
     except Exception as e_tf:
         try:
             import keras  # noqa
-            try:    return keras.saving.load_model(model_path, safe_mode=not unsafe_deser)
-            except TypeError: return keras.saving.load_model(model_path)
+            try:
+                return keras.saving.load_model(
+                    model_path, safe_mode=not unsafe_deser, custom_objects=custom_objects
+                )
+            except TypeError:
+                return keras.saving.load_model(model_path, custom_objects=custom_objects)
         except Exception as e_k:
             if os.path.isdir(model_path):
                 import tensorflow as tf  # noqa
-                try:    return tf.keras.models.load_model(model_path, safe_mode=not unsafe_deser)
-                except TypeError: return tf.keras.models.load_model(model_path)
+                try:
+                    return tf.keras.models.load_model(
+                        model_path, safe_mode=not unsafe_deser, custom_objects=custom_objects
+                    )
+                except TypeError:
+                    return tf.keras.models.load_model(model_path, custom_objects=custom_objects)
             raise RuntimeError(
                 f"Не удалось загрузить модель '{model_path}'. "
                 f"tf.keras: {type(e_tf).__name__}; keras: {type(e_k).__name__}"
