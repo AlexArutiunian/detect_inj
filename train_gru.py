@@ -174,7 +174,7 @@ def build_items(csv_path: str, data_dir: str,
                 
                 stats["no_file"] += 1
                 status = "not-found"
-                print(status, " ", path)
+                print(status, " ", path, rel)
                 if len(skipped_examples)<10: skipped_examples.append((status, rel))
             else:
                 try:
