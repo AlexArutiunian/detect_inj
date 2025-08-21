@@ -330,36 +330,93 @@ def _register_custom_objects():
         return {"masked_mean": masked_mean}
     except Exception:
         return {}
+    
+# ---------- Custom functions used inside Lambda layers ----------
+def _register_custom_objects():
+    import tensorflow as tf
+    import keras
+
+    @keras.saving.register_keras_serializable(package="custom")
+    def masked_mean(inputs):
+        # Supports both [x, mask] and x only
+        if isinstance(inputs, (list, tuple)):
+            x = inputs[0]
+            mask = inputs[1] if len(inputs) > 1 else None
+        else:
+            x = inputs
+            mask = None
+
+        x = tf.convert_to_tensor(x)
+        if mask is not None:
+            mask = tf.cast(mask, x.dtype)
+            mask = tf.expand_dims(mask, axis=-1)      # (B, T, 1)
+            num = tf.reduce_sum(x * mask, axis=1)     # (B, D)
+            den = tf.reduce_sum(mask, axis=1) + 1e-8  # (B, 1)
+            y = num / den
+        else:
+            y = tf.reduce_mean(x, axis=1)             # (B, D)
+
+        # *** give Keras a static-ish shape hint: (None, D) ***
+        if x.shape.rank is not None and x.shape.rank >= 2:
+            y.set_shape([None, x.shape[-1]])
+        return y
+
+    @keras.saving.register_keras_serializable(package="custom")
+    def valid_mask(x):
+        # x: (B, T, D) -> (B, T) mask in {0,1}
+        import tensorflow as tf
+        x = tf.convert_to_tensor(x)
+        m = tf.reduce_sum(tf.abs(x), axis=-1) > 0.0
+        m = tf.cast(m, tf.float32)
+        # shape hint: (None, T)
+        if x.shape.rank is not None and x.shape.rank >= 2:
+            m.set_shape([None, x.shape[1]])
+        return m
+
+    # при необходимости сюда же можно добавить другие использованные функции:
+    # @keras.saving.register_keras_serializable(package="custom")
+    # def masked_max(inputs): ...
+
+    return {"masked_mean": masked_mean, "valid_mask": valid_mask}
+    
+    
 def load_any_model(model_path: str, unsafe_deser: bool = False):
     import os
     custom_objects = _register_custom_objects()
     try:
-        import keras
+        import keras, tensorflow as tf
         if unsafe_deser:
-            try: keras.config.enable_unsafe_deserialization()
-            except Exception: pass
-        import tensorflow as tf  # noqa
+            try:
+                keras.config.enable_unsafe_deserialization()
+            except Exception:
+                pass
         try:
             return tf.keras.models.load_model(
-                model_path, safe_mode=not unsafe_deser, custom_objects=custom_objects
+                model_path,
+                safe_mode=not unsafe_deser,
+                custom_objects=custom_objects,
             )
         except TypeError:
             return tf.keras.models.load_model(model_path, custom_objects=custom_objects)
     except Exception as e_tf:
         try:
-            import keras  # noqa
+            import keras
             try:
                 return keras.saving.load_model(
-                    model_path, safe_mode=not unsafe_deser, custom_objects=custom_objects
+                    model_path,
+                    safe_mode=not unsafe_deser,
+                    custom_objects=custom_objects,
                 )
             except TypeError:
                 return keras.saving.load_model(model_path, custom_objects=custom_objects)
         except Exception as e_k:
             if os.path.isdir(model_path):
-                import tensorflow as tf  # noqa
+                import tensorflow as tf
                 try:
                     return tf.keras.models.load_model(
-                        model_path, safe_mode=not unsafe_deser, custom_objects=custom_objects
+                        model_path,
+                        safe_mode=not unsafe_deser,
+                        custom_objects=custom_objects,
                     )
                 except TypeError:
                     return tf.keras.models.load_model(model_path, custom_objects=custom_objects)
@@ -367,6 +424,7 @@ def load_any_model(model_path: str, unsafe_deser: bool = False):
                 f"Не удалось загрузить модель '{model_path}'. "
                 f"tf.keras: {type(e_tf).__name__}; keras: {type(e_k).__name__}"
             )
+
 
 def load_classical_bundle(path: str):
     import joblib
