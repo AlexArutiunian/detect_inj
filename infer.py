@@ -308,6 +308,7 @@ def is_classical_path(p: str) -> bool:
     return low.endswith(".joblib") or low.endswith(".pkl")
 
 # ---------- Custom objects for Keras-3 Lambda deserialization ----------
+# ---------- Custom objects for Keras-3 Lambda deserialization ----------
 def _register_custom_objects():
     import tensorflow as tf
     import keras
@@ -362,13 +363,18 @@ def _register_custom_objects():
                 pass
             return super().compute_output_shape(input_shape)
 
-    # --- Жёсткая подмена класса до загрузки модели ---
-    # Это важно для случаев, когда сериализатор игнорирует custom_objects["Lambda"].
-    keras.layers.Lambda = SafeLambda  # monkey patch
-
-    # Также зарегистрируем под именем 'Lambda'
+    # ---- ЖЕСТКИЙ ПАТЧ В ДВУХ МЕСТАХ ----
+    # 1) публичный путь
+    keras.layers.Lambda = SafeLambda
+    # 2) внутренний модуль, откуда берёт класс десериализация
     try:
-        # Keras 3
+        from keras.src.layers.core import lambda_layer as _ll
+        _ll.Lambda = SafeLambda
+    except Exception:
+        pass
+
+    # Зарегистрировать в глобальных custom_objects
+    try:
         co = keras.saving.get_custom_objects()
         co["Lambda"] = SafeLambda
         co["masked_mean"] = masked_mean
@@ -385,61 +391,69 @@ def load_any_model(model_path: str, unsafe_deser: bool = False):
 
     custom_objects = _register_custom_objects()
 
-    # Иногда "safe_mode=True" мешает кастомам; дайте флагом опцию отключить.
+    # Безопаснее сразу отключить safe_mode, иначе Keras может проигнорировать подмену Lambda
+    # Можно оставить флаг --unsafe_deser для полного контроля.
     safe_mode = not unsafe_deser
+    if safe_mode:
+        # если пользователь не указал --unsafe_deser, но у нас есть Lambda-подмена,
+        # всё равно лучше снять safe_mode
+        safe_mode = False
 
-    # Попробовать tf.keras
+    # 1) Попробовать через tf.keras в custom_object_scope
     try:
-        return tf.keras.models.load_model(
-            model_path,
-            custom_objects=custom_objects,
-            compile=False,          # компиляция не нужна для инференса
-            safe_mode=safe_mode     # у новых версий tf.keras параметр поддерживается
-        )
-    except TypeError:
-        # старые версии tf.keras без safe_mode
-        try:
+        with keras.utils.custom_object_scope(custom_objects):
             return tf.keras.models.load_model(
                 model_path,
                 custom_objects=custom_objects,
-                compile=False
+                compile=False,
+                safe_mode=safe_mode  # у некоторых сборок tf.keras параметр поддерживается
             )
+    except TypeError:
+        try:
+            with keras.utils.custom_object_scope(custom_objects):
+                return tf.keras.models.load_model(
+                    model_path,
+                    custom_objects=custom_objects,
+                    compile=False
+                )
         except Exception as e_tf:
             tf_err = e_tf
 
-    # Попробовать keras 3
+    # 2) Попробовать через keras.saving в том же scope
     try:
-        return keras.saving.load_model(
-            model_path,
-            custom_objects=custom_objects,
-            compile=False,
-            safe_mode=safe_mode
-        )
-    except TypeError:
-        try:
+        with keras.utils.custom_object_scope(custom_objects):
             return keras.saving.load_model(
                 model_path,
                 custom_objects=custom_objects,
-                compile=False
+                compile=False,
+                safe_mode=safe_mode
             )
+    except TypeError:
+        try:
+            with keras.utils.custom_object_scope(custom_objects):
+                return keras.saving.load_model(
+                    model_path,
+                    custom_objects=custom_objects,
+                    compile=False
+                )
         except Exception as e_k:
-            # Если путь — директория (SavedModel), дайте ещё одну попытку через tf.keras
             if os.path.isdir(model_path):
                 try:
-                    return tf.keras.models.load_model(
-                        model_path,
-                        custom_objects=custom_objects,
-                        compile=False
-                    )
+                    with keras.utils.custom_object_scope(custom_objects):
+                        return tf.keras.models.load_model(
+                            model_path,
+                            custom_objects=custom_objects,
+                            compile=False
+                        )
                 except Exception as e_dir:
                     raise RuntimeError(
                         f"Не удалось загрузить модель '{model_path}'. Последняя ошибка: {type(e_dir).__name__}: {e_dir}"
                     )
             raise RuntimeError(
-                f"Не удалось загрузить модель '{model_path}'. tf.keras: {type(tf_err).__name__ if 'tf_err' in locals() else 'N/A'}; "
+                f"Не удалось загрузить модель '{model_path}'. tf.keras: {type(locals().get('tf_err')).__name__ if 'tf_err' in locals() else 'N/A'}; "
                 f"keras: {type(e_k).__name__}: {e_k}"
             )
-    
+
 
 def load_classical_bundle(path: str):
     import joblib
