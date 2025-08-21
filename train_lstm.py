@@ -6,7 +6,7 @@ import os, json, argparse, math, random
 import numpy as np
 import pandas as pd
 import matplotlib
-matplotlib.use("Agg")           # сохраняем графики без GUI
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from sklearn.metrics import roc_curve, auc
 
@@ -49,8 +49,23 @@ def label_to_int(v):
     return None
 
 def sanitize_seq(a: np.ndarray) -> np.ndarray:
+    """
+    Приводит произвольный массив к форме (T, F):
+    - заменяет NaN/Inf на 0
+    - выбирает самую длинную ось как время и переносит её на 0
+    - остальные оси сплющивает в признаки
+    """
     a = np.nan_to_num(a, nan=0.0, posinf=0.0, neginf=0.0)
+    if a.ndim == 1:
+        a = a[:, None]                             # (T,) -> (T,1)
+    elif a.ndim >= 2:
+        t_axis = int(np.argmax(a.shape))           # предполагаем, что время — самая длинная ось
+        if t_axis != 0:
+            a = np.moveaxis(a, t_axis, 0)          # время -> ось 0
+        if a.ndim > 2:
+            a = a.reshape(a.shape[0], -1)          # (T, ...)->(T,F)
     return a.astype(np.float32, copy=False)
+
 def best_threshold_by_balanced_accuracy(y_true, p):
     from sklearn.metrics import roc_curve
     fpr, tpr, th = roc_curve(y_true, p)
@@ -59,25 +74,22 @@ def best_threshold_by_balanced_accuracy(y_true, p):
     return float(th[int(np.nanargmax(bal))])
 
 def threshold_for_specificity(y_true, p, target_spec=0.80):
-    # найдём порог с максимальной чувствительностью при специфичности >= target_spec
     from sklearn.metrics import roc_curve
     fpr, tpr, th = roc_curve(y_true, p)
     spec = 1.0 - fpr
     idx = np.where(spec >= target_spec)[0]
     if len(idx) == 0:
-        return float(th[0])  # самый жёсткий порог (максимальная специфичность)
-    # среди подходящих берём тот, где TPR максимален
+        return float(th[0])
     j = idx[int(np.nanargmax(tpr[idx]))]
     return float(th[j])
 
 def threshold_for_precision(y_true, p, target_prec=0.80):
-    # если хотите контролировать именно precision (меньше FP → выше precision)
     from sklearn.metrics import precision_recall_curve
     prec, rec, th = precision_recall_curve(y_true, p)
-    ok = np.where(prec[:-1] >= target_prec)[0]  # len(th) == len(prec)-1
+    ok = np.where(prec[:-1] >= target_prec)[0]
     if len(ok) == 0:
-        return 1.0  # очень высокий порог, если нужная точность недостижима
-    j = ok[int(np.nanargmax(rec[ok]))]  # из них берём с максимальным recall
+        return 1.0
+    j = ok[int(np.nanargmax(rec[ok]))]
     return float(th[j])
 
 def best_threshold_by_f1(y_true, p):
@@ -99,30 +111,19 @@ def compute_metrics(y_true, y_pred, y_prob):
 
 # ---------------------- маппинг путей ----------------------
 def possible_npy_paths(data_dir: str, rel: str) -> List[str]:
-    """Генерирует все разумные варианты путей (учёт .json, .npy, .json.npy, базовое имя)."""
     rel = (rel or "").strip().replace("\\", "/").lstrip("/")
     cands = []
-
     def push(x):
-        if x not in cands:
-            cands.append(x)
-
-    # как есть и с .npy
+        if x not in cands: cands.append(x)
     push(os.path.join(data_dir, rel))
     if not rel.endswith(".npy"):
         push(os.path.join(data_dir, rel + ".npy"))
-
-    # варианты с .json → .npy и .json.npy
     if rel.endswith(".json"):
         base_nojson = rel[:-5]
         push(os.path.join(data_dir, base_nojson + ".npy"))
-        push(os.path.join(data_dir, rel + ".npy"))          # .json.npy
-
-    # если уже .json.npy — попробуем без .json
+        push(os.path.join(data_dir, rel + ".npy"))
     if rel.endswith(".json.npy"):
         push(os.path.join(data_dir, rel.replace(".json.npy", ".npy")))
-
-    # только базовое имя
     b = os.path.basename(rel)
     push(os.path.join(data_dir, b))
     if not b.endswith(".npy"):
@@ -132,7 +133,6 @@ def possible_npy_paths(data_dir: str, rel: str) -> List[str]:
         push(os.path.join(data_dir, b + ".npy"))
     if b.endswith(".json.npy"):
         push(os.path.join(data_dir, b.replace(".json.npy", ".npy")))
-
     return cands
 
 def pick_existing_path(cands: List[str]) -> str | None:
@@ -190,7 +190,8 @@ def build_items(csv_path: str, data_dir: str,
             else:
                 try:
                     arr = np.load(path, allow_pickle=False, mmap_mode="r")
-                    if arr.ndim != 2 or arr.shape[0] < 2:
+                    x = sanitize_seq(arr)
+                    if x.ndim != 2 or x.shape[0] < 2:
                         stats["too_short"] += 1
                         status = "too-short"
                         if len(skipped_examples)<10: skipped_examples.append((status, os.path.basename(path)))
@@ -200,7 +201,7 @@ def build_items(csv_path: str, data_dir: str,
                         stats["ok"] += 1
                         status = "OK"
                         resolved = path
-                        shape_txt = f"shape={tuple(arr.shape)}"
+                        shape_txt = f"shape={tuple(x.shape)}"
                 except Exception as e:
                     stats["error"] += 1
                     status = f"np-load:{type(e).__name__}"
@@ -209,7 +210,7 @@ def build_items(csv_path: str, data_dir: str,
         if debug_index:
             print(f"[{i:05d}] csv='{rel}' | label_raw='{lab_raw}' -> {status}"
                   + (f" | path='{resolved}' {shape_txt}" if resolved else ""))
-
+    print(stats)
     return items_x, items_y, stats, skipped_examples
 
 def probe_stats(items: List[Tuple[str,int]], downsample: int = 1, pctl: int = 95):
@@ -217,9 +218,11 @@ def probe_stats(items: List[Tuple[str,int]], downsample: int = 1, pctl: int = 95
     feat = None
     for p, _ in items:
         arr = np.load(p, allow_pickle=False, mmap_mode="r")
-        if arr.ndim != 2 or arr.shape[0] < 2: continue
-        if feat is None: feat = int(arr.shape[1])
-        L = int(arr.shape[0] // max(1, downsample))
+        x = sanitize_seq(arr)
+        L = int(x.shape[0] // max(1, downsample))
+        if x.ndim != 2 or L < 1:
+            continue
+        if feat is None: feat = int(x.shape[1])
         if L > 0: lengths.append(L)
     max_len = int(np.percentile(lengths, pctl)) if lengths else 256
     return max_len, feat or 1
@@ -232,7 +235,8 @@ def compute_norm_stats(items: List[Tuple[str,int]], feat_dim: int, downsample: i
     m2   = np.zeros(feat_dim, dtype=np.float64)
     for p, _ in pool:
         arr = np.load(p, allow_pickle=False, mmap_mode="r")
-        x = sanitize_seq(arr[::max(1, downsample)])
+        x = sanitize_seq(arr)
+        x = x[::max(1, downsample)]
         if x.shape[0] > max_len_cap: x = x[:max_len_cap]
         for t in range(x.shape[0]):
             count += 1
@@ -259,7 +263,8 @@ def make_datasets(items, labels, max_len, feat_dim, bs, downsample, mean, std, r
                 p = items[i]
                 y = labels[i]
                 arr = np.load(p, allow_pickle=False, mmap_mode="r")
-                x = sanitize_seq(arr[::max(1, downsample)])
+                x = sanitize_seq(arr)
+                x = x[::max(1, downsample)]
                 if x.shape[0] < 2:
                     continue
                 if x.shape[0] > max_len:
@@ -293,68 +298,49 @@ def make_datasets(items, labels, max_len, feat_dim, bs, downsample, mean, std, r
     return make
 
 def build_lstm_model(input_shape, learning_rate=1e-3, mixed_precision=False):
-    # Теперь это LSTM-классификатор (имя функции можно оставить для совместимости)
     tf, layers, models = lazy_tf()
     inp = layers.Input(shape=input_shape)
     x = layers.Masking(mask_value=0.0)(inp)
-
-    # было:
-    # x = layers.GRU(128, return_sequences=True)(x)
-    # x = layers.GRU(64)(x)
-
-    # стало:
     x = layers.LSTM(128, return_sequences=True)(x)
     x = layers.LSTM(64)(x)
-
     x = layers.Dropout(0.3)(x)
     x = layers.Dense(64, activation="relu")(x)
     out = layers.Dense(1, activation="sigmoid", dtype="float32")(x)
-
     model = models.Model(inp, out)
     opt = tf.keras.optimizers.Adam(learning_rate=learning_rate, clipnorm=1.0)
     model.compile(optimizer=opt, loss="binary_crossentropy", metrics=["accuracy"])
     return model
 
+# заглушка контекста, если нет стратегии
+class contextlib_null:
+    def __enter__(self): return None
+    def __exit__(self, *exc): return False
 
 # ---------------------- main ----------------------
 def main():
     ap = argparse.ArgumentParser("LSTM binary classifier over NPY sequences")
     ap.add_argument("--out_dir", default="output_run_lstm")
-
     ap.add_argument("--csv", required=True)
     ap.add_argument("--data_dir", required=True)
     ap.add_argument("--filename_col", default="filename")
     ap.add_argument("--label_col", default="No inj/ inj")
-   
     ap.add_argument("--epochs", type=int, default=20)
-    ap.add_argument("--batch_size", type=int, default=16)  # локальный BS (умножается на #GPU)
+    ap.add_argument("--batch_size", type=int, default=16)
     ap.add_argument("--downsample", type=int, default=1)
-    ap.add_argument("--max_len", default="auto")           # "auto" -> 95 перцентиль
-    ap.add_argument("--gpus", default="all")               # "all" | "cpu" | "0,1"
+    ap.add_argument("--max_len", default="auto")
+    ap.add_argument("--gpus", default="all")
     ap.add_argument("--mixed_precision", action="store_true")
-    ap.add_argument("--print_csv_preview", action="store_true",
-                    help="Показать первые 5 строк CSV и частоты меток")
-    ap.add_argument("--debug_index", action="store_true",
-                    help="Печатать статус каждой строки при индексации")
-    ap.add_argument("--peek", type=int, default=0,
-                    help="Показать N успешно сопоставленных путей (форма массива)")
-    
+    ap.add_argument("--print_csv_preview", action="store_true")
+    ap.add_argument("--debug_index", action="store_true")
+    ap.add_argument("--peek", type=int, default=0)
+
     ap.add_argument("--threshold_mode", choices=["f1", "balanced_acc", "specificity", "precision"],
-                default="specificity", help="как подбирать порог на DEV")
-    ap.add_argument("--target_specificity", type=float, default=0.85,
-                    help="целевая специфичность для threshold_mode=specificity")
-    ap.add_argument("--target_precision", type=float, default=0.85,
-                    help="целевая точность для threshold_mode=precision")
+                    default="specificity")
+    ap.add_argument("--target_specificity", type=float, default=0.85)
+    ap.add_argument("--target_precision", type=float, default=0.85)
+    ap.add_argument("--neg_weight_mult", type=float, default=1.0)
 
-    # (опционально) усилить вес отрицательного класса в лоссе
-    ap.add_argument("--neg_weight_mult", type=float, default=1.0,
-                    help="множитель к весу класса 0 (для снижения FP)")
-    
-    
     args = ap.parse_args()
-    
-   
-
 
     # Видимость GPU до импорта TF
     if args.gpus.lower() == "cpu":
@@ -378,26 +364,28 @@ def main():
         print("\n=== CSV preview (first 5 rows) ===")
         df_preview = pd.read_csv(args.csv)
         print(df_preview.head(5).to_string(index=False))
-        if "No inj/ inj" in df_preview.columns:
-            print("\nLabel value counts in 'No inj/ inj':")
-            print(df_preview["No inj/ inj"].value_counts(dropna=False))
+        if args.label_col in df_preview.columns:
+            print(f"\nLabel value counts in '{args.label_col}':")
+            print(df_preview[args.label_col].value_counts(dropna=False))
 
     if args.peek > 0:
         print(f"\n=== Peek first {min(args.peek, len(items))} matched items ===")
         for (pth, lab) in items[:args.peek]:
             try:
                 arr = np.load(pth, allow_pickle=False, mmap_mode="r")
-                print(f"OK  label={lab} | {pth} | shape={arr.shape}")
+                x = sanitize_seq(arr)
+                print(f"OK  label={lab} | {pth} | shape={x.shape}")
             except Exception as e:
                 print(f"FAIL to load for peek: {pth} -> {type(e).__name__}")
 
     # Статы по длине/размеру признака
-    if args.max_len.strip().lower() == "auto":
+    if str(args.max_len).strip().lower() == "auto":
         max_len, feat_dim = probe_stats(items, downsample=args.downsample, pctl=95)
         max_len = int(max(8, min(max_len, 20000)))
     else:
         max_len = int(args.max_len)
         aa = np.load(paths[0], allow_pickle=False, mmap_mode="r")
+        aa = sanitize_seq(aa)
         feat_dim = int(aa.shape[1])
     print(f"max_len={max_len} | feat_dim={feat_dim}")
 
@@ -421,7 +409,7 @@ def main():
 
     if args.mixed_precision:
         from tensorflow.keras import mixed_precision as mp
-        mp.set_global_policy("mixed_float16")  # выходной Dense уже float32
+        mp.set_global_policy("mixed_float16")
 
     strategy = tf.distribute.MirroredStrategy() if len(gpus) > 1 else None
     replicas = strategy.num_replicas_in_sync if strategy else 1
@@ -444,8 +432,7 @@ def main():
         class_weight[0] *= float(args.neg_weight_mult)
     print("class_weight:", class_weight)
 
-
-    # Строим модель
+    # Модель
     ctx = strategy.scope() if strategy else contextlib_null()
     with ctx:
         model = build_lstm_model((max_len, feat_dim), learning_rate=1e-3, mixed_precision=args.mixed_precision)
@@ -467,8 +454,6 @@ def main():
     # Предсказания и метрики
     prob_dev  = model.predict(dev_ds,  verbose=0).reshape(-1).astype(np.float32)
     y_dev     = labels_all[idx_dev]
-    prob_dev  = model.predict(dev_ds,  verbose=0).reshape(-1).astype(np.float32)
-    y_dev     = labels_all[idx_dev]
 
     if args.threshold_mode == "specificity":
         thr = threshold_for_specificity(y_dev, prob_dev, args.target_specificity)
@@ -480,8 +465,7 @@ def main():
         thr = best_threshold_by_f1(y_dev, prob_dev)
 
     print(f"[THRESHOLD] mode={args.threshold_mode} "
-        f"target_spec={args.target_specificity} target_prec={args.target_precision} -> thr={thr:.4f}")
-
+          f"target_spec={args.target_specificity} target_prec={args.target_precision} -> thr={thr:.4f}")
 
     prob_test = model.predict(test_ds, verbose=0).reshape(-1).astype(np.float32)
     y_test    = labels_all[idx_test]
@@ -505,11 +489,6 @@ def main():
     print("\n=== TEST (using DEV threshold) ===")
     print(test_metrics["report"])
     print("Saved to:", args.out_dir)
-
-# заглушка контекста, если нет стратегии
-class contextlib_null:
-    def __enter__(self): return None
-    def __exit__(self, *exc): return False
 
 if __name__ == "__main__":
     main()
