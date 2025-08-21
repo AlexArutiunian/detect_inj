@@ -160,6 +160,7 @@ def build_items(csv_path: str, data_dir: str,
         shape_txt = ""
 
         if not rel:
+            print(rel)
             stats["no_file"] += 1
             status = "empty-filename"
             if len(skipped_examples)<10: skipped_examples.append((status, str(row.to_dict())))
