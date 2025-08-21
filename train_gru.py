@@ -50,7 +50,21 @@ def label_to_int(v):
 
 def sanitize_seq(a: np.ndarray) -> np.ndarray:
     a = np.nan_to_num(a, nan=0.0, posinf=0.0, neginf=0.0)
+
+    # если это один признак во времени
+    if a.ndim == 1:
+        a = a[:, None]
+
+    # если данных 3D или больше — переносим ось времени в 0 и сплющиваем остальные
+    if a.ndim >= 3:
+        # предполагаем, что время — самая длинная ось; при другой организации замените логику
+        t_axis = int(np.argmax(a.shape))
+        if t_axis != 0:
+            a = np.moveaxis(a, t_axis, 0)
+        a = a.reshape(a.shape[0], -1)
+
     return a.astype(np.float32, copy=False)
+
 
 def best_threshold_by_f1(y_true, p):
     from sklearn.metrics import precision_recall_curve
@@ -165,7 +179,7 @@ def build_items(csv_path: str, data_dir: str,
                 try:
                     arr = np.load(path, allow_pickle=False, mmap_mode="r")
                   
-                    if arr.ndim != 2 or arr.shape[0] < 2:
+                    if arr.ndim != 3 or arr.shape[0] < 2:
                         stats["too_short"] += 1
                         status = "too-short"
                         print(status, path, "dim: ", arr.ndim)
