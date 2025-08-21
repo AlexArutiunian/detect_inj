@@ -134,6 +134,7 @@ def build_items(csv_path: str, data_dir: str,
 
     items_x, items_y = [], []
     stats = {"ok":0, "no_file":0, "bad_label":0, "too_short":0, "error":0}
+    
     skipped_examples = []
 
     for i, row in tqdm(df.iterrows(), total=len(df), desc="Indexing"):
@@ -181,7 +182,7 @@ def build_items(csv_path: str, data_dir: str,
         if debug_index:
             print(f"[{i:05d}] csv='{rel}' | label_raw='{lab_raw}' -> {status}"
                   + (f" | path='{resolved}' {shape_txt}" if resolved else ""))
-
+    print(stats)
     return items_x, items_y, stats, skipped_examples
 
 def probe_stats(items: List[Tuple[str,int]], downsample: int = 1, pctl: int = 95):
@@ -314,6 +315,7 @@ def main():
         label_col=args.label_col,
         debug_index=args.debug_index
     )
+    print(items_x, items_y)
     assert items_x and items_y, "Не найдено валидных .npy и меток"
     items = list(zip(items_x, items_y))
     paths = items_x
