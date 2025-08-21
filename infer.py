@@ -44,6 +44,20 @@ def load_norm_stats(path: str) -> Tuple[np.ndarray, np.ndarray, int]:
     std = np.where(std < 1e-8, 1.0, std)
     return mean, std, max_len
 
+# ==== ДОБАВЬ это где-нибудь рядом с численными утилитами ====
+def as_TxF(a: np.ndarray) -> Optional[np.ndarray]:
+    """Привести вход к (T, F). Поддерживает (T,F) и (T,V,C)."""
+    if a is None:
+        return None
+    a = np.asarray(a)
+    if a.ndim == 2:
+        return a
+    if a.ndim == 3:
+        T, V, C = a.shape
+        return a.reshape(T, V * C)
+    if a.ndim == 1:
+        return a.reshape(-1, 1)
+    return None
 
 # ================= пути/сканирование =================
 
@@ -260,8 +274,11 @@ def build_features_for_paths(paths: List[str],
         try:
             if input_format == "npy":
                 arr = np.load(p, allow_pickle=False, mmap_mode="r")
-                if arr.ndim != 2 or arr.shape[0] < 2: continue
+                arr = as_TxF(arr)               # <-- добавили
+                if arr is None or arr.shape[0] < 2:
+                    continue
                 seq = arr[::max(1, downsample)]
+
             else:
                 d = _safe_json_load(p)
                 md = d.get(motion_key)
@@ -341,8 +358,11 @@ def make_dataset_nn(paths: List[str],
     def _load_seq(p: str) -> Optional[np.ndarray]:
         if input_format == "npy":
             arr = np.load(p, allow_pickle=False, mmap_mode="r")
-            if arr.ndim != 2 or arr.shape[0] < 1: return None
+            arr = as_TxF(arr)               # <-- добавили
+            if arr is None or arr.shape[0] < 1:
+                return None
             return arr
+
         d = _safe_json_load(p)
         md = d.get(motion_key)
         if not isinstance(md, dict):
