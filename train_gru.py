@@ -160,9 +160,10 @@ def build_items(csv_path: str, data_dir: str,
         shape_txt = ""
 
         if not rel:
-            print(rel)
+            
             stats["no_file"] += 1
             status = "empty-filename"
+            print(rel, status, data_dir)
             if len(skipped_examples)<10: skipped_examples.append((status, str(row.to_dict())))
         elif lab is None:
             stats["bad_label"] += 1
@@ -173,6 +174,7 @@ def build_items(csv_path: str, data_dir: str,
             if not path:
                 
                 stats["no_file"] += 1
+                print(rel, status, data_dir, path)
                 
                 if len(skipped_examples)<10: skipped_examples.append((status, rel))
             else:
