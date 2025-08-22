@@ -380,6 +380,26 @@ def main():
     idx_train_full, idx_test = train_test_split(idx, test_size=0.20, random_state=42, stratify=labels_all)
     idx_train, idx_dev = train_test_split(idx_train_full, test_size=0.125, random_state=42, stratify=labels_all[idx_train_full])
 
+    # --- сохраним test npy в отдельную папку ---
+    import shutil
+    test_dir = os.path.join(args.out_dir, "test_files")
+    os.makedirs(test_dir, exist_ok=True)
+    test_paths = [paths[i] for i in idx_test]
+
+    print(f"[info] Копируем {len(test_paths)} тестовых файлов в {test_dir}")
+    for p in tqdm(test_paths, desc="Copy test npy", unit="file"):
+        dst = os.path.join(test_dir, os.path.basename(p))
+        try:
+            shutil.copy2(p, dst)
+        except Exception as e:
+            print("[warn] не удалось скопировать", p, "->", e)
+
+    # при желании запишем список путей
+    with open(os.path.join(args.out_dir, "test_list.txt"), "w") as f:
+        for p in test_paths:
+            f.write(p + "\n")
+
+    
     # Норм-статы по train
     ensure_dir(args.out_dir)
     mean, std = compute_norm_stats([items[i] for i in idx_train], feat_dim, args.downsample, max_len)
