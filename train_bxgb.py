@@ -154,8 +154,8 @@ def _feats_from_npy_task(args):
     npy_path, y, downsample = args
     try:
         arr = np.load(npy_path, allow_pickle=False, mmap_mode="r")
-        if arr.ndim != 2 or arr.shape[0] < 2: return None
-        seq = arr[::downsample] if downsample > 1 else arr
+        arr = as_TxF(arr)
+        if arr is None or arr.shape[0] < 2: return None
         return (_features_from_seq(np.asarray(seq)), int(y))
     except Exception:
         return None
@@ -233,6 +233,18 @@ def _plot_f1_threshold(y_true, y_prob, thr, title, path):
     ax.plot(t, f1); ax.axvline(thr, linestyle='--', label=f"best thr={thr:.3f}")
     ax.set_xlabel("Threshold"); ax.set_ylabel("F1"); ax.set_title(title); ax.legend()
     fig.tight_layout(); fig.savefig(path, dpi=160); plt.close(fig)
+
+def as_TxF(a: np.ndarray):
+    """Привести вход к (T, F). Поддерживает (T,F) и (T,V,C)."""
+    if a.ndim == 2:
+        return a
+    if a.ndim == 3:
+        T, V, C = a.shape
+        return a.reshape(T, V * C)
+    if a.ndim == 1:
+        return a.reshape(-1, 1)
+    return None
+
 
 def _plot_feature_importance(model, feature_names, topn, title, path):
     if not hasattr(model, "feature_importances_"): return False
