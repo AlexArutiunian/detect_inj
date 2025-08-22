@@ -163,7 +163,6 @@ def build_items(csv_path: str, data_dir: str,
             
             stats["no_file"] += 1
             status = "empty-filename"
-            print(rel, status, data_dir)
             if len(skipped_examples)<10: skipped_examples.append((status, str(row.to_dict())))
         elif lab is None:
             stats["bad_label"] += 1
@@ -172,10 +171,8 @@ def build_items(csv_path: str, data_dir: str,
         else:
             path = pick_existing_path(possible_npy_paths(data_dir, rel))
             if not path:
-                
                 stats["no_file"] += 1
-                
-                
+                status = "not-found"
                 if len(skipped_examples)<10: skipped_examples.append((status, rel))
             else:
                 try:
@@ -343,14 +340,7 @@ def main():
         label_col=args.label_col,
         debug_index=args.debug_index
     )
-    if not items_x or not items_y:
-        print("\n[ERROR] Не найдено валидных файлов или меток!")
-        print("Stats:", stats)
-        if skipped:
-            print("\nПримеры пропусков (первые 10):")
-            for st, info in skipped:
-                print("  ", st, "|", info)
-        raise SystemExit(1)   # выходим аккуратно
+    assert items_x and items_y, "Не найдено валидных .npy и меток"
     items = list(zip(items_x, items_y))
     paths = items_x
     labels_all = np.array(items_y, dtype=np.int32)
