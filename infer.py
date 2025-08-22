@@ -286,6 +286,8 @@ def _spectral_stats(x: np.ndarray) -> np.ndarray:
     sent = float(-(p * np.log(p)).sum())
     return np.array([e1, e2, e3, sent], dtype=np.float32)
 
+
+
 def _extract_features_rich(seq_2d: np.ndarray) -> np.ndarray:
     """seq_2d: (T, F) → (F*31,)"""
     T, F = seq_2d.shape
@@ -295,6 +297,103 @@ def _extract_features_rich(seq_2d: np.ndarray) -> np.ndarray:
         feats.append(_basic_stats(x))
         feats.append(_spectral_stats(x))
     return np.concatenate(feats, axis=0).astype(np.float32, copy=False)
+# ==== два экстрактора: CLASSIC (6*F) и RICH (31*F) ====
+
+def _extract_features_classic(seq_2d: np.ndarray) -> np.ndarray:
+    """(T,F) -> (F*6,) : mean, std, min, max, dmean, dstd"""
+    seq = np.asarray(seq_2d, dtype=np.float32)
+    dif = np.diff(seq, axis=0) if seq.shape[0] > 1 else np.zeros_like(seq)
+    stat = np.concatenate([
+        np.nanmean(seq, axis=0), np.nanstd(seq, axis=0),
+        np.nanmin(seq, axis=0),  np.nanmax(seq, axis=0),
+        np.nanmean(dif, axis=0), np.nanstd(dif, axis=0)
+    ], axis=0).astype(np.float32, copy=False)
+    return np.nan_to_num(stat, nan=0.0, posinf=0.0, neginf=0.0)
+
+# (RICH уже есть) _extract_features_rich(seq_2d) -> (F*31,)
+
+# ==== универсальный билдер с выбором режима ====
+def build_features_for_paths(paths: List[str],
+                             input_format: str,
+                             downsample: int,
+                             schema_joints: Optional[List[str]],
+                             motion_key: str="running",
+                             feat_mode: str="auto",
+                             exp_dim: Optional[int]=None) -> Tuple[np.ndarray, List[str]]:
+    """
+    feat_mode: 'auto' | 'rich' | 'classic'
+    exp_dim:   ожидаемая размерность признаков (например, scaler.n_features_in_)
+    """
+    # helper для одного массива
+    def _one_feats(seq_2d: np.ndarray, mode: str) -> np.ndarray:
+        if mode == "rich":
+            return _extract_features_rich(seq_2d)
+        elif mode == "classic":
+            return _extract_features_classic(seq_2d)
+        else:
+            raise ValueError("mode must be 'rich' or 'classic'")
+
+    # если auto — определим на первом валидном примере
+    detected_mode = None
+
+    X_list, keep_paths = [], []
+    for p in tqdm(paths, desc="Feats(AUTO)" if feat_mode=="auto" else f"Feats({feat_mode.upper()})",
+                  dynamic_ncols=True, mininterval=0.2):
+        try:
+            # загрузка последовательности -> (T,F)
+            if input_format == "npy":
+                arr = np.load(p, allow_pickle=False, mmap_mode="r")
+                arr = as_TxF(arr)
+                if arr is None or arr.shape[0] < 2:
+                    continue
+                seq = arr[::max(1, downsample)]
+            else:
+                d = _safe_json_load(p)
+                md = d.get(motion_key)
+                if not isinstance(md, dict):
+                    for k in ("running","walking"):
+                        if k in d and isinstance(d[k], dict):
+                            md = d[k]; break
+                if not isinstance(md, dict): 
+                    continue
+                if not schema_joints: 
+                    continue
+                seq = _stack_motion_frames_with_schema(md, schema_joints)
+                if seq is None or seq.shape[0] < 2: 
+                    continue
+                if downsample > 1: 
+                    seq = seq[::downsample]
+
+            seq = np.asarray(seq, dtype=np.float32)
+
+            # автоопределение
+            if feat_mode == "auto" and detected_mode is None and exp_dim is not None:
+                F = seq.shape[1]
+                cand = []
+                if F*31 == exp_dim: cand.append("rich")
+                if F*6  == exp_dim: cand.append("classic")
+                # если обе подходят — предпочтем RICH (т.к. она “старше” в твоём пайплайне)
+                if cand:
+                    detected_mode = "rich" if "rich" in cand else cand[0]
+                else:
+                    # пробуем вычислить и сравнить длину напрямую
+                    r = _extract_features_rich(seq).shape[0]
+                    c = _extract_features_classic(seq).shape[0]
+                    if r == exp_dim: detected_mode = "rich"
+                    elif c == exp_dim: detected_mode = "classic"
+                    else:
+                        raise ValueError(f"Cannot auto-detect features: exp={exp_dim}, got rich={r}, classic={c}")
+
+            mode_to_use = detected_mode if feat_mode == "auto" else feat_mode
+            X_list.append(_one_feats(seq, mode_to_use))
+            keep_paths.append(p)
+        except Exception:
+            continue
+
+    if not X_list:
+        raise RuntimeError("Не удалось собрать ни одной строки фич.")
+    X = np.stack(X_list).astype(np.float32, copy=False)
+    return X, keep_paths
 
 
 # ================== ПОСТРОЕНИЕ ФИЧЕЙ ДЛЯ ПУТЕЙ ==================
@@ -417,6 +516,9 @@ def main():
     ap.add_argument("--scan_first", action="store_true", help="сначала скан папки, затем пересечение с CSV")
     ap.add_argument("--out_csv",    required=True)
     ap.add_argument("inputs", nargs="*", help="необязательный явный список файлов/имен (сопоставится через --data_dir)")
+    
+    ap.add_argument("--feat_mode", choices=["auto","rich","classic"], default="auto",
+                help="Тип фич: auto подбирает по модели/скейлеру")
 
     # графики
     ap.add_argument("--plot_summary", default="", help="PNG для групп; по умолчанию <out_csv>_groups.png")
@@ -480,12 +582,25 @@ def main():
         calibrator = cal
         print("[info] calibrator loaded (isotonic/Platt)")
 
-    # считаем RICH-фичи
+    exp_dim = None
+    if scaler is not None and hasattr(scaler, "n_features_in_"):
+        exp_dim = int(scaler.n_features_in_)
+    elif hasattr(model, "n_features_in_"):
+        exp_dim = int(model.n_features_in_)
+
+    # считаем фичи (авто/ручной режим)
     X, keep_paths = build_features_for_paths(
         paths, args.input_format, max(1, int(args.downsample)),
-        schema_joints, motion_key=args.motion_key
+        schema_joints, motion_key=args.motion_key,
+        feat_mode=args.feat_mode, exp_dim=exp_dim
     )
 
+    # строгая проверка на совпадение размерности, если известно exp_dim
+    if exp_dim is not None and X.shape[1] != exp_dim:
+        raise ValueError(
+            f"Feature mismatch: got {X.shape[1]}, expected {exp_dim}. "
+            f"Проверь --feat_mode/раскладку/downsample."
+    )
     # проверка совместимости с scaler
     if scaler is not None and hasattr(scaler, "n_features_in_"):
         exp = int(scaler.n_features_in_)
