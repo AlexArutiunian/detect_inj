@@ -396,44 +396,6 @@ def build_features_for_paths(paths: List[str],
     return X, keep_paths
 
 
-# ================== ПОСТРОЕНИЕ ФИЧЕЙ ДЛЯ ПУТЕЙ ==================
-def build_features_for_paths(paths: List[str],
-                             input_format: str,
-                             downsample: int,
-                             schema_joints: Optional[List[str]],
-                             motion_key: str="running") -> Tuple[np.ndarray, List[str]]:
-    X_list, keep_paths = [], []
-    for p in tqdm(paths, desc="Feats(RICH)", dynamic_ncols=True, mininterval=0.2):
-        try:
-            if input_format == "npy":
-                arr = np.load(p, allow_pickle=False, mmap_mode="r")
-                arr = as_TxF(arr)
-                if arr is None or arr.shape[0] < 2:
-                    continue
-                seq = arr[::max(1, downsample)]
-            else:  # json
-                d = _safe_json_load(p)
-                md = d.get(motion_key)
-                if not isinstance(md, dict):
-                    for k in ("running","walking"):
-                        if k in d and isinstance(d[k], dict):
-                            md = d[k]; break
-                if not isinstance(md, dict): continue
-                if not schema_joints: continue
-                seq = _stack_motion_frames_with_schema(md, schema_joints)
-                if seq is None or seq.shape[0] < 2: continue
-                if downsample > 1: seq = seq[::downsample]
-
-            # RICH-фичи:
-            X_list.append(_extract_features_rich(np.asarray(seq)))
-            keep_paths.append(p)
-        except Exception:
-            continue
-    if not X_list:
-        raise RuntimeError("Не удалось собрать ни одной строки RICH-фич.")
-    return np.stack(X_list).astype(np.float32, copy=False), keep_paths
-
-
 # ================== МОДЕЛЬ/КАЛИБРАТОР ==================
 def load_classical_bundle(path: str):
     obj = joblib.load(path)
