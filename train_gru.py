@@ -100,18 +100,14 @@ def possible_npy_paths(data_dir: str, rel: str) -> List[str]:
     push(os.path.join(data_dir, rel))
     if not rel.endswith(".npy"):
         push(os.path.join(data_dir, rel + ".npy"))
-        print(data_dir, rel + ".npy")
 
     if rel.endswith(".json"):
         base_nojson = rel[:-5]
         push(os.path.join(data_dir, base_nojson + ".npy"))
-        print(data_dir, rel + ".npy")
         push(os.path.join(data_dir, rel + ".npy"))
-        print(data_dir, rel + ".npy")
 
     if rel.endswith(".json.npy"):
         push(os.path.join(data_dir, rel.replace(".json.npy", ".npy")))
-        
 
     b = os.path.basename(rel)
     push(os.path.join(data_dir, b))
@@ -347,9 +343,17 @@ def main():
         label_col=args.label_col,
         debug_index=args.debug_index
     )
+    
+    print(f"\n=== Итоговый список входных файлов ({len(items)}) ===")
+    for path, lab in items[:50]:   # покажем первые 50 для контроля
+        print(f"label={lab} | {path}")
+    if len(items) > 50:
+        print(f"... и ещё {len(items)-50} файлов")
+
     assert items_x and items_y, "Не найдено валидных .npy и меток"
     items = list(zip(items_x, items_y))
     paths = items_x
+    
     labels_all = np.array(items_y, dtype=np.int32)
 
     if args.print_csv_preview:
