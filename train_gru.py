@@ -174,7 +174,7 @@ def build_items(csv_path: str, data_dir: str,
             if not path:
                 
                 stats["no_file"] += 1
-                print(rel, status, data_dir, path)
+                
                 
                 if len(skipped_examples)<10: skipped_examples.append((status, rel))
             else:
@@ -343,17 +343,16 @@ def main():
         label_col=args.label_col,
         debug_index=args.debug_index
     )
-    
-    print(f"\n=== Итоговый список входных файлов ({len(items)}) ===")
-    for path, lab in items[:50]:   # покажем первые 50 для контроля
-        print(f"label={lab} | {path}")
-    if len(items) > 50:
-        print(f"... и ещё {len(items)-50} файлов")
-
-    assert items_x and items_y, "Не найдено валидных .npy и меток"
+    if not items_x or not items_y:
+        print("\n[ERROR] Не найдено валидных файлов или меток!")
+        print("Stats:", stats)
+        if skipped:
+            print("\nПримеры пропусков (первые 10):")
+            for st, info in skipped:
+                print("  ", st, "|", info)
+        raise SystemExit(1)   # выходим аккуратно
     items = list(zip(items_x, items_y))
     paths = items_x
-    
     labels_all = np.array(items_y, dtype=np.int32)
 
     if args.print_csv_preview:
