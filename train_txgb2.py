@@ -367,7 +367,19 @@ def train_xgb(
     if use_scale_pos_weight:
         pos, neg = int(np.sum(y_train == 1)), int(np.sum(y_train == 0))
         spw = (neg / max(pos, 1)) if pos > 0 else 1.0
+    gpu_params = {}
+    try:
+        ver = tuple(map(int, xgb.__version__.split(".")[:2]))
+        if ver >= (2, 0):
+            # XGBoost 2.x: новый способ
+            gpu_params = dict(device="cuda", tree_method="hist")  # GPU тренировка и инференс
+        else:
+            # XGBoost 1.x: старый способ
+            gpu_params = dict(tree_method="gpu_hist", predictor="gpu_predictor")
+    except Exception:
+        pass
 
+    # а здесь просто прокинь параметры:
     model = XGBClassifier(
         n_estimators=n_estimators,
         learning_rate=learning_rate,
@@ -381,12 +393,10 @@ def train_xgb(
         max_delta_step=max_delta_step,
         objective="binary:logistic",
         eval_metric="auc",
-        tree_method="hist",
-        scale_pos_weight=spw,
         random_state=random_state,
-        n_jobs=-1
+        n_jobs=-1,
+        **gpu_params,
     )
-
     # sample_weight усиливает класс 0 (No Injury)
     sw_train = np.where(y_train == 0, w0, w1).astype(np.float32)
     sw_dev   = np.where(y_dev   == 0, w0, w1).astype(np.float32)
