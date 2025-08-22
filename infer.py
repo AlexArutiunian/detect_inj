@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Unified inference (NN + classical) with confidence — for NPY and JSON.
-Теперь ещё рисует горизонтальные бары по всем группам:
-- confidence buckets
-- injury buckets (pred==1)
-- no-injury buckets (pred==0)
+infer_xgb_rich.py — Инференс классической XGBoost-модели (injury / no-injury)
+с теми же RICH-фичами, что и в train_xgb_plus:
+на канал 27 (basic+windows) + 4 (spectral) = 31 признаков.
+
+Поддерживает входы: .npy или .json (нужна схема суставов).
+Умеет брать список файлов из CSV (столбец --filename_col) и/или из сканирования папки.
+Результат: CSV с prob/pred + “confidence buckets” и PNG-график распределений.
 """
 
 from __future__ import annotations
@@ -14,58 +16,33 @@ from typing import List, Tuple, Optional
 
 import numpy as np
 import pandas as pd
+from tqdm import tqdm
+import joblib
 
-# --- Matplotlib для сохранения графиков без GUI ---
+# --- Matplotlib без GUI ---
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.ticker import MaxNLocator
 
 
-# ================= численные утилиты =================
-
-def sanitize_seq(a: np.ndarray) -> np.ndarray:
-    a = np.nan_to_num(a, nan=0.0, posinf=0.0, neginf=0.0)
-    return a.astype(np.float32, copy=False)
-
+# ================== ВСПОМОГАТЕЛЬНОЕ ==================
 def entropy_binary(p: np.ndarray) -> np.ndarray:
     p = np.clip(p, 1e-8, 1 - 1e-8)
     return -(p * np.log(p) + (1 - p) * np.log(1 - p))
 
-def load_norm_stats(path: str) -> Tuple[np.ndarray, np.ndarray, int]:
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"norm_stats '{path}' не найден")
-    d = np.load(path, allow_pickle=False)
-    if not all(k in d for k in ("mean", "std", "max_len")):
-        raise ValueError(f"В '{path}' нет всех ключей (нужны mean, std, max_len)")
-    mean = d["mean"].astype(np.float32)
-    std  = d["std"].astype(np.float32)
-    max_len = int(d["max_len"])
-    std = np.where(std < 1e-8, 1.0, std)
-    return mean, std, max_len
+def ensure_dir(p: str) -> None:
+    os.makedirs(p, exist_ok=True)
 
-# ==== ДОБАВЬ это где-нибудь рядом с численными утилитами ====
-def as_TxF(a: np.ndarray) -> Optional[np.ndarray]:
-    """Привести вход к (T, F). Поддерживает (T,F) и (T,V,C)."""
-    if a is None:
-        return None
-    a = np.asarray(a)
-    if a.ndim == 2:
-        return a
-    if a.ndim == 3:
-        T, V, C = a.shape
-        return a.reshape(T, V * C)
-    if a.ndim == 1:
-        return a.reshape(-1, 1)
+def label_to_int(v):
+    if v is None: return None
+    s = str(v).strip().lower()
+    if s in ("injury","1"): return 1
+    if s in ("no injury","0"): return 0
     return None
 
-# ================= пути/сканирование =================
 
-def _norm_rel_with_suffix(s: str, input_format: str) -> str:
-    s = (s or "").replace("\\", "/").lstrip("/")
-    suf = ".npy" if input_format == "npy" else ".json"
-    return s if s.endswith(suf) else (s + suf)
-
+# ================== ПРОЧТЕНИЕ ВХОДОВ ==================
 def list_files_with_ext(root: str, ext: str, recursive: bool=True) -> List[str]:
     out: List[str] = []
     if not root: root = "."
@@ -90,7 +67,6 @@ def possible_paths(data_dir: str, rel: str, input_format: str) -> List[str]:
         if x and x not in cands: cands.append(x)
 
     push(os.path.join(data_dir, rel))
-
     if input_format == "npy":
         if not rel.endswith(".npy"): push(os.path.join(data_dir, rel + ".npy"))
         if rel.endswith(".json"):    push(os.path.join(data_dir, rel[:-5] + ".npy"))
@@ -98,7 +74,7 @@ def possible_paths(data_dir: str, rel: str, input_format: str) -> List[str]:
         b = os.path.basename(rel)
         push(os.path.join(data_dir, b))
         if not b.endswith(".npy"): push(os.path.join(data_dir, b + ".npy"))
-        if b.endswith(".json"):    push(os.path.join(data_dir, b[:-5] + ".npy")); push(os.path.join(data_dir, b + ".npy"))
+        if b.endswith(".json"):    push(os.path.join(data_dir, b[:-5] + ".npy"))
         if b.endswith(".json.npy"):push(os.path.join(data_dir, b.replace(".json.npy", ".npy")))
     else:
         if not rel.endswith(".json"): push(os.path.join(data_dir, rel + ".json"))
@@ -115,75 +91,6 @@ def pick_existing_path(cands: List[str]) -> Optional[str]:
     for p in cands:
         if os.path.exists(p): return p
     return None
-def choose_paths_scan_then_csv(data_dir: str,
-                               csv_path: Optional[str],
-                               filename_col: str,
-                               recursive: bool,
-                               input_format: str) -> List[str]:
-    """
-    1) Сканируем data_dir (по расширению из input_format) -> список файлов на диске.
-    2) Если задан CSV — берём пересечение с CSV, НО c нормализацией:
-       для каждой CSV-строки пробуем все кандидаты через possible_paths(...),
-       совпадаем либо по абсолютному существующему файлу, либо по basename из скана.
-    """
-    # 1) что лежит на диске
-    ext = ".npy" if input_format == "npy" else ".json"
-    disk_files = list_files_with_ext(data_dir, ext, recursive=recursive)
-
-    if not csv_path or not os.path.exists(csv_path):
-        if csv_path and not os.path.exists(csv_path):
-            print(f"[warn] CSV '{csv_path}' не найден; используем только файлы на диске.", file=sys.stderr)
-        return disk_files
-
-    # индексы для быстрых совпадений
-    disk_set = set(os.path.normpath(p) for p in disk_files)
-    by_base: dict[str, str] = {}
-    for p in disk_files:
-        b = os.path.basename(p)
-        if b not in by_base:  # первое вхождение
-            by_base[b] = p
-
-    # 2) читаем CSV и сопоставляем с диском
-    df = pd.read_csv(csv_path)
-    cols = {c.lower().strip(): c for c in df.columns}
-    fn_col = cols.get(filename_col.lower(), filename_col)
-    if fn_col not in df.columns:
-        for c in df.columns:
-            if "file" in c.lower() or "name" in c.lower():
-                fn_col = c; break
-
-    chosen: list[str] = []
-    missing = 0
-    for raw in df[fn_col].astype(str).tolist():
-        # переберём все разумные кандидаты путей (json<->npy тоже)
-        cands = possible_paths(data_dir, raw, input_format)
-        hit = None
-        for c in cands:
-            nc = os.path.normpath(c)
-            if os.path.exists(nc):
-                hit = nc; break
-            # попробуем совпасть по basename со сканом
-            b = os.path.basename(nc)
-            if b in by_base:
-                hit = by_base[b]; break
-        if hit:
-            chosen.append(hit)
-        else:
-            missing += 1
-
-    if missing:
-        print(f"[warn] В CSV указано файлов, которых нет на диске: {missing}", file=sys.stderr)
-    extra = len(disk_files) - len(set(chosen))
-    if extra > 0:
-        print(f"[info] На диске есть файлов вне CSV: {extra}", file=sys.stderr)
-
-    # уберём дубликаты и вернём в стабильном порядке
-    seen, out = set(), []
-    for p in chosen:
-        if p not in seen:
-            seen.add(p); out.append(p)
-    return out
-
 
 def resolve_inputs_from_csv(csv_path: str, data_dir: str, filename_col: str, input_format: str) -> List[str]:
     if not os.path.exists(csv_path):
@@ -205,18 +112,59 @@ def resolve_inputs_from_csv(csv_path: str, data_dir: str, filename_col: str, inp
         print(f"[warn] Не найдено {missing} файлов из CSV", file=sys.stderr)
     return paths
 
-def resolve_inputs_from_args(inputs: List[str], data_dir: Optional[str], input_format: str) -> List[str]:
-    out: List[str] = []
-    for p in inputs:
-        if os.path.exists(p): out.append(p)
-        elif data_dir:
-            r = pick_existing_path(possible_paths(data_dir, p, input_format))
-            if r: out.append(r)
+def choose_paths_scan_then_csv(data_dir: str,
+                               csv_path: Optional[str],
+                               filename_col: str,
+                               recursive: bool,
+                               input_format: str) -> List[str]:
+    ext = ".npy" if input_format == "npy" else ".json"
+    disk_files = list_files_with_ext(data_dir, ext, recursive=recursive)
+
+    if not csv_path or not os.path.exists(csv_path):
+        if csv_path and not os.path.exists(csv_path):
+            print(f"[warn] CSV '{csv_path}' не найден; используем только файлы на диске.", file=sys.stderr)
+        return disk_files
+
+    df = pd.read_csv(csv_path)
+    cols = {c.lower().strip(): c for c in df.columns}
+    fn_col = cols.get(filename_col.lower(), filename_col)
+    if fn_col not in df.columns:
+        for c in df.columns:
+            if "file" in c.lower() or "name" in c.lower():
+                fn_col = c; break
+
+    by_base: dict[str, str] = {}
+    for p in disk_files:
+        b = os.path.basename(p)
+        if b not in by_base:
+            by_base[b] = p
+
+    chosen: list[str] = []
+    missing = 0
+    for raw in df[fn_col].astype(str).tolist():
+        hit = None
+        for c in possible_paths(data_dir, raw, input_format):
+            nc = os.path.normpath(c)
+            if os.path.exists(nc):
+                hit = nc; break
+            b = os.path.basename(nc)
+            if b in by_base:
+                hit = by_base[b]; break
+        if hit: chosen.append(hit)
+        else:   missing += 1
+
+    if missing:
+        print(f"[warn] В CSV указано файлов, которых нет на диске: {missing}", file=sys.stderr)
+
+    # dedup
+    seen, out = set(), []
+    for p in chosen:
+        if p not in seen:
+            seen.add(p); out.append(p)
     return out
 
 
-# ================= JSON-помощники =================
-
+# ================== JSON/NPY helpers ==================
 def _safe_json_load(path: str):
     try:
         import orjson
@@ -252,34 +200,119 @@ def _infer_schema_from_first(paths: List[str], motion_keys=("running","walking")
     return None
 
 
-# ================= классические фичи (train3.py) =================
+# ================== Приведение к (T,F) ==================
+def as_TxF(a: np.ndarray) -> Optional[np.ndarray]:
+    """Поддерживает (T,F) и (T,V,C) → (T, F)"""
+    if a is None:
+        return None
+    a = np.asarray(a)
+    if a.ndim == 2:
+        return a
+    if a.ndim == 3:
+        T, V, C = a.shape
+        return a.reshape(T, V * C)
+    if a.ndim == 1:
+        return a.reshape(-1, 1)
+    return None
 
-def _features_from_seq(seq_np: np.ndarray) -> np.ndarray:
-    seq = seq_np.astype(np.float32, copy=False)
-    dif = np.diff(seq, axis=0)
-    stat = np.concatenate([
-        np.nanmean(seq, axis=0), np.nanstd(seq, axis=0),
-        np.nanmin(seq, axis=0),  np.nanmax(seq, axis=0),
-        np.nanmean(dif, axis=0), np.nanstd(dif, axis=0)
-    ]).astype(np.float32, copy=False)
-    return np.nan_to_num(stat, nan=0.0, posinf=0.0, neginf=0.0)
 
+# ================== RICH-фичи (31 на канал) ==================
+def _basic_stats(x: np.ndarray) -> np.ndarray:
+    x = np.asarray(x, dtype=np.float32)
+    dx = np.diff(x) if x.size > 1 else np.array([0.0], dtype=np.float32)
+
+    def safe_std(v):  return float(np.nanstd(v)) if v.size else 0.0
+    def safe_mean(v): return float(np.nanmean(v)) if v.size else 0.0
+    def safe_min(v):  return float(np.nanmin(v)) if v.size else 0.0
+    def safe_max(v):  return float(np.nanmax(v)) if v.size else 0.0
+    def q(v, qq):     return float(np.nanpercentile(v, qq)) if v.size else 0.0
+
+    def safe_skew(v):
+        v = v[np.isfinite(v)]
+        if v.size < 3: return 0.0
+        m = v.mean(); s = v.std()
+        return float(np.mean(((v - m) / (s + 1e-12))**3))
+
+    def safe_kurt(v):
+        v = v[np.isfinite(v)]
+        if v.size < 4: return 0.0
+        m = v.mean(); s = v.std()
+        return float(np.mean(((v - m) / (s + 1e-12))**4) - 3.0)
+
+    def acf(v, k=1):
+        v = v[np.isfinite(v)]
+        n = v.size
+        if n <= k or n < 2: return 0.0
+        m = v.mean()
+        v0 = v - m
+        num = np.sum(v0[:-k] * v0[k:])
+        den = np.sum(v0 * v0) + 1e-12
+        return float(num / den)
+
+    def window_stats(v):
+        n = v.size
+        if n < 3:
+            return [safe_mean(v), safe_std(v), safe_min(v), safe_max(v)] * 3
+        a = v[:n//3]; b = v[n//3:2*n//3]; c = v[2*n//3:]
+        out=[]
+        for w in (a,b,c):
+            out.extend([safe_mean(w), safe_std(w), safe_min(w), safe_max(w)])
+        return out
+
+    out = [
+        safe_mean(x), safe_std(x), safe_min(x), safe_max(x),
+        q(x,25), q(x,50), q(x,75),
+        safe_skew(x), safe_kurt(x),
+        safe_mean(dx), safe_std(dx), safe_min(dx), safe_max(dx),
+        acf(x,1), acf(x,2),
+    ]
+    out.extend(window_stats(x))  # +12
+    return np.array(out, dtype=np.float32)  # 27 на канал
+
+def _spectral_stats(x: np.ndarray) -> np.ndarray:
+    x = np.asarray(x, dtype=np.float32)
+    x = x - np.nanmean(x)
+    n = x.size
+    if n < 4: return np.zeros(4, dtype=np.float32)
+    fft = np.fft.rfft(x * np.hanning(n))
+    pxx = (fft.real**2 + fft.imag**2)
+    pxx = np.clip(pxx, 1e-12, None)
+    k = pxx.size
+    b = k // 3
+    e1 = float(pxx[:b].sum())
+    e2 = float(pxx[b:2*b].sum())
+    e3 = float(pxx[2*b:].sum())
+    p = pxx / pxx.sum()
+    sent = float(-(p * np.log(p)).sum())
+    return np.array([e1, e2, e3, sent], dtype=np.float32)
+
+def _extract_features_rich(seq_2d: np.ndarray) -> np.ndarray:
+    """seq_2d: (T, F) → (F*31,)"""
+    T, F = seq_2d.shape
+    feats = []
+    for j in range(F):
+        x = np.asarray(seq_2d[:, j], dtype=np.float32)
+        feats.append(_basic_stats(x))
+        feats.append(_spectral_stats(x))
+    return np.concatenate(feats, axis=0).astype(np.float32, copy=False)
+
+
+# ================== ПОСТРОЕНИЕ ФИЧЕЙ ДЛЯ ПУТЕЙ ==================
 def build_features_for_paths(paths: List[str],
                              input_format: str,
                              downsample: int,
                              schema_joints: Optional[List[str]],
                              motion_key: str="running") -> Tuple[np.ndarray, List[str]]:
     X_list, keep_paths = [], []
-    for p in paths:
+    for p in tqdm(paths, desc="Feats(RICH)", dynamic_ncols=True, mininterval=0.2):
         try:
             if input_format == "npy":
                 arr = np.load(p, allow_pickle=False, mmap_mode="r")
-                arr = as_TxF(arr)               # <-- добавили
+                arr = as_TxF(arr)
                 if arr is None or arr.shape[0] < 2:
                     continue
                 seq = arr[::max(1, downsample)]
-
-            else:
+            else:  # json
                 d = _safe_json_load(p)
                 md = d.get(motion_key)
                 if not isinstance(md, dict):
@@ -287,160 +320,40 @@ def build_features_for_paths(paths: List[str],
                         if k in d and isinstance(d[k], dict):
                             md = d[k]; break
                 if not isinstance(md, dict): continue
-                if not schema_joints:
-                    continue
+                if not schema_joints: continue
                 seq = _stack_motion_frames_with_schema(md, schema_joints)
                 if seq is None or seq.shape[0] < 2: continue
                 if downsample > 1: seq = seq[::downsample]
-            X_list.append(_features_from_seq(np.asarray(seq)))
+
+            # RICH-фичи:
+            X_list.append(_extract_features_rich(np.asarray(seq)))
             keep_paths.append(p)
         except Exception:
             continue
     if not X_list:
-        raise RuntimeError("Не удалось собрать ни одной строки фич для классической модели.")
+        raise RuntimeError("Не удалось собрать ни одной строки RICH-фич.")
     return np.stack(X_list).astype(np.float32, copy=False), keep_paths
 
 
-# ================= загрузка моделей =================
-
-def is_classical_path(p: str) -> bool:
-    low = p.lower()
-    return low.endswith(".joblib") or low.endswith(".pkl")
-
-def load_any_model(model_path: str, unsafe_deser: bool = False):
-    import os
-    try:
-        import keras
-        if unsafe_deser:
-            try: keras.config.enable_unsafe_deserialization()
-            except Exception: pass
-        import tensorflow as tf  # noqa
-        try:    return tf.keras.models.load_model(model_path, safe_mode=not unsafe_deser)
-        except TypeError: return tf.keras.models.load_model(model_path)
-    except Exception as e_tf:
-        try:
-            import keras  # noqa
-            try:    return keras.saving.load_model(model_path, safe_mode=not unsafe_deser)
-            except TypeError: return keras.saving.load_model(model_path)
-        except Exception as e_k:
-            if os.path.isdir(model_path):
-                import tensorflow as tf  # noqa
-                try:    return tf.keras.models.load_model(model_path, safe_mode=not unsafe_deser)
-                except TypeError: return tf.keras.models.load_model(model_path)
-            raise RuntimeError(
-                f"Не удалось загрузить модель '{model_path}'. "
-                f"tf.keras: {type(e_tf).__name__}; keras: {type(e_k).__name__}"
-            )
-
+# ================== МОДЕЛЬ/КАЛИБРАТОР ==================
 def load_classical_bundle(path: str):
-    import joblib
     obj = joblib.load(path)
     if isinstance(obj, dict):
         return obj.get("model", obj), obj.get("scaler", None)
     return obj, None
 
-
-# ================= датасет для NN =================
-
-def make_dataset_nn(paths: List[str],
-                    mean: np.ndarray,
-                    std: np.ndarray,
-                    max_len: int,
-                    downsample: int,
-                    batch_size: int,
-                    input_format: str,
-                    schema_joints: Optional[List[str]] = None,
-                    motion_key: str = "running"):
-    import tensorflow as tf
-    AUTOTUNE = tf.data.AUTOTUNE
-    feat_dim = int(mean.shape[0])
-
-    def _load_seq(p: str) -> Optional[np.ndarray]:
-        if input_format == "npy":
-            arr = np.load(p, allow_pickle=False, mmap_mode="r")
-            arr = as_TxF(arr)               # <-- добавили
-            if arr is None or arr.shape[0] < 1:
-                return None
-            return arr
-
-        d = _safe_json_load(p)
-        md = d.get(motion_key)
-        if not isinstance(md, dict):
-            for k in ("running","walking"):
-                if k in d and isinstance(d[k], dict):
-                    md = d[k]; break
-        if not isinstance(md, dict): return None
-        if not schema_joints: return None
-        return _stack_motion_frames_with_schema(md, schema_joints)
-
-    def gen():
-        for p in paths:
-            try:
-                x0 = _load_seq(p)
-                if x0 is None:
-                    print(f"[warn] пропуск '{p}': пустой/неправильный вход", file=sys.stderr)
-                    continue
-                x = sanitize_seq(x0[::max(1, downsample)])
-                if x.shape[1] != feat_dim:
-                    if x.shape[1] > feat_dim: x = x[:, :feat_dim]
-                    else: x = np.pad(x, [[0,0],[0, feat_dim - x.shape[1]]], mode="constant")
-                if x.shape[0] > max_len: x = x[:max_len]
-                x = (x - mean) / std
-                yield x, p
-            except Exception as e:
-                print(f"[warn] skip '{p}': {type(e).__name__}: {e}", file=sys.stderr)
-
-    import tensorflow as tf  # noqa
-    out_sig = (
-        tf.TensorSpec(shape=(None, feat_dim), dtype=tf.float32),
-        tf.TensorSpec(shape=(), dtype=tf.string),
-    )
-
-    def pad_map(x, path):
-        T = tf.shape(x)[0]
-        pad_t = tf.maximum(0, max_len - T)
-        x = tf.pad(x, [[0, pad_t], [0, 0]])
-        x = x[:max_len]
-        x.set_shape([max_len, feat_dim])
-        return x, path
-
-    ds = tf.data.Dataset.from_generator(gen, output_signature=out_sig)
-    ds = ds.map(pad_map, num_parallel_calls=AUTOTUNE)
-    ds = ds.batch(batch_size, drop_remainder=False).prefetch(AUTOTUNE)
-    return ds
-
-def predict_nn(model, ds, mc_passes: int = 1):
-    import tensorflow as tf
-    if mc_passes <= 1:
-        paths_all, probs_all = [], []
-        for xb, pb in ds:
-            p = model(xb, training=False)
-            probs_all.append(tf.cast(p, tf.float32).numpy().reshape(-1))
-            paths_all.extend([s.decode("utf-8") for s in pb.numpy().tolist()])
-        probs = np.concatenate(probs_all, axis=0) if probs_all else np.zeros((0,), dtype=np.float32)
-        return paths_all, probs, None
-
-    mc_stack, paths_all = [], []
-    for t in range(mc_passes):
-        probs_t, paths_t = [], []
-        for xb, pb in ds:
-            p = model(xb, training=True)
-            probs_t.append(p.numpy().reshape(-1))
-            if t == 0:
-                paths_t.extend([s.decode("utf-8") for s in pb.numpy().tolist()])
-        mc_stack.append(np.concatenate(probs_t, axis=0) if probs_t else np.zeros((0,), dtype=np.float32))
-        if t == 0: paths_all = paths_t
-    mc_arr = np.stack(mc_stack, axis=0) if mc_stack else np.zeros((0,0), dtype=np.float32)
-    return paths_all, mc_arr.mean(axis=0), mc_arr.std(axis=0)
+def maybe_load_calibrator(model_dir: str):
+    path = os.path.join(model_dir, "calibrator.joblib")
+    if os.path.exists(path):
+        try:
+            return joblib.load(path)
+        except Exception:
+            pass
+    return None
 
 
-# ================= отрисовка суммарных групп =================
-
+# ================== ГРАФИК ГРУПП ==================
 def plot_group_bars(df: pd.DataFrame, out_path: str, title_prefix: str = "", dpi: int = 180):
-    """Рисует 3 блока: confidence / injury(pred=1) / no-injury(pred=0) — горизонтальные бары.
-       Подписи внутри/снаружи подбираются автоматически, чтобы не вылезали.
-    """
-    # Подготовка данных
     conf_labels = ["conf <50%", "conf 50–60%", "conf 60–80%", "conf >80%"]
     inj_labels  = ["inj <50%", "inj 50–60%", "inj 60–80%", "inj >80%"]
     noi_labels  = ["no-injury <50%", "no-injury 50–60%", "no-injury 60–80%", "no-injury >80%"]
@@ -449,8 +362,6 @@ def plot_group_bars(df: pd.DataFrame, out_path: str, title_prefix: str = "", dpi
     inj_counts  = [int((df["inj_group"] == g).sum()) for g in inj_labels]
     noi_counts  = [int((df["noinj_group"] == g).sum()) for g in noi_labels]
 
-    # Фигура
-    # высота под число категорий; ширину возьмём побольше, чтобы подписи точно влезли
     fig, axes = plt.subplots(1, 3, figsize=(16, 5), constrained_layout=True)
     blocks = [
         (axes[0], conf_labels, conf_counts, "Confidence buckets (all)"),
@@ -467,9 +378,8 @@ def plot_group_bars(df: pd.DataFrame, out_path: str, title_prefix: str = "", dpi
         tt = f"{title_prefix} — {ttl}" if title_prefix else ttl
         ax.set_title(tt)
         maxc = max([0] + counts)
-        ax.set_xlim(0, max(1, int(maxc * 1.18)))  # запас справа, чтобы текст не резался
+        ax.set_xlim(0, max(1, int(maxc * 1.18)))
 
-        # подписи: если столбик широкий — пишем внутри, иначе чуть правее бара
         for i, v in enumerate(counts):
             if maxc == 0:
                 ax.text(0.02, i, "0", va="center", ha="left")
@@ -485,55 +395,35 @@ def plot_group_bars(df: pd.DataFrame, out_path: str, title_prefix: str = "", dpi
     print(f"[OK] Group plot saved: {out_path}")
 
 
-# ================= main =================
-
+# ================== MAIN ==================
 def main():
-    ap = argparse.ArgumentParser("Unified inference (NN + classical) for NPY/JSON with group bars")
-    # формат данных
+    ap = argparse.ArgumentParser("Inference (XGB classic) with RICH features for NPY/JSON")
+    # формат
     ap.add_argument("--input_format", choices=["npy","json"], default="npy")
     ap.add_argument("--motion_key", default="running", help="для JSON: running|walking")
-    ap.add_argument("--schema_json", default="", help="для JSON: путь к schema_joints.json (порядок суставов)")
-    ap.add_argument("--use_joints", default="", help="для JSON: список через запятую (приоритет над schema_json)")
+    ap.add_argument("--schema_json", default="", help="для JSON: путь к schema_joints.json")
+    ap.add_argument("--use_joints",  default="", help="для JSON: список через запятую (приоритет над schema_json)")
 
-    # модель
-    ap.add_argument("--model", required=True, help=".keras/.h5/SavedModel ИЛИ .joblib/.pkl (классика)")
-    ap.add_argument("--norm_stats", default="", help="для NN: norm_stats.npz (mean,std,max_len)")
-    ap.add_argument("--threshold",  default=None, help="порог; если файл, читается из файла, иначе число; дефолт 0.5")
+    # модель/порог
+    ap.add_argument("--model", required=True, help="path to model.joblib (из train_xgb_plus)")
+    ap.add_argument("--threshold",  default=None, help="число или путь к threshold.txt (если не задано — 0.5)")
     ap.add_argument("--downsample", type=int, default=1)
-    ap.add_argument("--batch_size", type=int, default=32)
-    ap.add_argument("--mc_passes",  type=int, default=1, help="только для NN (MC Dropout)")
 
     # входы
-    ap.add_argument("--csv",         default=None)
-    ap.add_argument("--data_dir",    default=".")
+    ap.add_argument("--csv",         default=None, help="CSV с колонкой filename")
+    ap.add_argument("--data_dir",    default=".",  help="корневая папка данных")
     ap.add_argument("--filename_col", default="filename")
-    ap.add_argument("--out_csv",     required=True)
-    ap.add_argument("inputs", nargs="*")
+    ap.add_argument("--recursive",  action="store_true", help="глубокий скан при --scan_first")
+    ap.add_argument("--scan_first", action="store_true", help="сначала скан папки, затем пересечение с CSV")
+    ap.add_argument("--out_csv",    required=True)
+    ap.add_argument("inputs", nargs="*", help="необязательный явный список файлов/имен (сопоставится через --data_dir)")
 
-    # scan
-    ap.add_argument("--scan_first", action="store_true")
-    ap.add_argument("--recursive",  action="store_true")
-
-    # device / keras
-    ap.add_argument("--gpus", default="all")
-    ap.add_argument("--unsafe_deser", action="store_true")
-
-    # plot
-    ap.add_argument("--plot_summary", default="", help="PNG для групповых баров; по умолчанию: <out_csv>_groups.png")
-    ap.add_argument("--plot_title",   default="", help="Префикс к заголовкам графиков")
+    # графики
+    ap.add_argument("--plot_summary", default="", help="PNG для групп; по умолчанию <out_csv>_groups.png")
+    ap.add_argument("--plot_title",   default="", help="Префикс к заголовкам")
     ap.add_argument("--plot_dpi",     type=int, default=180)
 
     args = ap.parse_args()
-
-    # определить тип модели
-    is_classical = is_classical_path(args.model)
-
-    # GPU только для NN
-    if not is_classical:
-        if args.gpus.lower() == "cpu":
-            os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
-        elif args.gpus.lower() != "all":
-            os.environ["CUDA_VISIBLE_DEVICES"] = args.gpus
 
     # входные пути
     if args.scan_first and args.data_dir:
@@ -541,13 +431,19 @@ def main():
     elif args.csv:
         paths = resolve_inputs_from_csv(args.csv, args.data_dir or ".", args.filename_col, args.input_format)
     else:
-        paths = resolve_inputs_from_args(args.inputs, args.data_dir, args.input_format)
+        # явные inputs → сопоставим с data_dir при необходимости
+        paths = []
+        for p in (args.inputs or []):
+            if os.path.exists(p): paths.append(p)
+            else:
+                r = pick_existing_path(possible_paths(args.data_dir or ".", p, args.input_format))
+                if r: paths.append(r)
 
     if not paths:
         print("Нет входных файлов. Укажи --scan_first или --csv, или список путей.", file=sys.stderr)
         sys.exit(2)
 
-    # схема суставов для JSON (и для классики, и для NN)
+    # схема суставов (для JSON)
     schema_joints: Optional[List[str]] = None
     if args.input_format == "json":
         if args.use_joints.strip():
@@ -560,121 +456,76 @@ def main():
             if schema_joints:
                 print(f"[info] auto schema from JSON keys: {len(schema_joints)} joints")
         if not schema_joints:
-            raise RuntimeError("Для JSON не удалось определить схему суставов. Передайте --schema_json или --use_joints.")
+            raise RuntimeError("Для JSON не удалось определить схему суставов. Передай --schema_json или --use_joints.")
 
     # порог
     thr = 0.5
     if args.threshold:
         if os.path.exists(args.threshold):
             try:
-                with open(args.threshold, "r", encoding="utf-8") as f: thr = float(f.read().strip())
+                with open(args.threshold, "r", encoding="utf-8") as f:
+                    thr = float(f.read().strip())
             except Exception:
                 print("[warn] не удалось прочитать threshold, используем 0.5", file=sys.stderr)
         else:
             try: thr = float(args.threshold)
             except Exception: pass
 
-    # === Ветка КЛАССИЧЕСКОЙ модели ===
-    if is_classical:
-        model, scaler = load_classical_bundle(args.model)
-        X, keep_paths = build_features_for_paths(paths, args.input_format, max(1, int(args.downsample)), schema_joints, motion_key=args.motion_key)
-        Xs = scaler.transform(X) if scaler is not None else X
+    # загрузка модели/скейлера и (возможно) калибратора
+    model, scaler = load_classical_bundle(args.model)
+    calibrator = None
+    model_dir = os.path.dirname(os.path.abspath(args.model))
+    cal = maybe_load_calibrator(model_dir)
+    if cal is not None:
+        calibrator = cal
+        print("[info] calibrator loaded (isotonic/Platt)")
 
-        if hasattr(model, "predict_proba"):
-            prob = model.predict_proba(Xs)[:, 1]
-        elif hasattr(model, "decision_function"):
-            d = model.decision_function(Xs)
-            d = (d - d.min()) / (d.max() - d.min() + 1e-9)
-            prob = d
-        else:
-            prob = model.predict(Xs).astype(np.float32)
+    # считаем RICH-фичи
+    X, keep_paths = build_features_for_paths(
+        paths, args.input_format, max(1, int(args.downsample)),
+        schema_joints, motion_key=args.motion_key
+    )
 
-        probs = np.asarray(prob, dtype=np.float32)
-        pred = (probs >= thr).astype(np.int32)
-        p_clip = np.clip(probs, 1e-8, 1 - 1e-8)
-        logit = np.log(p_clip / (1.0 - p_clip)).astype(np.float32)
-        confidence = np.where(pred == 1, p_clip, 1.0 - p_clip).astype(np.float32)
-        entr = entropy_binary(p_clip).astype(np.float32)
+    # проверка совместимости с scaler
+    if scaler is not None and hasattr(scaler, "n_features_in_"):
+        exp = int(scaler.n_features_in_)
+        got = int(X.shape[1])
+        if got != exp:
+            raise ValueError(
+                f"Feature mismatch: got {got}, expected {exp}. "
+                f"Убедись, что инференс использует RICH-фичи (31*F), тот же downsample/раскладку, что при обучении."
+            )
 
-        def _conf_group(c: float) -> str:
-            if c >= 0.8: return "conf >80%"
-            if c >= 0.6: return "conf 60–80%"
-            if c >= 0.5: return "conf 50–60%"
-            return "conf <50%"
+    Xs = scaler.transform(X) if scaler is not None else X
 
-        def _inj_group(p: float) -> str:
-            if p >= 0.8: return "inj >80%"
-            if p >= 0.6: return "inj 60–80%"
-            if p >= 0.5: return "inj 50–60%"
-            return "inj <50%"
+    # вероятности
+    if hasattr(model, "predict_proba"):
+        prob = model.predict_proba(Xs)[:, 1]
+    elif hasattr(model, "decision_function"):
+        d = model.decision_function(Xs)
+        d = (d - d.min()) / (d.max() - d.min() + 1e-9)
+        prob = d
+    else:
+        prob = model.predict(Xs).astype(np.float32)
 
-        def _noinj_group(p0: float) -> str:
-            if p0 >= 0.8: return "no-injury >80%"
-            if p0 >= 0.6: return "no-injury 60–80%"
-            if p0 >= 0.5: return "no-injury 50–60%"
-            return "no-injury <50%"
+    probs = np.asarray(prob, dtype=np.float32)
+    if calibrator is not None:
+        try:
+            probs = calibrator.transform(probs)  # isotonic
+        except Exception:
+            try:
+                probs = calibrator.predict_proba(probs.reshape(-1,1))[:,1]  # если вдруг классическая LR
+            except Exception:
+                pass
 
-        confidence_group = [_conf_group(float(c)) for c in confidence.tolist()]
-        inj_group  = [_inj_group(float(p))  if y == 1 else "" for p, y in zip(p_clip.tolist(), pred.tolist())]
-        noin_group = [_noinj_group(float(1.0 - p)) if y == 0 else "" for p, y in zip(p_clip.tolist(), pred.tolist())]
-        pred_group = [inj_group[i] if pred[i] == 1 else noin_group[i] for i in range(len(pred))]
-
-        df = pd.DataFrame({
-            "path": keep_paths,
-            "prob": probs,
-            "pred": pred,
-            "confidence": confidence,
-            "logit": logit,
-            "entropy": entr,
-            "confidence_group": confidence_group,
-            "inj_group": inj_group,
-            "noinj_group": noin_group,
-            "pred_group": pred_group,
-        }).sort_values(["confidence"], ascending=[False]).reset_index(drop=True)
-
-        df.to_csv(args.out_csv, index=False, float_format="%.6f")
-
-        # график групп
-        plot_path = args.plot_summary or (os.path.splitext(args.out_csv)[0] + "_groups.png")
-        plot_group_bars(df, plot_path, title_prefix=args.plot_title, dpi=args.plot_dpi)
-
-        # отчёт
-        n = len(df); n_pos = int(df["pred"].sum()); n_neg = n - n_pos
-        c_lt50 = int((df["confidence_group"] == "conf <50%").sum())
-        c_50_60 = int((df["confidence_group"] == "conf 50–60%").sum())
-        c_60_80 = int((df["confidence_group"] == "conf 60–80%").sum())
-        c_80p   = int((df["confidence_group"] == "conf >80%").sum())
-        print(f"Predicted: injury={n_pos} | no-injury={n_neg}")
-        print(f"Confidence buckets: <50%={c_lt50} | 50–60%={c_50_60} | 60–80%={c_60_80} | >80%={c_80p}")
-        return
-
-    # === Ветка НЕЙРОСЕТИ ===
-    if not args.norm_stats:
-        raise RuntimeError("Для NN необходимо указать --norm_stats (mean,std,max_len).")
-
-    mean, std, max_len = load_norm_stats(args.norm_stats)
-
-    # предупреждение для JSON
-    if args.input_format == "json":
-        # ожидаем F=3*|joints| — проверка только для информации
-        pass
-
-    model = load_any_model(args.model, unsafe_deser=args.unsafe_deser)
-
-    ds = make_dataset_nn(paths, mean, std, max_len, args.downsample, args.batch_size,
-                         input_format=args.input_format, schema_joints=schema_joints, motion_key=args.motion_key)
-    pths, probs, probs_std = predict_nn(model, ds, mc_passes=args.mc_passes)
-    if len(pths) == 0:
-        print("Нечего предсказывать — все примеры оказались битыми.", file=sys.stderr)
-        sys.exit(3)
-
-    probs = probs.astype(np.float32)
+    # бинаризация и вспомогательные величины
     pred = (probs >= thr).astype(np.int32)
     p_clip = np.clip(probs, 1e-8, 1 - 1e-8)
     logit = np.log(p_clip / (1.0 - p_clip)).astype(np.float32)
     confidence = np.where(pred == 1, p_clip, 1.0 - p_clip).astype(np.float32)
     entr = entropy_binary(p_clip).astype(np.float32)
 
+    # группировки
     def _conf_group(c: float) -> str:
         if c >= 0.8: return "conf >80%"
         if c >= 0.6: return "conf 60–80%"
@@ -698,8 +549,9 @@ def main():
     noin_group = [_noinj_group(float(1.0 - p)) if y == 0 else "" for p, y in zip(p_clip.tolist(), pred.tolist())]
     pred_group = [inj_group[i] if pred[i] == 1 else noin_group[i] for i in range(len(pred))]
 
-    out = {
-        "path": pths,
+    # CSV
+    df = pd.DataFrame({
+        "path": keep_paths,
         "prob": probs,
         "pred": pred,
         "confidence": confidence,
@@ -709,12 +561,10 @@ def main():
         "inj_group": inj_group,
         "noinj_group": noin_group,
         "pred_group": pred_group,
-    }
-    if probs_std is not None:
-        out["prob_std"] = probs_std.astype(np.float32)
+    }).sort_values(["confidence"], ascending=[False]).reset_index(drop=True)
 
-    df = pd.DataFrame(out).sort_values(["confidence"], ascending=[False]).reset_index(drop=True)
     df.to_csv(args.out_csv, index=False, float_format="%.6f")
+    print(f"[OK] saved: {args.out_csv}")
 
     # график групп
     plot_path = args.plot_summary or (os.path.splitext(args.out_csv)[0] + "_groups.png")
@@ -727,8 +577,6 @@ def main():
     c_80p   = int((df["confidence_group"] == "conf >80%").sum())
     print(f"Predicted: injury={n_pos} | no-injury={n_neg}")
     print(f"Confidence buckets: <50%={c_lt50} | 50–60%={c_50_60} | 60–80%={c_60_80} | >80%={c_80p}")
-    if "prob_std" in df.columns:
-        print(f"MC Dropout: passes={args.mc_passes} | mean std={df['prob_std'].mean():.6f}")
 
 if __name__ == "__main__":
     main()
