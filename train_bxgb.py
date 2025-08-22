@@ -518,6 +518,46 @@ if __name__ == "__main__":
     X_train, X_dev, y_train, y_dev = train_test_split(
         X_train_full, y_train_full, test_size=args.dev_size_from_train, random_state=args.seed, stratify=y_train_full
     )
+    
+        # --- сохраним test npy в отдельную папку ---
+    import shutil
+
+    test_dir = os.path.join(args.out_dir, "test_files")
+    os.makedirs(test_dir, exist_ok=True)
+
+    # читаем CSV ещё раз, чтобы восстановить пути
+    meta = pd.read_csv(args.csv, usecols=[args.filename_col, args.label_col])
+    all_paths = []
+    for _, row in meta.iterrows():
+        fn = str(row[args.filename_col]).strip() if pd.notnull(row.get(args.filename_col)) else ""
+        y = label_to_int(row.get(args.label_col))
+        if not fn or y is None:
+            continue
+        p = _map_to_npy_path(args.data_dir, fn)
+        if os.path.exists(p):
+            all_paths.append(p)
+
+    # те же индексы, что и у X_all / y_all
+    test_indices = set(range(len(all_paths))) - set(range(len(y_all)))  # заглушка
+    # проще: мы знаем размерности одинаковы → возьмём test_paths по маске y_test
+    # в момент сплита train_test_split возвращает X_test в том же порядке, значит индексы соответствуют
+    _, X_test_idx = train_test_split(
+        np.arange(len(y_all)), test_size=args.test_size, random_state=args.seed, stratify=y_all
+    )
+    test_paths = [all_paths[i] for i in X_test_idx]
+
+    print(f"[info] Копируем {len(test_paths)} тестовых файлов в {test_dir}")
+    for p in tqdm(test_paths, desc="Copy test npy", unit="file"):
+        dst = os.path.join(test_dir, os.path.basename(p))
+        try:
+            shutil.copy2(p, dst)
+        except Exception as e:
+            print("[warn] не удалось скопировать", p, "->", e)
+
+    with open(os.path.join(args.out_dir, "test_list.txt"), "w") as f:
+        for p in test_paths:
+            f.write(p + "\n")
+
 
     print("\n=== Split stats ===")
     print_split_stats("TRAIN (≈70%)", y_train)
