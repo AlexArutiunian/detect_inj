@@ -154,11 +154,22 @@ def _feats_from_npy_task(args):
     npy_path, y, downsample = args
     try:
         arr = np.load(npy_path, allow_pickle=False, mmap_mode="r")
-        arr = as_TxF(arr)
-        if arr is None or arr.shape[0] < 2: return None
-        return (_features_from_seq(np.asarray(seq)), int(y))
+        arr = as_TxF(arr)  # -> (T, F) или None
+        if arr is None or arr.shape[0] < 2:
+            return None
+
+        # downsample, очистка NaN/Inf и приведение к float32
+        if downsample and downsample > 1:
+            arr = arr[::downsample]
+        seq = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
+
+        feat = _features_from_seq(seq)
+        if feat is None:
+            return None
+        return (feat, int(y))
     except Exception:
         return None
+
 
 def load_features_from_npy(csv_path, npy_dir, filename_col="filename",
                            label_col="No inj/ inj", downsample=1, workers=0):
