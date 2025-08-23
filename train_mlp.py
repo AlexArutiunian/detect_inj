@@ -248,14 +248,18 @@ def extract_features(path: str, schema: Schema, fps: int = 30) -> pd.DataFrame:
         }])
 
     # ---- агрегируем ТОЛЬКО ЧИСЛОВЫЕ колонки (без side как категории) ----
-    num = df.select_dtypes(include=[np.number]).copy()
-    # отделим side, чтобы не попадала в agg
-    side_col = num.pop("side")
+# ---- агрегируем по шагам и плоско раскладываем в одну строку ----
+    agg_tbl = num.agg(["median", "mean", "std"]).T  # index: features, columns: stats
+    flat = {f"{feat}_{stat}": float(agg_tbl.loc[feat, stat])
+            for feat in agg_tbl.index for stat in agg_tbl.columns}
+    agg = pd.DataFrame([flat])
+
 
     agg = num.agg(["median", "mean", "std"]).T
     agg.columns = [f"{c}_{s}" for c, s in agg.columns.str.split("_", n=1)]
     agg = agg.T.T  # просто чтобы не трогать порядок
 
+   
     # асимметрии по медианам L/R (если обе стороны есть)
     if (side_col==0).any() and (side_col==1).any():
         def med(side, col):
@@ -268,6 +272,7 @@ def extract_features(path: str, schema: Schema, fps: int = 30) -> pd.DataFrame:
 
     agg["cycles_count"] = len(num)
     return agg.reset_index(drop=True)
+
 
 
 # --------------------- Dataset build ---------------------
