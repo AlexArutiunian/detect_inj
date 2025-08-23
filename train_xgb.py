@@ -2,13 +2,18 @@
 # -*- coding: utf-8 -*-
 
 """
-Binary Injury Detection on NPY sequences (subject-wise split).
-Содержит:
-- извлечение биомеханических фич по шаговым циклам (длина шага, cadence, ROM, jerk и т.п.)
-- дополнительные метрики (harmonic ratio, path curvature, cross-correlation L/R, duty factor и др.)
-- «богатые» пер-канальные статистики и спектральные фичи (27+4 на каждый канал) с осмысленными именами
-- обучение XGBoost (с весами классов), подбор порога по DEV с ограничениями на recall
-- отчёты/графики и сохранение кэша фич
+Binary Injury Detection on NPY sequences (subject-wise split) + numeric metadata from CSV.
+
+Что делает:
+- извлечение шаговых/биомех фич + богатые пер-канальные статистики/спектр (31 на канал) с осмысленными именами
+- добавляет ЧИСЛОВЫЕ признаки из CSV: speed_r, age, Height, Weight, YrsRunning,
+  RaceTimeHrs/Mins/Secs, YrPR, NumRaces, InjDuration (и любые др., которые удастся привести к числам)
+  + аккуратные производные (BMI, race_time_total_sec)
+- обучение XGBoost (веса классов), подбор порога по DEV с ограничениями
+- отчёты/графики и кэш фич
+
+Запуск (пример):
+  python train_all.py --mode train --csv full_manifest.csv --data_dir ./npy --schema schema_joints.json --fast_axes --use_gpu
 """
 
 import os, json, argparse, random, re, warnings, itertools
@@ -59,7 +64,6 @@ _SPECTRAL_NAMES = ["spec_e1","spec_e2","spec_e3","spec_entropy"]  # 4
 AXES = ["x","y","z"]
 
 def make_channel_names_from_schema(schema_names: List[str]) -> List[str]:
-    """Порядок каналов как в массиве (для каждого сустава три оси x,y,z)."""
     out=[]
     for joint in schema_names:
         base = joint.strip().lower()
@@ -372,11 +376,12 @@ def extract_features(path: str, schema: Schema, fps: int = 30, stride: int = 1, 
             iqr_step_time=np.nan, iqr_step_len=np.nan, iqr_cadence=np.nan, iqr_stance_time=np.nan,
             asym_step_time=np.nan, asym_step_len=np.nan, asym_rom_knee=np.nan,
             asym_rom_hip=np.nan, asym_rom_ankle=np.nan, asym_stance_time=np.nan,
-            asym_cadence=np.nan, asym_pelvis_vert_osc=np.nan, asym_pelvis_ml_osc=np.nan, asym_pelvis_ap_osc=np.nan,
+            asym_cadence=np.nan, asym_pelvis_vert_osc=np.nan, asym_pelvis_ml_osc*np.nan if False else np.nan,  # keep key presence
+            asym_pelvis_ap_osc=np.nan,
             si_step_len=np.nan, si_step_time=np.nan, si_cadence=np.nan,
             pelvis_jerk_rms_y=0.0, pelvis_jerk_rms_z=0.0, pelvis_jerk_rms_x=0.0,
             pelvis_jerk_norm=0.0,
-            step_width_ml=float(step_width_ml) if step_width_ml is not None else np.nan,
+            step_width_ml=np.nan,
             cycles_count=0,
             path_straightness=0.0,
             path_curv_mean=0.0, path_curv_rms=0.0,
@@ -389,7 +394,6 @@ def extract_features(path: str, schema: Schema, fps: int = 30, stride: int = 1, 
 
     if df.empty:
         flat = _empty_row_base()
-        # имена для сырых фич
         channels = make_channel_names_from_schema(schema.names)
         feat_names = make_feature_names_from_channels(channels)
         A2 = A.reshape(A.shape[0], -1).astype(np.float32, copy=False)
@@ -423,7 +427,6 @@ def extract_features(path: str, schema: Schema, fps: int = 30, stride: int = 1, 
             L = med(0,col); R = med(1,col)
             denom = (abs(L)+abs(R))/2 + 1e-6
             flat[f"asym_{col}"] = abs(L-R)/denom
-        # Symmetry Index
         for col in ["step_len","step_time","cadence"]:
             L = med(0,col); R = med(1,col)
             flat[f"si_{col}"] = (L-R)/((L+R)/2 + 1e-6)
@@ -442,6 +445,7 @@ def extract_features(path: str, schema: Schema, fps: int = 30, stride: int = 1, 
     flat["pelvis_jerk_norm"] = (flat["pelvis_jerk_rms_y"]+flat["pelvis_jerk_rms_z"]) / (abs(mean_step_t)*abs(mean_step_l) + 1e-6)
 
     # ширина шага и метрики траектории таза
+    # (step_width_ml уже вычислен выше при наличии обеих стоп)
     flat["step_width_ml"] = float(step_width_ml) if step_width_ml is not None else np.nan
     horiz = pelvis[:,[0,2]]
     net = np.linalg.norm(horiz[-1]-horiz[0])
@@ -487,7 +491,7 @@ def extract_features(path: str, schema: Schema, fps: int = 30, stride: int = 1, 
     else:
         flat["cc_AP"]=np.nan; flat["cc_AP_lag"]=np.nan; flat["cc_ML"]=np.nan; flat["cc_ML_lag"]=np.nan
 
-    # Доля «двойной опоры» (приблизительно)
+    # Двойная опора
     ds_vals=[]
     if "L_foot" in cogs and "R_foot" in cogs:
         fsL, foL = detect_gait_events(cogs["L_foot"], fps=fps)
@@ -511,7 +515,7 @@ def extract_features(path: str, schema: Schema, fps: int = 30, stride: int = 1, 
                 else: j+=1
     flat["ds_ratio"] = float(np.nanmean(ds_vals)) if ds_vals else np.nan
 
-    # Стабильность: доля выбросов (median ± 1.5*IQR) среди ключевых шаговых фич
+    # Стабильность шагов
     key = ["step_len","step_time","cadence","stance_time","pelvis_vert_osc","pelvis_ml_osc"]
     count_out = 0; count_all = 0
     for k in key:
@@ -526,7 +530,6 @@ def extract_features(path: str, schema: Schema, fps: int = 30, stride: int = 1, 
         count_out += int(out); count_all += int(vv.size)
     flat["outlier_rate"] = float(count_out / max(1, count_all))
 
-    # число циклов
     flat["cycles_count"] = int(len(num))
 
     # ---- Добавим «сырые» пер-канальные фичи с осмысленными именами
@@ -539,24 +542,66 @@ def extract_features(path: str, schema: Schema, fps: int = 30, stride: int = 1, 
 
     return pd.DataFrame([flat])
 
+# -------------------- CSV numeric meta --------------------
+_NUMERIC_CANDIDATES = [
+    "speed_r","age","Height","Weight","YrsRunning",
+    "RaceTimeHrs","RaceTimeMins","RaceTimeSecs",
+    "YrPR","NumRaces","InjDuration"
+]
+def _coerce_numeric_series(s: pd.Series) -> pd.Series:
+    # заменим «Unknown»/пустые на NaN и приведём к числам
+    return pd.to_numeric(s.replace(["Unknown","unknown","", "NA", "N/A", "nan"], np.nan), errors="coerce")
+
+def build_meta_numeric(row: pd.Series) -> Dict[str, float]:
+    out={}
+    for c in _NUMERIC_CANDIDATES:
+        if c in row.index:
+            out[f"meta_{c.lower()}"] = float(_coerce_numeric_series(pd.Series([row[c]])).iloc[0])
+    # производные (если есть размеры)
+    h = out.get("meta_height"); w = out.get("meta_weight")
+    if pd.notnull(h) and pd.notnull(w) and h>0:
+        # Height обычно в см
+        h_m = h/100.0 if h>3 else h
+        out["meta_bmi"] = float(w/((h_m**2)+1e-6))
+    else:
+        out["meta_bmi"] = np.nan
+    # суммарное время гонки в секундах (может быть сильно разрежено)
+    hh = out.get("meta_racetimehrs"); mm = out.get("meta_racetimemins"); ss = out.get("meta_racetimesecs")
+    total = 0.0; ok=False
+    for v, mul in [(hh,3600),(mm,60),(ss,1)]:
+        if v is not None and pd.notnull(v):
+            total += float(v)*mul; ok=True
+    out["meta_race_time_total_sec"] = float(total) if ok else np.nan
+    return out
+
 # -------------------- Parallel dataset build --------------------
 def _extract_one(args):
-    p, fn, y_val, fps, stride, fast_axes = args
+    p, fn, y_val, fps, stride, fast_axes, meta_d = args
     schema = load_schema(schema_path_global)
     feats = extract_features(p, schema, fps=fps, stride=stride, fast_axes_flag=fast_axes)
     d = feats.iloc[0].to_dict()
-    return d, int(y_val), guess_subject_id(fn), p
+    # мержим мета-числовые признаки
+    d.update(meta_d)
+    return d, int(y_val), fn, p  # fn будет использован для группировки (sub_id попозже)
 
 def build_table(manifest_csv: str, data_dir: str, schema: Schema, fps: int,
                 workers: int = 1, stride: int = 1, fast_axes: bool = True
                ) -> Tuple[pd.DataFrame, np.ndarray, np.ndarray, List[str]]:
     df = pd.read_csv(manifest_csv)
     assert "filename" in df.columns, "CSV must have 'filename'"
+    # метка
     y_col = None
     for c in df.columns:
         if "inj" in c.lower():
             y_col = c; break
     assert y_col is not None, "CSV must have an injury label column (e.g., 'No inj/ inj')"
+
+    # подготовим карту filename -> meta_numeric dict
+    meta_map = {}
+    for r in df.itertuples(index=False):
+        row = pd.Series(r._asdict())
+        fn = str(row["filename"])
+        meta_map[fn] = build_meta_numeric(row)
 
     f_idx = df.columns.get_loc("filename")
     y_idx = df.columns.get_loc(y_col)
@@ -566,10 +611,11 @@ def build_table(manifest_csv: str, data_dir: str, schema: Schema, fps: int,
         fn = str(row[f_idx])
         p = os.path.join(data_dir, fn)
         if not p.endswith(".npy"): p += ".npy"
-        if not os.path.exists(p): 
+        if not os.path.exists(p):
             continue
         y_val = label_to_int(row[y_idx])
-        tasks.append((p, fn, y_val, fps, stride, fast_axes))
+        meta_d = meta_map.get(fn, {})
+        tasks.append((p, fn, y_val, fps, stride, fast_axes, meta_d))
     if not tasks:
         raise RuntimeError("No valid .npy paths")
 
@@ -580,8 +626,8 @@ def build_table(manifest_csv: str, data_dir: str, schema: Schema, fps: int,
     if workers <= 1:
         for t in tqdm(tasks, desc="Extract features"):
             try:
-                d, yv, grp, fp = _extract_one(t)
-                X_rows.append(d); y_list.append(yv); groups.append(grp); files.append(fp)
+                d, yv, fn, fp = _extract_one(t)
+                X_rows.append(d); y_list.append(yv); files.append(fp); groups.append(fn)
             except Exception as e:
                 skipped += 1
                 tqdm.write(f"[skip] {t[0]} -> {type(e).__name__} {e}")
@@ -590,16 +636,27 @@ def build_table(manifest_csv: str, data_dir: str, schema: Schema, fps: int,
             futs = [ex.submit(_extract_one, t) for t in tasks]
             for f in tqdm(as_completed(futs), total=len(futs), desc="Extract features (parallel)"):
                 try:
-                    d, yv, grp, fp = f.result()
-                    X_rows.append(d); y_list.append(yv); groups.append(grp); files.append(fp)
+                    d, yv, fn, fp = f.result()
+                    X_rows.append(d); y_list.append(yv); files.append(fp); groups.append(fn)
                 except Exception as e:
                     skipped += 1
                     tqdm.write(f"[skip] -> {type(e).__name__} {e}")
 
-    X = pd.DataFrame(X_rows).fillna(0.0)
+    X = pd.DataFrame(X_rows)
+    # оставляем только числовые (meta_* уже числовые)
+    X = X.apply(pd.to_numeric, errors="ignore")
+    X = X.select_dtypes(include=[np.number]).copy().fillna(0.0)
+
     y = np.asarray(y_list, dtype=np.int64)
-    groups = np.asarray(groups)
     files = np.asarray(files)
+
+    # groups: предпочтем sub_id из CSV, если есть, иначе — guess из filename
+    if "sub_id" in df.columns:
+        # построим мапу filename->sub_id
+        sid_map = dict(zip(df["filename"].astype(str), df["sub_id"].astype(str)))
+        groups = np.array([sid_map.get(Path(f).stem + ".npy", sid_map.get(Path(f).name, guess_subject_id(Path(f).name))) for f in files])
+    else:
+        groups = np.array([guess_subject_id(Path(f).name) for f in files])
 
     ok = np.isin(y, [0,1])
     bad = (~ok).sum()
@@ -607,8 +664,6 @@ def build_table(manifest_csv: str, data_dir: str, schema: Schema, fps: int,
         print(f"[warn] dropped {bad} rows due to bad labels")
     X = X.loc[ok].reset_index(drop=True)
     y = y[ok]; groups = groups[ok]; files = files[ok]
-
-    X = X.select_dtypes(include=[np.number]).copy()
 
     print(f"[info] Ready: {len(X)} samples (skipped {skipped}); positives={int((y==1).sum())}, negatives={int((y==0).sum())}, features={X.shape[1]}")
     return X, y, groups, files
@@ -638,9 +693,7 @@ def plot_confusion_matrix(cm: np.ndarray, class_names, normalize: bool, save_pat
         xlabel="Predicted",
     )
     ax.set_ylim(len(class_names)-0.5, -0.5)
-    if title is None:
-        title = "Confusion Matrix (normalized)" if normalize else "Confusion Matrix (counts)"
-    ax.set_title(title, pad=14)
+    ax.set_title(title or ("Confusion Matrix (normalized)" if normalize else "Confusion Matrix (counts)"), pad=14)
     thresh = cm_norm.max()/2.0
     for i, j in itertools.product(range(cm.shape[0]), range(cm.shape[1])):
         text = f"{cm_norm[i,j]:.2f}\n({int(cm[i,j])})" if normalize else f"{int(cm[i,j])}"
@@ -667,7 +720,7 @@ def find_threshold_balanced(y_true, probs, target_r1=0.95, target_r0=0.90):
         r0 = recall_score(y_true, pred, pos_label=0)
         bal = 0.5*(r1 + r0)
         if (r1 >= target_r1) and (r0 >= target_r0):
-            if not best["ok"] or bal > best["bal"]:
+            if (not best["ok"]) or (bal > best["bal"]):
                 best = {"thr": float(thr), "r1": float(r1), "r0": float(r0), "ok": True, "bal": float(bal)}
         if not best["ok"] and bal > best["bal"]:
             best = {"thr": float(thr), "r1": float(r1), "r0": float(r0), "ok": False, "bal": float(bal)}
@@ -738,7 +791,6 @@ def train_xgb(X: pd.DataFrame, y: np.ndarray, groups: np.ndarray, files: np.ndar
 
     feat_names = X_tr.columns.astype(str).tolist()
 
-    # DMatrix с именами признаков
     dtrain = xgb.DMatrix(X_tr.values, label=y_tr, weight=sw_tr, feature_names=feat_names)
     dvalid = xgb.DMatrix(X_dv.values, label=y_dv, weight=sw_dv, feature_names=feat_names)
     dtest  = xgb.DMatrix(X_te.values, label=y_te, feature_names=feat_names)
@@ -894,14 +946,14 @@ def predict_one(npy_path: str, schema_path: str, out_dir: str, fps: int = 30, st
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--mode", choices=["extract","train","train_features","predict"], default="train")
-    ap.add_argument("--csv", help="manifest.csv (для extract/train)")
-    ap.add_argument("--data_dir", help="папка с .npy (для extract/train)")
+    ap.add_argument("--csv", help="full manifest.csv (с колонками filename, No inj/ inj, + числовые мета-фичи)")
+    ap.add_argument("--data_dir", help="папка с .npy")
     ap.add_argument("--schema", required=True, help="schema_joints.json")
     ap.add_argument("--out_dir", default="out_xgb_all")
     ap.add_argument("--fps", type=int, default=30)
     ap.add_argument("--stride", type=int, default=2, help="прореживание кадров")
     ap.add_argument("--fast_axes", action="store_true", help="быстрые оси сегментов (без SVD)")
-    ap.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2)-1), help="число процессов при extract/build")
+    ap.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2)-1))
 
     ap.add_argument("--use_gpu", action="store_true", help="XGBoost GPU (gpu_hist)")
     ap.add_argument("--min_recall_injury", type=float, default=0.95)
