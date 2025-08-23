@@ -339,6 +339,46 @@ def build_table(manifest_csv: str, data_dir: str, schema: Schema, fps: int
     print(f"[info] Позитивов (Injury): {(y==1).sum()} | Негативов (No Injury): {(y==0).sum()}")
     print(f"[info] Число признаков: {X.shape[1]}")
     return X, y, groups, files
+def extract_and_save(manifest_csv: str, data_dir: str, schema_path: str, fps: int, out_dir: str):
+    """Считает фичи по всему датасету и сохраняет кэш на диск."""
+    ensure_dir(out_dir)
+    schema = load_schema(schema_path)
+    X, y, groups, files = build_table(manifest_csv, data_dir, schema, fps=fps)
+
+    # сохраняем
+    X.to_parquet(os.path.join(out_dir, "features.parquet"))  # быстрая загрузка и без потерь типов
+    np.save(os.path.join(out_dir, "labels.npy"), y)
+    np.save(os.path.join(out_dir, "groups.npy"), groups)
+    with open(os.path.join(out_dir, "files.txt"), "w", encoding="utf-8") as f:
+        for p in files:
+            f.write(str(p) + "\n")
+    meta = {
+        "manifest_csv": manifest_csv,
+        "data_dir": data_dir,
+        "fps": fps,
+        "n_samples": int(len(X)),
+        "n_features": int(X.shape[1]),
+        "positives": int((y==1).sum()),
+        "negatives": int((y==0).sum()),
+        "schema": os.path.abspath(schema_path),
+    }
+    json.dump(meta, open(os.path.join(out_dir, "meta.json"), "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+
+    print(f"[extract] saved to: {out_dir}")
+    print(f"[extract] X: {X.shape}, y: {y.shape}, groups: {groups.shape}")
+    return out_dir
+
+
+def load_features_cache(features_path: str, labels_path: str, groups_path: str, files_path: str):
+    """Загружает кэш с фичами с диска."""
+    X = pd.read_parquet(features_path)
+    y = np.load(labels_path)
+    groups = np.load(groups_path, allow_pickle=True)
+    with open(files_path, "r", encoding="utf-8") as f:
+        files = np.array([ln.strip() for ln in f if ln.strip()])
+    # безопасность: оставим только числовые колонки
+    X = X.select_dtypes(include=[np.number]).copy()
+    return X, y, groups, files
 
 # --------------------- Torch model ---------------------
 def build_mlp(in_dim: int):
@@ -531,10 +571,12 @@ def predict_one(npy_path: str, schema: Schema, out_dir: str, fps: int = 30):
 # --------------------- CLI ---------------------
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", choices=["train","predict"], default="train")
-    ap.add_argument("--csv", help="manifest.csv (для train)")
-    ap.add_argument("--data_dir", help="папка с .npy (для train)")
-    ap.add_argument("--schema", required=True, help="schema_joints.json")
+    ap.add_argument("--mode", choices=["train","predict","extract","train_features"], default="train",
+                    help="extract: только посчитать и сохранить фичи; "
+                         "train_features: обучение из кэша фич")
+    ap.add_argument("--csv", help="manifest.csv (для train/extract)")
+    ap.add_argument("--data_dir", help="папка с .npy (для train/extract)")
+    ap.add_argument("--schema", required=True, help="schema_joints.json (нужен для extract/train/predict)")
     ap.add_argument("--out_dir", default="out_nn")
     ap.add_argument("--epochs", type=int, default=50)
     ap.add_argument("--batch_size", type=int, default=64)
@@ -542,21 +584,47 @@ def main():
     ap.add_argument("--weight_decay", type=float, default=1e-4)
     ap.add_argument("--fps", type=int, default=30)
     ap.add_argument("--npy", help="путь к .npy (для predict)")
+
+    # пути к кэшу (для train_features)
+    ap.add_argument("--features", help="path to features.parquet (для train_features)")
+    ap.add_argument("--labels", help="path to labels.npy (для train_features)")
+    ap.add_argument("--groups", help="path to groups.npy (для train_features)")
+    ap.add_argument("--files_list", help="path to files.txt (для train_features)")
+
     args = ap.parse_args()
     seed_all(42)
 
-    schema = load_schema(args.schema)
+    if args.mode == "extract":
+        assert args.csv and args.data_dir, "--csv и --data_dir обязательны в режиме extract"
+        extract_and_save(args.csv, args.data_dir, args.schema, fps=args.fps, out_dir=args.out_dir)
+        return
 
     if args.mode == "train":
         assert args.csv and args.data_dir, "--csv и --data_dir обязательны в режиме train"
+        schema = load_schema(args.schema)
         X, y, groups, files = build_table(args.csv, args.data_dir, schema, fps=args.fps)
-        print(f"[info] samples={len(X)}, positives={int((y==1).sum())}, features={X.shape[1]}")
+        print(f"[info] samples={len(X)}, positives={(y==1).sum()}, features={X.shape[1]}")
         train_nn(X, y, groups, files, args.out_dir,
-            epochs=args.epochs, batch_size=args.batch_size, lr=args.lr, weight_decay=args.weight_decay)
-    else:
-        assert args.npy, "--npy обязателен в режиме predict"
-        res = predict_one(args.npy, schema, args.out_dir, fps=args.fps)
-        print(json.dumps(res, ensure_ascii=False, indent=2))
+                 epochs=args.epochs, batch_size=args.batch_size, lr=args.lr, weight_decay=args.weight_decay)
+        return
+
+    if args.mode == "train_features":
+        # если пути не заданы, берём по умолчанию из out_dir (там где делали extract)
+        features = args.features or os.path.join(args.out_dir, "features.parquet")
+        labels   = args.labels   or os.path.join(args.out_dir, "labels.npy")
+        groups   = args.groups   or os.path.join(args.out_dir, "groups.npy")
+        files_l  = args.files_list or os.path.join(args.out_dir, "files.txt")
+        X, y, groups, files = load_features_cache(features, labels, groups, files_l)
+        print(f"[info] loaded cache: {X.shape}, positives={(y==1).sum()}")
+        train_nn(X, y, groups, files, args.out_dir,
+                 epochs=args.epochs, batch_size=args.batch_size, lr=args.lr, weight_decay=args.weight_decay)
+        return
+
+    # predict
+    assert args.npy, "--npy обязателен в режиме predict"
+    schema = load_schema(args.schema)
+    res = predict_one(args.npy, schema, args.out_dir, fps=args.fps)
+    print(json.dumps(res, ensure_ascii=False, indent=2))
 
 if __name__ == "__main__":
     main()
