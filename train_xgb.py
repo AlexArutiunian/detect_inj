@@ -492,7 +492,7 @@ def train_xgb(X: pd.DataFrame, y: np.ndarray, groups: np.ndarray, files: np.ndar
                                            target_r1=min_recall_pos,
                                            target_r0=min_recall_neg)
     thr = best["thr"]
-    print(f"[threshold] chosen={thr:.4f} | dev recall(1)={best['r1']:.3f} recall(0)={best['r0']:.3f} ok={best['ok']}")
+    print(f"[threshold] chosen={thr:.4f} | dev recall(1)={best['r1']:.3f} recall(0)={best['r0']:.3f}")
 
     # тест с этим порогом
     pred_te = (prob_te >= thr).astype(int)
