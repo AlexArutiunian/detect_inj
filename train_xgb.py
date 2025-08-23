@@ -489,8 +489,8 @@ def train_xgb(X: pd.DataFrame, y: np.ndarray, groups: np.ndarray, files: np.ndar
 
     # подбор порога под цели
     best = find_threshold_balanced(y_dv, prob_dv,
-                                           min_recall_pos=min_recall_pos,
-                                           min_recall_neg=min_recall_neg)
+                                           target_r1=min_recall_pos,
+                                           target_r0=min_recall_neg)
     thr = best["thr"]
     print(f"[threshold] chosen={thr:.4f} | dev recall(1)={best['r1']:.3f} recall(0)={best['r0']:.3f} ok={best['ok']}")
 
