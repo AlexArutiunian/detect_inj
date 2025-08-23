@@ -9,14 +9,14 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from sklearn.utils.class_weight import compute_class_weight
+import matplotlib.pyplot as plt
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
-# =============== GLOBAL (для форков) ===============
+# ===================== GLOBAL (для форков) =====================
 schema_path_global = None
 
-# =============== Utils ===============
+# ===================== Utils =====================
 def seed_all(s=42):
     random.seed(s); np.random.seed(s)
 
@@ -35,7 +35,7 @@ def guess_subject_id(filename: str) -> str:
 
 def ensure_dir(p): Path(p).mkdir(parents=True, exist_ok=True)
 
-# =============== Schema + I/O ===============
+# ===================== Schema + I/O =====================
 @dataclass
 class Schema:
     names: List[str]
@@ -70,9 +70,8 @@ def load_npy(path: str, schema: Schema) -> np.ndarray:
     arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
     return arr  # (T, N, 3)
 
-# =============== Biomech helpers ===============
+# ===================== Biomech helpers =====================
 def centroid_series(x: np.ndarray) -> np.ndarray:
-    """(T, K, 3) -> (T,3)"""
     return x.mean(axis=1)
 
 def center_and_scale(all_xyz: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
@@ -147,7 +146,7 @@ def iqr(a: np.ndarray):
     q75, q25 = np.nanpercentile(a, [75, 25])
     return float(q75 - q25)
 
-# =============== Feature Extraction ===============
+# ===================== Feature Extraction =====================
 def extract_features(path: str, schema: Schema, fps: int = 30, stride: int = 1, fast_axes_flag: bool = True) -> pd.DataFrame:
     """
     Возвращает одну строку числовых признаков.
@@ -160,21 +159,18 @@ def extract_features(path: str, schema: Schema, fps: int = 30, stride: int = 1, 
         A = A[::stride]
         fps = max(1, int(round(fps/stride)))
     T = A.shape[0]
-    # сегменты
     seg = {k: A[:, idx, :] for k, idx in schema.groups.items() if len(idx) > 0}
     if not seg:
         raise ValueError("Schema produced no segments")
     seg = center_and_scale(seg)
-    # центроиды и оси
     cogs = {k: centroid_series(v) for k, v in seg.items()}
-    axes = fast_segment_axes(cogs) if fast_axes_flag else {}  # для ROM, если пусто — некоторые ROM будут нулевые
+    axes = fast_segment_axes(cogs) if fast_axes_flag else {}
 
     rows = []
-    # дополнительные последовательные фичи (для smoothness)
     pelvis = cogs.get("pelvis")
     if pelvis is None: raise ValueError("No pelvis in schema")
 
-    # вспом: ширина шага (средняя ML-дистанция между стопами)
+    # ширина шага
     step_width_ml = None
     if "L_foot" in cogs and "R_foot" in cogs:
         step_width_ml = float(np.nanmedian(np.abs(cogs["L_foot"][:,2] - cogs["R_foot"][:,2])))
@@ -225,7 +221,6 @@ def extract_features(path: str, schema: Schema, fps: int = 30, stride: int = 1, 
 
     df = pd.DataFrame(rows)
     if df.empty:
-        # fallback минимум
         return pd.DataFrame([{
             "step_time_median": np.nan, "step_time_mean": np.nan, "step_time_std": 0.0,
             "cadence_median": np.nan, "cadence_mean": np.nan, "cadence_std": 0.0,
@@ -243,50 +238,50 @@ def extract_features(path: str, schema: Schema, fps: int = 30, stride: int = 1, 
             "asym_rom_hip": np.nan, "asym_rom_ankle": np.nan, "asym_stance_time": np.nan,
             "asym_cadence": np.nan, "asym_pelvis_vert_osc": np.nan, "asym_pelvis_ml_osc": np.nan,
             "pelvis_jerk_rms_y": 0.0, "pelvis_jerk_rms_z": 0.0,
-            "step_width_ml": float(step_width_ml) if step_width_ml is not None else np.nan,
-            "cycles_count": 0,
+            "step_width_ml": np.nan, "cycles_count": 0,
             "path_straightness": 0.0
         }])
 
-    # агрегаты по шагам
     num = df.select_dtypes(include=[np.number]).copy()
     side_col = num.pop("side")
+
     agg_tbl = num.agg(["median","mean","std"]).T
     flat = {f"{feat}_{stat}": float(agg_tbl.loc[feat, stat])
             for feat in agg_tbl.index for stat in agg_tbl.columns}
-    # CV/IQR — для «здоровых» важно низкое разброс/вариабельность
+
     for col in ["step_time","step_len","cadence","stance_time","pelvis_vert_osc","pelvis_ml_osc"]:
         v = num[col].values
         if np.isfinite(v).sum() >= 2:
             m = np.nanmean(v); s = np.nanstd(v)
             flat[f"cv_{col}"] = float(s/(abs(m)+1e-6))
-            flat[f"iqr_{col}"] = iqr(v)
+            flat[f"iqr_{col}"] = float(np.nanpercentile(v, 75) - np.nanpercentile(v, 25))
         else:
             flat[f"cv_{col}"] = np.nan; flat[f"iqr_{col}"] = np.nan
 
-    # асимметрии по медианам L/R
     if (side_col==0).any() and (side_col==1).any():
         def med(side, col):
             vv = num.loc[side_col==side, col]
             return float(np.median(vv)) if len(vv) else np.nan
-        for col in ["step_time","step_len","rom_knee","rom_hip","rom_ankle","stance_time","cadence","pelvis_vert_osc","pelvis_ml_osc"]:
+        for col in ["step_time","step_len","rom_knee","rom_hip","rom_ankle",
+                    "stance_time","cadence","pelvis_vert_osc","pelvis_ml_osc"]:
             L = med(0,col); R = med(1,col)
             denom = (abs(L)+abs(R))/2 + 1e-6
             flat[f"asym_{col}"] = abs(L-R)/denom
 
-    # плавность (jerk RMS) таза по вертикали/ML
     def jerk_rms(sig):
-        v  = np.gradient(sig)         # vel
-        a  = np.gradient(v)           # acc
-        j  = np.gradient(a)           # jerk
+        v  = np.gradient(sig)
+        a  = np.gradient(v)
+        j  = np.gradient(a)
         return float(np.sqrt(np.nanmean(j*j)))
+    pelvis = cogs["pelvis"]
     flat["pelvis_jerk_rms_y"] = jerk_rms(pelvis[:,1])
     flat["pelvis_jerk_rms_z"] = jerk_rms(pelvis[:,2])
 
-    # средняя ширина шага (ML между стопами)
-    flat["step_width_ml"] = float(step_width_ml) if step_width_ml is not None else np.nan
+    if "L_foot" in cogs and "R_foot" in cogs:
+        flat["step_width_ml"] = float(np.nanmedian(np.abs(cogs["L_foot"][:,2] - cogs["R_foot"][:,2])))
+    else:
+        flat["step_width_ml"] = np.nan
 
-    # straightness пути таза: фин.смещение / сумма приращений
     horiz = pelvis[:,[0,2]]
     net = np.linalg.norm(horiz[-1]-horiz[0])
     seglen = np.linalg.norm(np.diff(horiz, axis=0), axis=1)
@@ -295,7 +290,7 @@ def extract_features(path: str, schema: Schema, fps: int = 30, stride: int = 1, 
     flat["cycles_count"] = int(len(num))
     return pd.DataFrame([flat])
 
-# =============== Parallel dataset build ===============
+# ===================== Parallel dataset build =====================
 def _extract_one(args):
     p, fn, y_val, fps, stride, fast_axes = args
     schema = load_schema(schema_path_global)
@@ -369,9 +364,7 @@ def build_table(manifest_csv: str, data_dir: str, schema: Schema, fps: int,
     print(f"[info] Ready: {len(X)} samples (skipped {skipped}); positives={int((y==1).sum())}, negatives={int((y==0).sum())}, features={X.shape[1]}")
     return X, y, groups, files
 
-# =============== Confusion matrix plotting ===============
-import matplotlib.pyplot as plt
-
+# ===================== Confusion matrix plotting =====================
 def plot_confusion_matrix(cm: np.ndarray, class_names, normalize: bool, save_path: str, title: str = None):
     cm = cm.astype(np.float64)
     if normalize:
@@ -406,37 +399,36 @@ def plot_confusion_matrix(cm: np.ndarray, class_names, normalize: bool, save_pat
     plt.savefig(save_path, dpi=160)
     plt.close(fig)
 
-# =============== Threshold search with constraints ===============
-from sklearn.metrics import recall_score, precision_recall_curve, roc_auc_score, average_precision_score, confusion_matrix, classification_report
-def find_threshold_balanced(y_true, probs, target_r1=0.95, target_r0=0.90):
-    """
-    Перебираем порог и выбираем тот, где recall(1)>=target_r1 и recall(0)>=target_r0.
-    Возвращаем словарь с ключами thr, r1, r0, ok.
-    """
-    from sklearn.metrics import recall_score
+# ===================== Threshold search =====================
+from sklearn.metrics import (
+    recall_score, precision_recall_curve, roc_auc_score,
+    average_precision_score, confusion_matrix, classification_report
+)
 
-    best = {"thr": 0.5, "r1": 0.0, "r0": 0.0, "ok": False}
-    for thr in np.linspace(0.01, 0.99, 200):
+def find_threshold_balanced(y_true, probs, target_r1=0.95, target_r0=0.90):
+    best = {"thr": 0.5, "r1": 0.0, "r0": 0.0, "ok": False, "bal": -1.0}
+    for thr in np.linspace(0.0, 1.0, 2001):
         pred = (probs >= thr).astype(int)
         r1 = recall_score(y_true, pred, pos_label=1)
         r0 = recall_score(y_true, pred, pos_label=0)
-        if r1 >= target_r1 and r0 >= target_r0:
-            best = {"thr": thr, "r1": r1, "r0": r0, "ok": True}
-            break
-        # даже если не выполнили условия, сохраним лучший баланс по (r1+r0)
-        if (r1 + r0) > (best["r1"] + best["r0"]):
-            best = {"thr": thr, "r1": r1, "r0": r0, "ok": False}
+        bal = 0.5*(r1 + r0)
+        if (r1 >= target_r1) and (r0 >= target_r0):
+            if not best["ok"] or bal > best["bal"]:
+                best = {"thr": float(thr), "r1": float(r1), "r0": float(r0), "ok": True, "bal": float(bal)}
+        if not best["ok"] and bal > best["bal"]:
+            best = {"thr": float(thr), "r1": float(r1), "r0": float(r0), "ok": False, "bal": float(bal)}
     return best
 
+# ===================== Train XGBoost (xgb.train + DMatrix с весами) =====================
+from sklearn.model_selection import GroupShuffleSplit
+from sklearn.utils.class_weight import compute_class_weight
+import xgboost as xgb
 
-
-# =============== Train XGBoost ===============
 def train_xgb(X: pd.DataFrame, y: np.ndarray, groups: np.ndarray, files: np.ndarray,
               out_dir: str, use_gpu: bool, min_recall_pos: float, min_recall_neg: float,
               seed: int = 42):
+
     ensure_dir(out_dir)
-    from sklearn.model_selection import GroupShuffleSplit
-    from xgboost import XGBClassifier, plot_importance
 
     # subject-wise split 60/20/20
     gss1 = GroupShuffleSplit(n_splits=1, test_size=0.20, random_state=seed)
@@ -458,23 +450,6 @@ def train_xgb(X: pd.DataFrame, y: np.ndarray, groups: np.ndarray, files: np.ndar
     split_df.loc[te_idx, "split"] = "test"
     split_df.to_csv(os.path.join(out_dir, "split_subjectwise.csv"), index=False)
 
-    # модель
-        # модель + авто-веса классов (balanced) через sample_weight
-    params = dict(
-        n_estimators=1600,
-        learning_rate=0.03,
-        max_depth=4,
-        min_child_weight=2,
-        subsample=0.85,
-        colsample_bytree=0.9,
-        reg_lambda=1.0,
-        tree_method="gpu_hist" if use_gpu else "hist",
-        eval_metric="logloss",
-        random_state=seed,
-        n_jobs=0
-    )
-    model = XGBClassifier(**params)
-
     X_tr, y_tr = X.iloc[tr_idx], y[tr_idx]
     X_dv, y_dv = X.iloc[dv_idx], y[dv_idx]
     X_te, y_te = X.iloc[te_idx], y[te_idx]
@@ -485,23 +460,41 @@ def train_xgb(X: pd.DataFrame, y: np.ndarray, groups: np.ndarray, files: np.ndar
     w0, w1 = float(cw[0]), float(cw[1])
     print(f"[train] class_weight(balanced): w0(NoInjury)={w0:.3f}, w1(Injury)={w1:.3f}")
 
-    # sample weights для train/dev
     sw_tr = np.where(y_tr == 0, w0, w1).astype(np.float32)
     sw_dv = np.where(y_dv == 0, w0, w1).astype(np.float32)
 
-    print("[train] XGBoost fitting...")
-    model.fit(
-        X_tr, y_tr,
-        sample_weight=sw_tr,
-        eval_set=[(X_tr, y_tr), (X_dv, y_dv)],
-        eval_sample_weight=[sw_tr, sw_dv],
-        verbose=50,
-        early_stopping_rounds=100
+    # DMatrix с весами
+    dtrain = xgb.DMatrix(X_tr, label=y_tr, weight=sw_tr)
+    dvalid = xgb.DMatrix(X_dv, label=y_dv, weight=sw_dv)
+    dtest  = xgb.DMatrix(X_te, label=y_te)
+
+    params = dict(
+        objective="binary:logistic",
+        learning_rate=0.03,
+        max_depth=4,
+        min_child_weight=2,
+        subsample=0.85,
+        colsample_bytree=0.9,
+        reg_lambda=1.0,
+        tree_method="gpu_hist" if use_gpu else "hist",
+        eval_metric="logloss",
+        seed=seed,
+    )
+    num_boost_round = 1600
+
+    print("[train] XGBoost (xgb.train) fitting...")
+    bst = xgb.train(
+        params,
+        dtrain,
+        num_boost_round=num_boost_round,
+        evals=[(dtrain, "train"), (dvalid, "valid")],
+        early_stopping_rounds=100,
+        verbose_eval=50,
     )
 
     # вероятности
-    prob_dv = model.predict_proba(X_dv)[:,1]
-    prob_te = model.predict_proba(X_te)[:,1]
+    prob_dv = bst.predict(dvalid, iteration_range=(0, bst.best_iteration + 1))
+    prob_te = bst.predict(dtest,  iteration_range=(0, bst.best_iteration + 1))
 
     # PR/ROC
     auprc_dv = average_precision_score(y_dv, prob_dv)
@@ -511,8 +504,8 @@ def train_xgb(X: pd.DataFrame, y: np.ndarray, groups: np.ndarray, files: np.ndar
 
     # подбор порога под цели
     best = find_threshold_balanced(y_dv, prob_dv,
-                                           target_r1=min_recall_pos,
-                                           target_r0=min_recall_neg)
+                                   target_r1=min_recall_pos,
+                                   target_r0=min_recall_neg)
     thr = best["thr"]
     print(f"[threshold] chosen={thr:.4f} | dev recall(1)={best['r1']:.3f} recall(0)={best['r0']:.3f} ok={best['ok']}")
 
@@ -535,7 +528,7 @@ def train_xgb(X: pd.DataFrame, y: np.ndarray, groups: np.ndarray, files: np.ndar
     json.dump(metrics, open(os.path.join(out_dir, "metrics.json"), "w", encoding="utf-8"), ensure_ascii=False, indent=2)
     open(os.path.join(out_dir, "threshold.txt"), "w").write(str(thr))
 
-    # матрицы путаницы (картинки)
+    # матрицы путаницы
     class_names = ["No Injury", "Injury"]
     plot_confusion_matrix(cm, class_names, normalize=False,
                           save_path=os.path.join(out_dir, "confusion_matrix_counts.png"),
@@ -544,26 +537,33 @@ def train_xgb(X: pd.DataFrame, y: np.ndarray, groups: np.ndarray, files: np.ndar
                           save_path=os.path.join(out_dir, "confusion_matrix_normalized.png"),
                           title="Confusion Matrix (row-normalized)")
 
-    # важности признаков (top-25)
+    # важности признаков (top-25) через Booster.get_score()
     try:
-        from xgboost import plot_importance
-        fig, ax = plt.subplots(figsize=(8, 10))
-        plot_importance(model, max_num_features=25, importance_type="gain", ax=ax)
-        plt.title("XGBoost Feature Importance (top-25)")
-        plt.tight_layout()
-        plt.savefig(os.path.join(out_dir, "feature_importance_top25.png"), dpi=160)
-        plt.close(fig)
+        score = bst.get_score(importance_type="gain")  # dict: feat_name -> score
+        if len(score) > 0:
+            items = sorted(score.items(), key=lambda x: x[1], reverse=True)[:25]
+            names, vals = zip(*items)
+            plt.figure(figsize=(8,10))
+            y_pos = np.arange(len(names))
+            plt.barh(y_pos, vals)
+            plt.yticks(y_pos, names)
+            plt.gca().invert_yaxis()
+            plt.xlabel("Gain")
+            plt.title("XGBoost Feature Importance (top-25)")
+            plt.tight_layout()
+            plt.savefig(os.path.join(out_dir, "feature_importance_top25.png"), dpi=160)
+            plt.close()
     except Exception as e:
         print("[warn] feature importance plot failed:", e)
 
-    # сохраним модель
-    model.save_model(os.path.join(out_dir, "xgb.json"))
+    # сохранить Booster
+    bst.save_model(os.path.join(out_dir, "xgb.json"))
     json.dump(list(X.columns), open(os.path.join(out_dir, "features_cols.json"), "w", encoding="utf-8"), ensure_ascii=False, indent=2)
 
     print("Saved to:", out_dir)
-    return model, thr, (X_te, y_te, prob_te)
+    return bst, thr, (X_te, y_te, prob_te)
 
-# =============== Cache helpers ===============
+# ===================== Cache helpers =====================
 def extract_and_save(manifest_csv: str, data_dir: str, schema_path: str, fps: int, out_dir: str,
                      workers: int = 1, stride: int = 1, fast_axes: bool = True):
     ensure_dir(out_dir)
@@ -597,21 +597,22 @@ def load_features_cache(features_path: str, labels_path: str, groups_path: str, 
     X = X.select_dtypes(include=[np.number]).copy()
     return X, y, groups, files
 
-# =============== Predict ===============
+# ===================== Predict =====================
 def predict_one(npy_path: str, schema_path: str, out_dir: str, fps: int = 30, stride: int = 1, fast_axes: bool = True):
-    from xgboost import XGBClassifier
     schema = load_schema(schema_path)
     feats = extract_features(npy_path, schema, fps=fps, stride=stride, fast_axes_flag=fast_axes)
     cols = json.load(open(os.path.join(out_dir, "features_cols.json"), "r", encoding="utf-8"))
     X = feats.reindex(columns=cols, fill_value=0.0)
-    model = XGBClassifier()
-    model.load_model(os.path.join(out_dir, "xgb.json"))
+
+    bst = xgb.Booster()
+    bst.load_model(os.path.join(out_dir, "xgb.json"))
+
     thr = float(open(os.path.join(out_dir, "threshold.txt")).read().strip())
-    prob = float(model.predict_proba(X)[:,1][0])
+    prob = float(bst.predict(xgb.DMatrix(X))[0])
     pred = int(prob >= thr)
     return {"file": npy_path, "prob_injury": prob, "pred": pred, "threshold": thr}
 
-# =============== CLI ===============
+# ===================== CLI =====================
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--mode", choices=["extract","train","train_features","predict"], default="train")
@@ -621,20 +622,18 @@ def main():
     ap.add_argument("--out_dir", default="out_xgb")
     ap.add_argument("--fps", type=int, default=30)
     ap.add_argument("--stride", type=int, default=2, help="темп прореживания кадров")
-    ap.add_argument("--fast_axes", action="store_true", help="использовать быстрые оси сегментов (без SVD)")
+    ap.add_argument("--fast_axes", action="store_true", help="быстрые оси сегментов (без SVD)")
     ap.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2)-1), help="число процессов при extract/build")
 
     ap.add_argument("--use_gpu", action="store_true", help="XGBoost GPU (gpu_hist)")
     ap.add_argument("--min_recall_injury", type=float, default=0.95)
     ap.add_argument("--min_recall_noinj",  type=float, default=0.90)
 
-    # cache paths для train_features
     ap.add_argument("--features", help="path to features.parquet")
     ap.add_argument("--labels", help="path to labels.npy")
     ap.add_argument("--groups", help="path to groups.npy")
     ap.add_argument("--files_list", help="path to files.txt")
 
-    # predict
     ap.add_argument("--npy", help="путь к одному .npy (для predict)")
 
     args = ap.parse_args()
