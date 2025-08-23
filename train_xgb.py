@@ -408,29 +408,19 @@ def plot_confusion_matrix(cm: np.ndarray, class_names, normalize: bool, save_pat
 # =============== Threshold search with constraints ===============
 from sklearn.metrics import recall_score, precision_recall_curve, roc_auc_score, average_precision_score, confusion_matrix, classification_report
 
-def find_threshold_with_constraints(y_true, prob, min_recall_pos=0.95, min_recall_neg=0.90):
-    """
-    Ищем порог, чтобы Recall(1)>=min_recall_pos и Recall(0)>=min_recall_neg.
-    Если такого нет — выбираем порог, максимизирующий Recall(1)+Recall(0).
-    """
-    # сканируем по уникальным вероятностям + сетка
-    thr_grid = np.unique(np.concatenate([
-        np.linspace(0.01, 0.99, 199),
-        prob
-    ]))
-    best = {"thr": 0.5, "r1": 0.0, "r0": 0.0, "ok": False, "score": -1}
+def find_threshold_balanced(y_true, prob, target_r1=0.95, target_r0=0.90):
+    thr_grid = np.linspace(0.0, 1.0, 500)
+    best = {"thr": 0.5, "r1": 0.0, "r0": 0.0, "dist": 1e9}
     for thr in thr_grid:
         pred = (prob >= thr).astype(int)
-        # recall pos (1) и neg (0)
         r1 = recall_score(y_true, pred, pos_label=1)
-        r0 = recall_score(y_true, 1-pred, pos_label=1)  # recall класса 0
-        ok = (r1 >= min_recall_pos) and (r0 >= min_recall_neg)
-        score = r1 + r0
-        if ok and (not best["ok"] or score > best["score"]):
-            best.update({"thr": float(thr), "r1": float(r1), "r0": float(r0), "ok": True, "score": float(score)})
-        elif (not best["ok"]) and score > best["score"]:
-            best.update({"thr": float(thr), "r1": float(r1), "r0": float(r0), "ok": False, "score": float(score)})
+        r0 = recall_score(y_true, 1-pred, pos_label=1)
+        # расстояние от цели
+        dist = abs(r1-target_r1) + abs(r0-target_r0)
+        if dist < best["dist"]:
+            best.update({"thr": thr, "r1": r1, "r0": r0, "dist": dist})
     return best
+
 
 # =============== Train XGBoost ===============
 def train_xgb(X: pd.DataFrame, y: np.ndarray, groups: np.ndarray, files: np.ndarray,
@@ -498,7 +488,7 @@ def train_xgb(X: pd.DataFrame, y: np.ndarray, groups: np.ndarray, files: np.ndar
     auroc_te = roc_auc_score(y_te, prob_te)
 
     # подбор порога под цели
-    best = find_threshold_with_constraints(y_dv, prob_dv,
+    best = find_threshold_balanced(y_dv, prob_dv,
                                            min_recall_pos=min_recall_pos,
                                            min_recall_neg=min_recall_neg)
     thr = best["thr"]
