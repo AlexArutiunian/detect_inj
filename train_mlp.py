@@ -275,22 +275,30 @@ def extract_features(path: str, schema: Schema, fps: int = 30) -> pd.DataFrame:
 
 
 # --------------------- Dataset build ---------------------
+
 def build_table(manifest_csv: str, data_dir: str, schema: Schema, fps: int
                ) -> Tuple[pd.DataFrame, np.ndarray, np.ndarray, List[str]]:
     df = pd.read_csv(manifest_csv)
     assert "filename" in df.columns, "В CSV нужна колонка 'filename'"
+
+    # найдём реальное имя колонки с меткой (на случай разного регистра/лишних пробелов)
     y_col = None
     for c in df.columns:
         if "inj" in c.lower():
             y_col = c; break
     assert y_col is not None, "Не найден столбец с меткой (например 'No inj/ inj')"
 
+    # индексы столбцов — так безопаснее, чем обращаться по атрибутам
+    f_idx = df.columns.get_loc("filename")
+    y_idx = df.columns.get_loc(y_col)
+
     X_rows, y_list, groups, files = [], [], [], []
     skipped = 0
-
     print(f"[info] Всего строк в манифесте: {len(df)}")
-    for r in tqdm(df.itertuples(index=False), total=len(df), desc="Extract features"):
-        fn = str(getattr(r, "filename"))
+
+    # itertuples(name=None) -> кортежи без имён; берём по индексам
+    for row in tqdm(df.itertuples(index=False, name=None), total=len(df), desc="Extract features"):
+        fn = str(row[f_idx])
         p = os.path.join(data_dir, fn)
         if not p.endswith(".npy"):
             p += ".npy"
@@ -299,9 +307,10 @@ def build_table(manifest_csv: str, data_dir: str, schema: Schema, fps: int
             tqdm.write(f"[skip] нет файла {p}")
             continue
         try:
-            feats = extract_features(p, schema, fps=fps)   # одна строка, только числа
+            feats = extract_features(p, schema, fps=fps)  # одна строка, только числа
             X_rows.append(feats)
-            y_list.append(label_to_int(getattr(r, y_col)))
+            y_val = label_to_int(row[y_idx])              # <-- берём метку по индексу
+            y_list.append(y_val)
             groups.append(guess_subject_id(fn))
             files.append(p)
         except Exception as e:
@@ -319,7 +328,7 @@ def build_table(manifest_csv: str, data_dir: str, schema: Schema, fps: int
     ok = np.isin(y, [0, 1])
     bad = (~ok).sum()
     if bad:
-        print(f"[warn] удалены {bad} строк(и) из-за некорректных меток")
+        print(f"[warn] удалены {bad} строк(и) из-за некорректных меток: {y[~ok][:5]}")
     X = X.loc[ok].reset_index(drop=True)
     y = y[ok]; groups = groups[ok]; files = files[ok]
 
