@@ -407,19 +407,26 @@ def plot_confusion_matrix(cm: np.ndarray, class_names, normalize: bool, save_pat
 
 # =============== Threshold search with constraints ===============
 from sklearn.metrics import recall_score, precision_recall_curve, roc_auc_score, average_precision_score, confusion_matrix, classification_report
+def find_threshold_balanced(y_true, probs, target_r1=0.95, target_r0=0.90):
+    """
+    Перебираем порог и выбираем тот, где recall(1)>=target_r1 и recall(0)>=target_r0.
+    Возвращаем словарь с ключами thr, r1, r0, ok.
+    """
+    from sklearn.metrics import recall_score
 
-def find_threshold_balanced(y_true, prob, target_r1=0.95, target_r0=0.90):
-    thr_grid = np.linspace(0.0, 1.0, 500)
-    best = {"thr": 0.5, "r1": 0.0, "r0": 0.0, "dist": 1e9}
-    for thr in thr_grid:
-        pred = (prob >= thr).astype(int)
+    best = {"thr": 0.5, "r1": 0.0, "r0": 0.0, "ok": False}
+    for thr in np.linspace(0.01, 0.99, 200):
+        pred = (probs >= thr).astype(int)
         r1 = recall_score(y_true, pred, pos_label=1)
-        r0 = recall_score(y_true, 1-pred, pos_label=1)
-        # расстояние от цели
-        dist = abs(r1-target_r1) + abs(r0-target_r0)
-        if dist < best["dist"]:
-            best.update({"thr": thr, "r1": r1, "r0": r0, "dist": dist})
+        r0 = recall_score(y_true, pred, pos_label=0)
+        if r1 >= target_r1 and r0 >= target_r0:
+            best = {"thr": thr, "r1": r1, "r0": r0, "ok": True}
+            break
+        # даже если не выполнили условия, сохраним лучший баланс по (r1+r0)
+        if (r1 + r0) > (best["r1"] + best["r0"]):
+            best = {"thr": thr, "r1": r1, "r0": r0, "ok": False}
     return best
+
 
 
 # =============== Train XGBoost ===============
@@ -492,7 +499,7 @@ def train_xgb(X: pd.DataFrame, y: np.ndarray, groups: np.ndarray, files: np.ndar
                                            target_r1=min_recall_pos,
                                            target_r0=min_recall_neg)
     thr = best["thr"]
-    print(f"[threshold] chosen={thr:.4f} | dev recall(1)={best['r1']:.3f} recall(0)={best['r0']:.3f}")
+    print(f"[threshold] chosen={thr:.4f} | dev recall(1)={best['r1']:.3f} recall(0)={best['r0']:.3f} ok={best['ok']}")
 
     # тест с этим порогом
     pred_te = (prob_te >= thr).astype(int)
