@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Dict, List, Tuple
 
 warnings.filterwarnings("ignore", category=UserWarning)
-
+schema_path_global = None
 # --------------------- Utils ---------------------
 def seed_all(s=42):
     random.seed(s); np.random.seed(s)
@@ -167,25 +167,61 @@ def detect_gait_events(foot_centroid: np.ndarray, fps: int = 30) -> Tuple[np.nda
     return np.asarray(fs, dtype=int), np.asarray(fo, dtype=int)
 
 # --------------------- Фичи из одного .npy ---------------------
-def extract_features(path: str, schema: Schema, fps: int = 30) -> pd.DataFrame:
+def extract_features(path: str, schema: Schema, fps: int = 30, stride: int = 1, fast_axes: bool = False) -> pd.DataFrame:
     """
-    Возвращает ОДНУ строку с числовыми фичами по треку.
-    Никаких строковых колонок (например, side/file/group) в таблицу не добавляет.
+    Возвращает одну строку с числовыми фичами по треку.
+    Поддерживает ускорения:
+      - stride: берём каждый s-й кадр (fps_new = fps/stride)
+      - fast_axes: без покадрового SVD; оси сегментов как вектор между центроидами соседних сегментов
     """
     A = load_npy(path, schema)              # (T,N,3)
-    T = A.shape[0]
+    if stride > 1:
+        A = A[::stride]
+        fps = max(1, int(round(fps / stride)))
 
-    # сегменты из схемы
+    T = A.shape[0]
     seg = {k: A[:, idx, :] for k, idx in schema.groups.items() if len(idx) > 0}
     if not seg:
         raise ValueError("По схеме не нашлось ни одного сегмента")
 
-    # нормализация
     seg = center_and_scale(seg)
 
-    # оси сегментов и центроиды
-    axes = {k: segment_axis_series(v) for k, v in seg.items()}
-    cogs = {k: centroid_series(v) for k, v in seg.items()}
+    # центроиды сегментов (быстро)
+    cogs = {k: centroid_series(v) for k, v in seg.items()}  # (T,3) на сегмент
+
+    if fast_axes:
+        # Быстрые оси: направим бедро к голени, голень к стопе, таз к среднему бедра
+        axes = {}
+        for side in ("L", "R"):
+            th = cogs.get(f"{side}_thigh")
+            sh = cogs.get(f"{side}_shank")
+            ft = cogs.get(f"{side}_foot")
+            if th is not None and sh is not None:
+                v = sh - th
+                axes[f"{side}_thigh"] = v / (np.linalg.norm(v, axis=1, keepdims=True) + 1e-8)
+            if sh is not None and ft is not None:
+                v = ft - sh
+                axes[f"{side}_shank"] = v / (np.linalg.norm(v, axis=1, keepdims=True) + 1e-8)
+            if ft is not None:
+                # ось стопы: проекция направления движения сегмента (разность) или toe-heel недоступны => берём производную
+                dv = np.vstack([ft[1:] - ft[:-1], ft[[-1]] - ft[[-2]]])
+                axes[f"{side}_foot"] = dv / (np.linalg.norm(dv, axis=1, keepdims=True) + 1e-8)
+        # таз: направим от таза к среднему центроиду бедер, если есть
+        pel = cogs.get("pelvis")
+        thL = cogs.get("L_thigh"); thR = cogs.get("R_thigh")
+        if pel is not None and (thL is not None or thR is not None):
+            tgt = pel.copy()
+            if thL is not None and thR is not None:
+                tgt = (thL + thR) / 2.0
+            elif thL is not None:
+                tgt = thL
+            elif thR is not None:
+                tgt = thR
+            v = tgt - pel
+            axes["pelvis"] = v / (np.linalg.norm(v, axis=1, keepdims=True) + 1e-8)
+    else:
+        # Оси через покадровый SVD (точнее, но медленнее)
+        axes = {k: segment_axis_series(v) for k, v in seg.items()}
 
     rows = []
     for side in ("L", "R"):
@@ -276,75 +312,102 @@ def extract_features(path: str, schema: Schema, fps: int = 30) -> pd.DataFrame:
 
 # --------------------- Dataset build ---------------------
 
-def build_table(manifest_csv: str, data_dir: str, schema: Schema, fps: int
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from tqdm import tqdm
+
+def _extract_one(args):
+    p, fn, y_val, schema_path, fps, stride, fast_axes = args
+    # локальная загрузка схемы в процессе (дешёвая операция)
+    schema = load_schema(schema_path)
+    feats = extract_features(p, schema, fps=fps, stride=stride, fast_axes=fast_axes)
+    # вернём как (features_dict, y, group, file)
+    d = feats.iloc[0].to_dict()
+    return d, int(y_val), guess_subject_id(fn), p
+
+def build_table(manifest_csv: str, data_dir: str, schema: Schema, fps: int,
+                workers: int = 1, stride: int = 1, fast_axes: bool = False
                ) -> Tuple[pd.DataFrame, np.ndarray, np.ndarray, List[str]]:
     df = pd.read_csv(manifest_csv)
     assert "filename" in df.columns, "В CSV нужна колонка 'filename'"
 
-    # найдём реальное имя колонки с меткой (на случай разного регистра/лишних пробелов)
     y_col = None
     for c in df.columns:
         if "inj" in c.lower():
             y_col = c; break
     assert y_col is not None, "Не найден столбец с меткой (например 'No inj/ inj')"
 
-    # индексы столбцов — так безопаснее, чем обращаться по атрибутам
     f_idx = df.columns.get_loc("filename")
     y_idx = df.columns.get_loc(y_col)
 
-    X_rows, y_list, groups, files = [], [], [], []
-    skipped = 0
-    print(f"[info] Всего строк в манифесте: {len(df)}")
-
-    # itertuples(name=None) -> кортежи без имён; берём по индексам
-    for row in tqdm(df.itertuples(index=False, name=None), total=len(df), desc="Extract features"):
+    tasks = []
+    for row in df.itertuples(index=False, name=None):
         fn = str(row[f_idx])
         p = os.path.join(data_dir, fn)
-        if not p.endswith(".npy"):
-            p += ".npy"
-        if not os.path.exists(p):
-            skipped += 1
-            tqdm.write(f"[skip] нет файла {p}")
+        if not p.endswith(".npy"): p += ".npy"
+        if not os.path.exists(p): 
             continue
-        try:
-            feats = extract_features(p, schema, fps=fps)  # одна строка, только числа
-            X_rows.append(feats)
-            y_val = label_to_int(row[y_idx])              # <-- берём метку по индексу
-            y_list.append(y_val)
-            groups.append(guess_subject_id(fn))
-            files.append(p)
-        except Exception as e:
-            skipped += 1
-            tqdm.write(f"[skip] {p} -> {type(e).__name__} {e}")
+        y_val = label_to_int(row[y_idx])
+        tasks.append((p, fn, y_val,  # данные
+                      # передаём путь к schema, чтобы каждый процесс сам загрузил (избегаем больших pickles)
+                      schema_path_global, fps, stride, fast_axes))
 
-    if not X_rows:
-        raise RuntimeError("Не удалось собрать ни одной строки с фичами. Проверь пути и schema_joints.json")
+    if not tasks:
+        raise RuntimeError("Нет валидных путей к .npy")
 
-    X = pd.concat(X_rows, ignore_index=True).fillna(0.0)
+    print(f"[info] запуск извлечения фич: {len(tasks)} файлов | workers={workers} | stride={stride} | fast_axes={fast_axes}")
+    X_rows = []; y_list = []; groups = []; files = []
+    skipped = 0
+
+    if workers <= 1:
+        for t in tqdm(tasks, desc="Extract features"):
+            try:
+                d, yv, grp, fp = _extract_one(t)
+                X_rows.append(d); y_list.append(yv); groups.append(grp); files.append(fp)
+            except Exception as e:
+                skipped += 1
+                tqdm.write(f"[skip] {t[0]} -> {type(e).__name__} {e}")
+    else:
+        with ProcessPoolExecutor(max_workers=workers) as ex:
+            futs = [ex.submit(_extract_one, t) for t in tasks]
+            for f in tqdm(as_completed(futs), total=len(futs), desc="Extract features (parallel)"):
+                try:
+                    d, yv, grp, fp = f.result()
+                    X_rows.append(d); y_list.append(yv); groups.append(grp); files.append(fp)
+                except Exception as e:
+                    skipped += 1
+                    # tqdm.write печатает, не ломая прогресс-бар
+                    tqdm.write(f"[skip] -> {type(e).__name__} {e}")
+
+    X = pd.DataFrame(X_rows).fillna(0.0)
     y = np.asarray(y_list, dtype=np.int64)
     groups = np.asarray(groups)
     files = np.asarray(files)
 
-    ok = np.isin(y, [0, 1])
+    ok = np.isin(y, [0,1])
     bad = (~ok).sum()
     if bad:
-        print(f"[warn] удалены {bad} строк(и) из-за некорректных меток: {y[~ok][:5]}")
+        print(f"[warn] удалены {bad} строк(и) из-за некорректных меток")
     X = X.loc[ok].reset_index(drop=True)
     y = y[ok]; groups = groups[ok]; files = files[ok]
 
-    # На всякий случай: оставим только числовые признаки
     X = X.select_dtypes(include=[np.number]).copy()
 
     print(f"[info] Собрано примеров: {len(X)} (пропущено: {skipped})")
     print(f"[info] Позитивов (Injury): {(y==1).sum()} | Негативов (No Injury): {(y==0).sum()}")
     print(f"[info] Число признаков: {X.shape[1]}")
     return X, y, groups, files
-def extract_and_save(manifest_csv: str, data_dir: str, schema_path: str, fps: int, out_dir: str):
-    """Считает фичи по всему датасету и сохраняет кэш на диск."""
-    ensure_dir(out_dir)
-    schema = load_schema(schema_path)
-    X, y, groups, files = build_table(manifest_csv, data_dir, schema, fps=fps)
 
+
+def extract_and_save(manifest_csv: str, data_dir: str, schema_path: str, fps: int, out_dir: str,
+                     workers: int = 1, stride: int = 1, fast_axes: bool = False):
+    ensure_dir(out_dir)
+    # установим глобальный путь для форков
+    global schema_path_global
+    schema_path_global = schema_path
+    schema = load_schema(schema_path)
+    X, y, groups, files = build_table(manifest_csv, data_dir, schema, fps=fps,
+                                      workers=workers, stride=stride, fast_axes=fast_axes)
+ 
     # сохраняем
     X.to_parquet(os.path.join(out_dir, "features.parquet"))  # быстрая загрузка и без потерь типов
     np.save(os.path.join(out_dir, "labels.npy"), y)
@@ -584,6 +647,14 @@ def main():
     ap.add_argument("--weight_decay", type=float, default=1e-4)
     ap.add_argument("--fps", type=int, default=30)
     ap.add_argument("--npy", help="путь к .npy (для predict)")
+    
+    ap.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) - 1),
+                help="количество процессов для извлечения фич")
+    ap.add_argument("--stride", type=int, default=2,  # 60 FPS -> 30 FPS по умолчанию
+                    help="прореживание временной оси: берём каждый s-й кадр")
+    ap.add_argument("--fast_axes", action="store_true",
+                    help="быстрые оси сегментов без SVD (centroid-to-centroid)")
+
 
     # пути к кэшу (для train_features)
     ap.add_argument("--features", help="path to features.parquet (для train_features)")
@@ -593,16 +664,26 @@ def main():
 
     args = ap.parse_args()
     seed_all(42)
+    
+    global schema_path_global
+    schema_path_global = args.schema
+
 
     if args.mode == "extract":
         assert args.csv and args.data_dir, "--csv и --data_dir обязательны в режиме extract"
-        extract_and_save(args.csv, args.data_dir, args.schema, fps=args.fps, out_dir=args.out_dir)
+        extract_and_save(args.csv, args.data_dir, args.schema, fps=args.fps,
+                 out_dir=args.out_dir, workers=args.workers, stride=args.stride, fast_axes=args.fast_axes)
+
         return
 
     if args.mode == "train":
         assert args.csv and args.data_dir, "--csv и --data_dir обязательны в режиме train"
         schema = load_schema(args.schema)
-        X, y, groups, files = build_table(args.csv, args.data_dir, schema, fps=args.fps)
+        X, y, groups, files = build_table(
+            args.csv, args.data_dir, schema, fps=args.fps,
+            workers=args.workers, stride=args.stride, fast_axes=args.fast_axes
+        )
+
         print(f"[info] samples={len(X)}, positives={(y==1).sum()}, features={X.shape[1]}")
         train_nn(X, y, groups, files, args.out_dir,
                  epochs=args.epochs, batch_size=args.batch_size, lr=args.lr, weight_decay=args.weight_decay)
