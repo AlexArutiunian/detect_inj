@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from sklearn.utils.class_weight import compute_class_weight
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
@@ -458,7 +459,7 @@ def train_xgb(X: pd.DataFrame, y: np.ndarray, groups: np.ndarray, files: np.ndar
     split_df.to_csv(os.path.join(out_dir, "split_subjectwise.csv"), index=False)
 
     # модель
-    scale_pos_weight = float((y[tr_idx]==0).sum() / max(1,(y[tr_idx]==1).sum()))
+        # модель + авто-веса классов (balanced) через sample_weight
     params = dict(
         n_estimators=1600,
         learning_rate=0.03,
@@ -467,10 +468,9 @@ def train_xgb(X: pd.DataFrame, y: np.ndarray, groups: np.ndarray, files: np.ndar
         subsample=0.85,
         colsample_bytree=0.9,
         reg_lambda=1.0,
-        tree_method="hist" if not use_gpu else "gpu_hist",
+        tree_method="gpu_hist" if use_gpu else "hist",
         eval_metric="logloss",
         random_state=seed,
-        scale_pos_weight=scale_pos_weight,
         n_jobs=0
     )
     model = XGBClassifier(**params)
@@ -479,10 +479,25 @@ def train_xgb(X: pd.DataFrame, y: np.ndarray, groups: np.ndarray, files: np.ndar
     X_dv, y_dv = X.iloc[dv_idx], y[dv_idx]
     X_te, y_te = X.iloc[te_idx], y[te_idx]
 
+    # balanced class weights по трейну
+    classes = np.array([0, 1], dtype=np.int32)
+    cw = compute_class_weight(class_weight="balanced", classes=classes, y=y_tr)
+    w0, w1 = float(cw[0]), float(cw[1])
+    print(f"[train] class_weight(balanced): w0(NoInjury)={w0:.3f}, w1(Injury)={w1:.3f}")
+
+    # sample weights для train/dev
+    sw_tr = np.where(y_tr == 0, w0, w1).astype(np.float32)
+    sw_dv = np.where(y_dv == 0, w0, w1).astype(np.float32)
+
     print("[train] XGBoost fitting...")
-    model.fit(X_tr, y_tr,
-              eval_set=[(X_tr, y_tr), (X_dv, y_dv)],
-              verbose=50, early_stopping_rounds=100)
+    model.fit(
+        X_tr, y_tr,
+        sample_weight=sw_tr,
+        eval_set=[(X_tr, y_tr), (X_dv, y_dv)],
+        eval_sample_weight=[sw_tr, sw_dv],
+        verbose=50,
+        early_stopping_rounds=100
+    )
 
     # вероятности
     prob_dv = model.predict_proba(X_dv)[:,1]
