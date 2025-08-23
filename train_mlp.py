@@ -167,39 +167,40 @@ def detect_gait_events(foot_centroid: np.ndarray, fps: int = 30) -> Tuple[np.nda
 
 # --------------------- Фичи из одного .npy ---------------------
 def extract_features(path: str, schema: Schema, fps: int = 30) -> pd.DataFrame:
+    """
+    Возвращает ОДНУ строку с числовыми фичами по треку.
+    Никаких строковых колонок (например, side/file/group) в таблицу не добавляет.
+    """
     A = load_npy(path, schema)              # (T,N,3)
     T = A.shape[0]
-    # соберём набор сегментов (много маркеров каждый)
+
+    # сегменты из схемы
     seg = {k: A[:, idx, :] for k, idx in schema.groups.items() if len(idx) > 0}
-    if not seg: 
+    if not seg:
         raise ValueError("По схеме не нашлось ни одного сегмента")
 
     # нормализация
     seg = center_and_scale(seg)
 
-    # оси сегментов
+    # оси сегментов и центроиды
     axes = {k: segment_axis_series(v) for k, v in seg.items()}
     cogs = {k: centroid_series(v) for k, v in seg.items()}
 
-    # суставные углы по осям
-    feats_per_cycle = []
-    out_rows = []
-
+    rows = []
     for side in ("L", "R"):
-        foot = cogs.get(f"{side}_foot"); sh = axes.get(f"{side}_shank")
-        th  = axes.get(f"{side}_thigh"); pel = axes.get("pelvis")
+        foot = cogs.get(f"{side}_foot")
+        sh   = axes.get(f"{side}_shank")
+        th   = axes.get(f"{side}_thigh")
+        pel  = axes.get("pelvis")
         if foot is None or sh is None or th is None or pel is None:
             continue
 
         fs, fo = detect_gait_events(foot, fps=fps)
         if len(fs) < 2:
-            # резерв: одна "псевдофаза" всей записи
             fs = np.array([0, T-1], dtype=int)
 
-        # временные ряды углов
-        knee = angle_between(th, sh)                # рад
-        hip  = angle_between(pel, th)               # рад
-        # для голеностопа сравним оси стопы и голени, если есть ось стопы
+        knee = angle_between(th, sh)
+        hip  = angle_between(pel, th)
         foot_axis = axes.get(f"{side}_foot")
         ankle = angle_between(sh, foot_axis) if foot_axis is not None else np.zeros(T)
 
@@ -211,93 +212,106 @@ def extract_features(path: str, schema: Schema, fps: int = 30) -> pd.DataFrame:
             step_t = (b - a) / fps
             pelvis_y = cogs["pelvis"][:,1]
             vo = float(np.max(pelvis_y[segslice]) - np.min(pelvis_y[segslice]))
-            # длина шага: горизонтальная (x,z) компонента перемещения таза
             p0 = cogs["pelvis"][a, [0,2]]; p1 = cogs["pelvis"][b, [0,2]]
             step_len = float(np.linalg.norm(p1 - p0))
-            # stance: FS->FO внутри шага
             fo_in = fo[(fo > a) & (fo < b)]
             stance = float((fo_in[0]-a)/fps) if len(fo_in) else np.nan
 
-            row = {
-                "side": side,
+            rows.append({
+                "side": 0 if side=="L" else 1,   # числовая кодировка, если понадобится
                 "step_time": step_t,
                 "cadence": 60.0/step_t if step_t > 1e-6 else np.nan,
                 "step_len": step_len,
                 "pelvis_vert_osc": vo,
                 "rom_knee": float(np.max(knee[segslice]) - np.min(knee[segslice])),
-                "rom_hip": float(np.max(hip[segslice])  - np.min(hip[segslice])),
+                "rom_hip":  float(np.max(hip[segslice])  - np.min(hip[segslice])),
                 "rom_ankle": float(np.max(ankle[segslice]) - np.min(ankle[segslice])),
                 "stance_time": stance,
-            }
-            feats_per_cycle.append(row)
+            })
 
-    df = pd.DataFrame(feats_per_cycle)
+    df = pd.DataFrame(rows)
     if df.empty:
-        # fallback: агрегаты по всей записи без циклов
-        row = {
-            "side": "U",
-            "step_time": np.nan, "cadence": np.nan, "step_len": float(np.linalg.norm(cogs["pelvis"][[-1],[0,2]] - cogs["pelvis"][[0],[0,2]])),
-            "pelvis_vert_osc": float(np.max(cogs["pelvis"][:,1]) - np.min(cogs["pelvis"][:,1])),
-            "rom_knee": float(np.max(angle_between(axes.get("L_thigh", axes.get("R_thigh")), axes.get("L_shank", axes.get("R_shank"))))),
-            "rom_hip":  float(np.max(angle_between(axes.get("pelvis"), axes.get("L_thigh", axes.get("R_thigh"))))),
-            "rom_ankle": float(0.0),
-            "stance_time": np.nan
-        }
-        df = pd.DataFrame([row])
+        # fallback — одна строка с минимальным набором чисел
+        return pd.DataFrame([{
+            "step_time_median": np.nan, "step_time_mean": np.nan, "step_time_std": 0.0,
+            "cadence_median": np.nan, "cadence_mean": np.nan, "cadence_std": 0.0,
+            "step_len_median": 0.0, "step_len_mean": 0.0, "step_len_std": 0.0,
+            "pelvis_vert_osc_median": 0.0, "pelvis_vert_osc_mean": 0.0, "pelvis_vert_osc_std": 0.0,
+            "rom_knee_median": 0.0, "rom_knee_mean": 0.0, "rom_knee_std": 0.0,
+            "rom_hip_median": 0.0,  "rom_hip_mean": 0.0,  "rom_hip_std": 0.0,
+            "rom_ankle_median": 0.0, "rom_ankle_mean": 0.0, "rom_ankle_std": 0.0,
+            "stance_time_median": np.nan, "stance_time_mean": np.nan, "stance_time_std": 0.0,
+            "asym_step_time": np.nan, "asym_step_len": np.nan, "asym_rom_knee": np.nan,
+            "asym_rom_hip": np.nan, "asym_rom_ankle": np.nan, "asym_stance_time": np.nan,
+            "asym_cadence": np.nan, "asym_pelvis_vert_osc": np.nan,
+            "cycles_count": 0
+        }])
 
-    # агрегаты по треку
-    agg = df.groupby(lambda _: True).agg(["median","mean","std"]).fillna(0.0)
-    agg.columns = [f"{c}_{s}" for c,s in agg.columns]
+    # ---- агрегируем ТОЛЬКО ЧИСЛОВЫЕ колонки (без side как категории) ----
+    num = df.select_dtypes(include=[np.number]).copy()
+    # отделим side, чтобы не попадала в agg
+    side_col = num.pop("side")
 
-    # асимметрии, если обе стороны есть
-    if set(df["side"]) >= {"L","R"}:
-        def med(side, col): 
-            x = df.loc[df["side"]==side, col]
-            return float(np.median(x)) if len(x) else np.nan
+    agg = num.agg(["median", "mean", "std"]).T
+    agg.columns = [f"{c}_{s}" for c, s in agg.columns.str.split("_", n=1)]
+    agg = agg.T.T  # просто чтобы не трогать порядок
+
+    # асимметрии по медианам L/R (если обе стороны есть)
+    if (side_col==0).any() and (side_col==1).any():
+        def med(side, col):
+            v = num.loc[side_col==side, col]
+            return float(np.median(v)) if len(v) else np.nan
         for col in ["step_time","step_len","rom_knee","rom_hip","rom_ankle","stance_time","cadence","pelvis_vert_osc"]:
-            L = med("L", col); R = med("R", col)
+            L = med(0, col); R = med(1, col)
             denom = (abs(L)+abs(R))/2 + 1e-6
             agg[f"asym_{col}"] = abs(L-R)/denom
 
-    agg["cycles_count"] = len(df)
+    agg["cycles_count"] = len(num)
     return agg.reset_index(drop=True)
 
+
 # --------------------- Dataset build ---------------------
-def build_table(manifest_csv: str, data_dir: str, schema: Schema, fps: int) -> Tuple[pd.DataFrame, np.ndarray, np.ndarray, List[str]]:
+def build_table(manifest_csv: str, data_dir: str, schema: Schema, fps: int
+               ) -> Tuple[pd.DataFrame, np.ndarray, np.ndarray, List[str]]:
     df = pd.read_csv(manifest_csv)
     assert "filename" in df.columns, "В CSV нужна колонка 'filename'"
-    assert any(c.lower().startswith("no inj") or "inj" in c.lower() for c in df.columns), "Нужна колонка с меткой (например 'No inj/ inj')"
-
-    # найдём столбец с меткой
     y_col = None
     for c in df.columns:
         if "inj" in c.lower():
             y_col = c; break
-    X_rows = []; y = []; groups = []; files = []
+    assert y_col is not None, "Не найден столбец с меткой (например 'No inj/ inj')"
+
+    X_rows, y_list, groups, files = [], [], [], []
     for _, r in df.iterrows():
         fn = str(r["filename"])
         p = os.path.join(data_dir, fn)
-        if not p.endswith(".npy"): p += ".npy"
+        if not p.endswith(".npy"):
+            p += ".npy"
         if not os.path.exists(p):
             print("[skip] нет файла", p); continue
         try:
-            feats = extract_features(p, schema, fps=fps)   # одна строка
-            feats["file"] = p
-            feats["group"] = guess_subject_id(fn)
+            feats = extract_features(p, schema, fps=fps)   # одна строка, только числа
             X_rows.append(feats)
-            y.append(label_to_int(r[y_col]))
-            groups.append(feats["group"][0]); files.append(p)
+            y_list.append(label_to_int(r[y_col]))
+            groups.append(guess_subject_id(fn))
+            files.append(p)
         except Exception as e:
             print("[skip]", p, "->", type(e).__name__, e)
 
     X = pd.concat(X_rows, ignore_index=True).fillna(0.0)
-    y = np.asarray(y, dtype=np.int64)
+    y = np.asarray(y_list, dtype=np.int64)
     groups = np.asarray(groups)
     files = np.asarray(files)
-    # уберём тех, у кого не удалось распарсить метку
-    ok = np.isin(y, [0,1])
-    X, y, groups, files = X.loc[ok], y[ok], groups[ok], files[ok]
+
+    ok = np.isin(y, [0, 1])
+    X = X.loc[ok].reset_index(drop=True)
+    y = y[ok]; groups = groups[ok]; files = files[ok]
+
+    # На всякий случай: оставим только числовые признаки
+    X = X.select_dtypes(include=[np.number]).copy()
+
     return X, y, groups, files
+
 
 # --------------------- Torch model ---------------------
 def build_mlp(in_dim: int):
