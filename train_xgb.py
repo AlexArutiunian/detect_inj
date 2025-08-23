@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""
+XGBoost (injury / no-injury) c расширенными фичами ходьбы.
+- Extract (параллельно) -> cache
+- Train (subject-wise split 60/20/20) c class weights
+- Порог под цели (recall(1), recall(0))
+- Визуализации: CM, ROC/PR, FI
+- Predict 1 файл
+"""
 
 import os, json, argparse, random, re, warnings, itertools
 from dataclasses import dataclass
@@ -9,11 +17,15 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 from concurrent.futures import ProcessPoolExecutor, as_completed
-import matplotlib.pyplot as plt
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
-# ===================== GLOBAL (для форков) =====================
+# ---- Matplotlib (headless) ----
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+# ===================== GLOBAL для форков =====================
 schema_path_global = None
 
 # ===================== Utils =====================
@@ -147,12 +159,28 @@ def iqr(a: np.ndarray):
     return float(q75 - q25)
 
 # ===================== Feature Extraction =====================
+def harmonic_ratio(sig, fps, stride_freq=None):
+    sig = np.asarray(sig, float)
+    sig = sig - np.nanmean(sig)
+    n = sig.size
+    if n < 16: return (np.nan, np.nan)
+    if stride_freq is None:
+        stride_freq = fps / n  # fallback; потом поправим из step_time
+    f = np.fft.rfftfreq(n, d=1.0/fps)
+    P = np.abs(np.fft.rfft(sig*np.hanning(n)))**2
+    k0 = np.argmax(f >= max(stride_freq, 1e-6))
+    even = odd = 0.0
+    for h in range(1, 8):
+        k = k0*h
+        if k < len(P):
+            if h % 2 == 0: even += P[k]
+            else: odd += P[k]
+    # по классике: VT HR = even/odd, ML HR = odd/even
+    return float(even/max(odd,1e-12)), float(odd/max(even,1e-12))
+
 def extract_features(path: str, schema: Schema, fps: int = 30, stride: int = 1, fast_axes_flag: bool = True) -> pd.DataFrame:
     """
     Возвращает одну строку числовых признаков.
-    Ускорения:
-      - stride: берём каждый s-й кадр
-      - fast_axes_flag: быстрые оси сегментов (centroid-to-centroid)
     """
     A = load_npy(path, schema)
     if stride > 1:
@@ -197,13 +225,62 @@ def extract_features(path: str, schema: Schema, fps: int = 30, stride: int = 1, 
             step_t = (b-a)/fps
             pelvis_y = pelvis[:,1]
             pelvis_z = pelvis[:,2]  # ML
+            pelvis_x = pelvis[:,0]  # AP
             vo = float(np.max(pelvis_y[segslice]) - np.min(pelvis_y[segslice]))
             ml = float(np.max(pelvis_z[segslice]) - np.min(pelvis_z[segslice]))
+            ap = float(np.max(pelvis_x[segslice]) - np.min(pelvis_x[segslice]))
             p0 = pelvis[a, [0,2]]; p1 = pelvis[b, [0,2]]
             step_len = float(np.linalg.norm(p1 - p0))
             fo_in = fo[(fo > a) & (fo < b)]
             stance = float((fo_in[0]-a)/fps) if len(fo_in) else np.nan
             speed = step_len/step_t if step_t>1e-6 else 0.0
+
+            # STRIDE (FS->FS той же ноги)
+            if i+2 <= len(fs)-1:
+                a2 = fs[i+2]
+                stride_time = (a2 - a) / fps
+                p2 = pelvis[a2, [0,2]]
+                stride_len = float(np.linalg.norm(p2 - p0))
+            else:
+                stride_time = np.nan
+                stride_len  = np.nan
+
+            # duty/swing
+            duty_factor = stance/step_t if (np.isfinite(stance) and step_t>1e-6) else np.nan
+            swing_time  = step_t - stance if np.isfinite(stance) else np.nan
+
+            # угловые скорости
+            def peak_omega(theta):
+                if theta.size < 3: return 0.0
+                dt = 1.0 / fps
+                omg = np.gradient(theta[segslice]) / dt
+                return float(np.nanmax(np.abs(omg)))
+            knee_omega  = peak_omega(knee)
+            hip_omega   = peak_omega(hip)
+            ankle_omega = peak_omega(ankle)
+
+            # toe-out (горизонтальный угол оси стопы к оси таза)
+            toe_out = np.nan
+            foot_axis_vec = foot_axis
+            pel_axis_vec  = pel
+            if foot_axis_vec is not None and pel_axis_vec is not None:
+                fu = foot_axis_vec[segslice][:,[0,2]]
+                pu = pel_axis_vec [segslice][:,[0,2]]
+                fu = fu / (np.linalg.norm(fu, axis=1, keepdims=True)+1e-8)
+                pu = pu / (np.linalg.norm(pu, axis=1, keepdims=True)+1e-8)
+                ang = np.arccos(np.clip((fu*pu).sum(axis=1), -1.0, 1.0))
+                toe_out = float(np.nanmean(np.abs(ang)))
+
+            # clearance: min высота стопы в свинге
+            clearance = np.nan
+            if len(fo) and len(fs) >= 2:
+                for j in range(len(fo)):
+                    if fo[j] > a and fo[j] < b:
+                        y_foot = foot[:,1]
+                        base   = np.nanmedian(y_foot[a-1:a+2]) if a>0 else y_foot[a]
+                        swing_min = float(np.nanmin(y_foot[fo[j]:b]))
+                        clearance = swing_min - base
+                        break
 
             rows.append({
                 "side": 0 if side=="L" else 1,
@@ -213,10 +290,21 @@ def extract_features(path: str, schema: Schema, fps: int = 30, stride: int = 1, 
                 "step_speed": speed,
                 "pelvis_vert_osc": vo,
                 "pelvis_ml_osc": ml,
+                "pelvis_ap_osc": ap,
                 "rom_knee": float(np.max(knee[segslice]) - np.min(knee[segslice])),
                 "rom_hip":  float(np.max(hip[segslice])  - np.min(hip[segslice])),
                 "rom_ankle": float(np.max(ankle[segslice]) - np.min(ankle[segslice])),
                 "stance_time": stance,
+                "stride_time": stride_time,
+                "stride_len":  stride_len,
+                "duty_factor": duty_factor,
+                "swing_time":  swing_time,
+                "knee_omega_peak":  knee_omega,
+                "hip_omega_peak":   hip_omega,
+                "ankle_omega_peak": ankle_omega,
+                "foot_out_angle_mean": toe_out,
+                "foot_clearance": clearance,
+                "speed_norm_step_len": step_len/(speed+1e-6),
             })
 
     df = pd.DataFrame(rows)
@@ -228,64 +316,90 @@ def extract_features(path: str, schema: Schema, fps: int = 30, stride: int = 1, 
             "step_speed_median": 0.0, "step_speed_mean": 0.0, "step_speed_std": 0.0,
             "pelvis_vert_osc_median": 0.0, "pelvis_vert_osc_mean": 0.0, "pelvis_vert_osc_std": 0.0,
             "pelvis_ml_osc_median": 0.0, "pelvis_ml_osc_mean": 0.0, "pelvis_ml_osc_std": 0.0,
+            "pelvis_ap_osc_median": 0.0, "pelvis_ap_osc_mean": 0.0, "pelvis_ap_osc_std": 0.0,
             "rom_knee_median": 0.0, "rom_knee_mean": 0.0, "rom_knee_std": 0.0,
             "rom_hip_median": 0.0,  "rom_hip_mean": 0.0,  "rom_hip_std": 0.0,
             "rom_ankle_median": 0.0, "rom_ankle_mean": 0.0, "rom_ankle_std": 0.0,
             "stance_time_median": np.nan, "stance_time_mean": np.nan, "stance_time_std": 0.0,
             "cv_step_time": np.nan, "cv_step_len": np.nan, "cv_cadence": np.nan, "cv_stance_time": np.nan,
             "iqr_step_time": np.nan, "iqr_step_len": np.nan, "iqr_cadence": np.nan, "iqr_stance_time": np.nan,
-            "asym_step_time": np.nan, "asym_step_len": np.nan, "asym_rom_knee": np.nan,
-            "asym_rom_hip": np.nan, "asym_rom_ankle": np.nan, "asym_stance_time": np.nan,
-            "asym_cadence": np.nan, "asym_pelvis_vert_osc": np.nan, "asym_pelvis_ml_osc": np.nan,
             "pelvis_jerk_rms_y": 0.0, "pelvis_jerk_rms_z": 0.0,
             "step_width_ml": np.nan, "cycles_count": 0,
-            "path_straightness": 0.0
+            "path_straightness": 0.0,
+            "pelvis_hr_vert": np.nan, "pelvis_hr_ml": np.nan,
+            "path_curv_mean": np.nan, "path_curv_rms": np.nan
         }])
 
+    # --- агрегаты по шагам
     num = df.select_dtypes(include=[np.number]).copy()
     side_col = num.pop("side")
-
     agg_tbl = num.agg(["median","mean","std"]).T
     flat = {f"{feat}_{stat}": float(agg_tbl.loc[feat, stat])
             for feat in agg_tbl.index for stat in agg_tbl.columns}
 
-    for col in ["step_time","step_len","cadence","stance_time","pelvis_vert_osc","pelvis_ml_osc"]:
-        v = num[col].values
+    # CV/IQR (расширенный список)
+    cv_cols = ["step_time","step_len","cadence","stance_time",
+               "stride_time","stride_len","duty_factor","swing_time",
+               "pelvis_vert_osc","pelvis_ml_osc","pelvis_ap_osc",
+               "speed_norm_step_len","foot_out_angle_mean","foot_clearance"]
+    for col in cv_cols:
+        v = num[col].values if col in num.columns else np.array([np.nan])
         if np.isfinite(v).sum() >= 2:
             m = np.nanmean(v); s = np.nanstd(v)
             flat[f"cv_{col}"] = float(s/(abs(m)+1e-6))
-            flat[f"iqr_{col}"] = float(np.nanpercentile(v, 75) - np.nanpercentile(v, 25))
+            flat[f"iqr_{col}"] = iqr(v)
         else:
             flat[f"cv_{col}"] = np.nan; flat[f"iqr_{col}"] = np.nan
 
+    # асимметрии по медианам L/R
     if (side_col==0).any() and (side_col==1).any():
         def med(side, col):
-            vv = num.loc[side_col==side, col]
+            vv = num.loc[side_col==side, col] if col in num.columns else pd.Series(dtype=float)
             return float(np.median(vv)) if len(vv) else np.nan
-        for col in ["step_time","step_len","rom_knee","rom_hip","rom_ankle",
-                    "stance_time","cadence","pelvis_vert_osc","pelvis_ml_osc"]:
+        asym_cols = ["step_time","step_len","stride_time","stride_len",
+                     "duty_factor","swing_time",
+                     "rom_knee","rom_hip","rom_ankle",
+                     "stance_time","cadence","pelvis_vert_osc","pelvis_ml_osc",
+                     "foot_out_angle_mean","foot_clearance"]
+        for col in asym_cols:
             L = med(0,col); R = med(1,col)
             denom = (abs(L)+abs(R))/2 + 1e-6
             flat[f"asym_{col}"] = abs(L-R)/denom
 
+    # плавность (jerk RMS) таза
     def jerk_rms(sig):
         v  = np.gradient(sig)
         a  = np.gradient(v)
         j  = np.gradient(a)
         return float(np.sqrt(np.nanmean(j*j)))
-    pelvis = cogs["pelvis"]
     flat["pelvis_jerk_rms_y"] = jerk_rms(pelvis[:,1])
     flat["pelvis_jerk_rms_z"] = jerk_rms(pelvis[:,2])
 
-    if "L_foot" in cogs and "R_foot" in cogs:
-        flat["step_width_ml"] = float(np.nanmedian(np.abs(cogs["L_foot"][:,2] - cogs["R_foot"][:,2])))
-    else:
-        flat["step_width_ml"] = np.nan
+    # средняя ширина шага
+    flat["step_width_ml"] = float(step_width_ml) if step_width_ml is not None else np.nan
 
+    # straightness пути таза
     horiz = pelvis[:,[0,2]]
     net = np.linalg.norm(horiz[-1]-horiz[0])
     seglen = np.linalg.norm(np.diff(horiz, axis=0), axis=1)
     flat["path_straightness"] = float(net / (seglen.sum()+1e-6))
+
+    # кривизна пути таза (горизонталь)
+    d1 = np.gradient(horiz, axis=0); d2 = np.gradient(d1, axis=0)
+    numc = np.abs(d1[:,0]*d2[:,1] - d1[:,1]*d2[:,0])
+    den = (np.linalg.norm(d1,axis=1)**3 + 1e-6)
+    curv = numc/den
+    flat["path_curv_mean"] = float(np.nanmean(curv))
+    flat["path_curv_rms"]  = float(np.sqrt(np.nanmean(curv**2)))
+
+    # harmonic ratio по тазу (оценим stride_freq из медианы step_time)
+    if "step_time" in num.columns and np.isfinite(num["step_time"]).sum() >= 1:
+        stride_freq = 1.0 / (2*np.nanmedian(num["step_time"]))
+    else:
+        stride_freq = None
+    hr_v, hr_ml = harmonic_ratio(pelvis[:,1], fps, stride_freq), harmonic_ratio(pelvis[:,2], fps, stride_freq)
+    flat["pelvis_hr_vert"] = hr_v[0]
+    flat["pelvis_hr_ml"]   = hr_ml[1]
 
     flat["cycles_count"] = int(len(num))
     return pd.DataFrame([flat])
@@ -297,46 +411,6 @@ def _extract_one(args):
     feats = extract_features(p, schema, fps=fps, stride=stride, fast_axes_flag=fast_axes)
     d = feats.iloc[0].to_dict()
     return d, int(y_val), guess_subject_id(fn), p
-from sklearn.metrics import roc_curve, precision_recall_curve, auc, average_precision_score
-
-def plot_roc_pr_curves(y_true: np.ndarray, prob: np.ndarray, save_path: str, title_prefix: str):
-    """Рисует ROC и PR на одном полотне 1x2 и сохраняет картинку + CSV с точками кривых."""
-    import matplotlib.pyplot as plt
-    y_true = np.asarray(y_true).astype(int)
-    prob   = np.asarray(prob).astype(float)
-
-    # если один класс, ROC/PR не определены
-    if len(np.unique(y_true)) < 2:
-        print(f"[warn] {title_prefix}: один класс в y_true -> ROC/PR не рисуем")
-        return
-
-    fpr, tpr, _ = roc_curve(y_true, prob)
-    roc_auc = auc(fpr, tpr)
-
-    prec, rec, _ = precision_recall_curve(y_true, prob)
-    auprc = average_precision_score(y_true, prob)
-
-    # график
-    fig = plt.figure(figsize=(9,4))
-    ax1 = plt.subplot(1,2,1)
-    ax1.plot(fpr, tpr, lw=2, label=f"AUC={roc_auc:.3f}")
-    ax1.plot([0,1],[0,1],"--", lw=1)
-    ax1.set_xlabel("FPR"); ax1.set_ylabel("TPR"); ax1.set_title(f"{title_prefix} ROC")
-    ax1.legend(loc="lower right")
-
-    ax2 = plt.subplot(1,2,2)
-    ax2.plot(rec, prec, lw=2, label=f"AP={auprc:.3f}")
-    ax2.set_xlabel("Recall"); ax2.set_ylabel("Precision"); ax2.set_title(f"{title_prefix} PR")
-    ax2.legend(loc="lower left")
-
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=160)
-    plt.close(fig)
-
-    # сохраним точки кривых (на всякий случай)
-    base, _ = os.path.splitext(save_path)
-    pd.DataFrame({"fpr":fpr, "tpr":tpr}).to_csv(base+"_roc_points.csv", index=False)
-    pd.DataFrame({"recall":rec, "precision":prec}).to_csv(base+"_pr_points.csv", index=False)
 
 def build_table(manifest_csv: str, data_dir: str, schema: Schema, fps: int,
                 workers: int = 1, stride: int = 1, fast_axes: bool = True
@@ -347,7 +421,7 @@ def build_table(manifest_csv: str, data_dir: str, schema: Schema, fps: int,
     for c in df.columns:
         if "inj" in c.lower():
             y_col = c; break
-    assert y_col is not None, "CSV must have an injury label column (e.g., 'No inj/ inj')"
+    assert y_col is not None, "CSV must have a column with injury label"
 
     f_idx = df.columns.get_loc("filename")
     y_idx = df.columns.get_loc(y_col)
@@ -401,7 +475,7 @@ def build_table(manifest_csv: str, data_dir: str, schema: Schema, fps: int,
 
     X = X.select_dtypes(include=[np.number]).copy()
 
-    print(f"[info] Ready: {len(X)} samples (skipped {skipped}); positives={int((y==1).sum())}, negatives={int((y==0).sum())}, features={X.shape[1]}")
+    print(f"[info] Ready: {len(X)} samples (skipped {skipped}); positives={(y==1).sum()}, negatives={(y==0).sum()}, features={X.shape[1]}")
     return X, y, groups, files
 
 # ===================== Confusion matrix plotting =====================
@@ -439,10 +513,37 @@ def plot_confusion_matrix(cm: np.ndarray, class_names, normalize: bool, save_pat
     plt.savefig(save_path, dpi=160)
     plt.close(fig)
 
+# ===================== ROC/PR =====================
+from sklearn.metrics import roc_curve, precision_recall_curve, auc, average_precision_score
+
+def plot_roc_pr_curves(y_true: np.ndarray, prob: np.ndarray, save_path: str, title_prefix: str):
+    y_true = np.asarray(y_true).astype(int)
+    prob   = np.asarray(prob).astype(float)
+    if len(np.unique(y_true)) < 2:
+        print(f"[warn] {title_prefix}: один класс в y_true -> ROC/PR не рисуем")
+        return
+    fpr, tpr, _ = roc_curve(y_true, prob)
+    roc_auc = auc(fpr, tpr)
+    prec, rec, _ = precision_recall_curve(y_true, prob)
+    auprc = average_precision_score(y_true, prob)
+    fig = plt.figure(figsize=(9,4))
+    ax1 = plt.subplot(1,2,1)
+    ax1.plot(fpr, tpr, lw=2, label=f"AUC={roc_auc:.3f}")
+    ax1.plot([0,1],[0,1],"--", lw=1)
+    ax1.set_xlabel("FPR"); ax1.set_ylabel("TPR"); ax1.set_title(f"{title_prefix} ROC")
+    ax1.legend(loc="lower right")
+    ax2 = plt.subplot(1,2,2)
+    ax2.plot(rec, prec, lw=2, label=f"AP={auprc:.3f}")
+    ax2.set_xlabel("Recall"); ax2.set_ylabel("Precision"); ax2.set_title(f"{title_prefix} PR")
+    ax2.legend(loc="lower left")
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=160)
+    plt.close(fig)
+
 # ===================== Threshold search =====================
 from sklearn.metrics import (
-    recall_score, precision_recall_curve, roc_auc_score,
-    average_precision_score, confusion_matrix, classification_report
+    recall_score, roc_auc_score, average_precision_score,
+    confusion_matrix, classification_report
 )
 
 def find_threshold_balanced(y_true, probs, target_r1=0.95, target_r0=0.90):
@@ -541,15 +642,10 @@ def train_xgb(X: pd.DataFrame, y: np.ndarray, groups: np.ndarray, files: np.ndar
     auroc_dv = roc_auc_score(y_dv, prob_dv)
     auprc_te = average_precision_score(y_te, prob_te)
     auroc_te = roc_auc_score(y_te, prob_te)
-    
-    # вероятности
-    prob_dv = bst.predict(dvalid, iteration_range=(0, bst.best_iteration + 1))
-    prob_te = bst.predict(dtest,  iteration_range=(0, bst.best_iteration + 1))
 
     # ROC/PR графики
     plot_roc_pr_curves(y_dv, prob_dv, os.path.join(out_dir, "roc_pr_dev.png"),  "DEV")
     plot_roc_pr_curves(y_te, prob_te, os.path.join(out_dir, "roc_pr_test.png"), "TEST")
-
 
     # подбор порога под цели
     best = find_threshold_balanced(y_dv, prob_dv,
@@ -586,9 +682,9 @@ def train_xgb(X: pd.DataFrame, y: np.ndarray, groups: np.ndarray, files: np.ndar
                           save_path=os.path.join(out_dir, "confusion_matrix_normalized.png"),
                           title="Confusion Matrix (row-normalized)")
 
-    # важности признаков (top-25) через Booster.get_score()
+    # важности признаков (top-25)
     try:
-        score = bst.get_score(importance_type="gain")  # dict: feat_name -> score
+        score = bst.get_score(importance_type="gain")
         if len(score) > 0:
             items = sorted(score.items(), key=lambda x: x[1], reverse=True)[:25]
             names, vals = zip(*items)
@@ -597,15 +693,14 @@ def train_xgb(X: pd.DataFrame, y: np.ndarray, groups: np.ndarray, files: np.ndar
             plt.barh(y_pos, vals)
             plt.yticks(y_pos, names)
             plt.gca().invert_yaxis()
-            plt.xlabel("Gain")
-            plt.title("XGBoost Feature Importance (top-25)")
+            plt.xlabel("Gain"); plt.title("XGBoost Feature Importance (top-25)")
             plt.tight_layout()
             plt.savefig(os.path.join(out_dir, "feature_importance_top25.png"), dpi=160)
             plt.close()
     except Exception as e:
         print("[warn] feature importance plot failed:", e)
 
-    # сохранить Booster
+    # сохранить Booster и список фич
     bst.save_model(os.path.join(out_dir, "xgb.json"))
     json.dump(list(X.columns), open(os.path.join(out_dir, "features_cols.json"), "w", encoding="utf-8"), ensure_ascii=False, indent=2)
 
@@ -670,7 +765,7 @@ def main():
     ap.add_argument("--schema", required=True, help="schema_joints.json")
     ap.add_argument("--out_dir", default="out_xgb")
     ap.add_argument("--fps", type=int, default=30)
-    ap.add_argument("--stride", type=int, default=2, help="темп прореживания кадров")
+    ap.add_argument("--stride", type=int, default=2, help="прореживание кадров")
     ap.add_argument("--fast_axes", action="store_true", help="быстрые оси сегментов (без SVD)")
     ap.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2)-1), help="число процессов при extract/build")
 
@@ -678,11 +773,13 @@ def main():
     ap.add_argument("--min_recall_injury", type=float, default=0.95)
     ap.add_argument("--min_recall_noinj",  type=float, default=0.90)
 
+    # cache paths для train_features
     ap.add_argument("--features", help="path to features.parquet")
     ap.add_argument("--labels", help="path to labels.npy")
     ap.add_argument("--groups", help="path to groups.npy")
     ap.add_argument("--files_list", help="path to files.txt")
 
+    # predict
     ap.add_argument("--npy", help="путь к одному .npy (для predict)")
 
     args = ap.parse_args()
