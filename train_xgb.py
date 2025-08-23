@@ -357,7 +357,6 @@ def extract_features(path: str, schema: Schema, fps: int = 30, stride: int = 1, 
 
     df = pd.DataFrame(per_cycle)
 
-    # ---- если циклов нет: вернём «пустую» строку + имена для сырых фич
     def _empty_row_base():
         return dict(
             step_time_median=np.nan, step_time_mean=np.nan, step_time_std=0.0,
@@ -376,7 +375,9 @@ def extract_features(path: str, schema: Schema, fps: int = 30, stride: int = 1, 
             iqr_step_time=np.nan, iqr_step_len=np.nan, iqr_cadence=np.nan, iqr_stance_time=np.nan,
             asym_step_time=np.nan, asym_step_len=np.nan, asym_rom_knee=np.nan,
             asym_rom_hip=np.nan, asym_rom_ankle=np.nan, asym_stance_time=np.nan,
-            asym_cadence=np.nan, asym_pelvis_vert_osc=np.nan, asym_pelvis_ml_osc*np.nan if False else np.nan,  # keep key presence
+            asym_cadence=np.nan,
+            asym_pelvis_vert_osc=np.nan,
+            asym_pelvis_ml_osc=np.nan,
             asym_pelvis_ap_osc=np.nan,
             si_step_len=np.nan, si_step_time=np.nan, si_cadence=np.nan,
             pelvis_jerk_rms_y=0.0, pelvis_jerk_rms_z=0.0, pelvis_jerk_rms_x=0.0,
@@ -391,6 +392,7 @@ def extract_features(path: str, schema: Schema, fps: int = 30, stride: int = 1, 
             freq_peak_power=np.nan,
             outlier_rate=0.0,
         )
+
 
     if df.empty:
         flat = _empty_row_base()
