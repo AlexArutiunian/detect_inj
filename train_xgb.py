@@ -297,6 +297,46 @@ def _extract_one(args):
     feats = extract_features(p, schema, fps=fps, stride=stride, fast_axes_flag=fast_axes)
     d = feats.iloc[0].to_dict()
     return d, int(y_val), guess_subject_id(fn), p
+from sklearn.metrics import roc_curve, precision_recall_curve, auc, average_precision_score
+
+def plot_roc_pr_curves(y_true: np.ndarray, prob: np.ndarray, save_path: str, title_prefix: str):
+    """Рисует ROC и PR на одном полотне 1x2 и сохраняет картинку + CSV с точками кривых."""
+    import matplotlib.pyplot as plt
+    y_true = np.asarray(y_true).astype(int)
+    prob   = np.asarray(prob).astype(float)
+
+    # если один класс, ROC/PR не определены
+    if len(np.unique(y_true)) < 2:
+        print(f"[warn] {title_prefix}: один класс в y_true -> ROC/PR не рисуем")
+        return
+
+    fpr, tpr, _ = roc_curve(y_true, prob)
+    roc_auc = auc(fpr, tpr)
+
+    prec, rec, _ = precision_recall_curve(y_true, prob)
+    auprc = average_precision_score(y_true, prob)
+
+    # график
+    fig = plt.figure(figsize=(9,4))
+    ax1 = plt.subplot(1,2,1)
+    ax1.plot(fpr, tpr, lw=2, label=f"AUC={roc_auc:.3f}")
+    ax1.plot([0,1],[0,1],"--", lw=1)
+    ax1.set_xlabel("FPR"); ax1.set_ylabel("TPR"); ax1.set_title(f"{title_prefix} ROC")
+    ax1.legend(loc="lower right")
+
+    ax2 = plt.subplot(1,2,2)
+    ax2.plot(rec, prec, lw=2, label=f"AP={auprc:.3f}")
+    ax2.set_xlabel("Recall"); ax2.set_ylabel("Precision"); ax2.set_title(f"{title_prefix} PR")
+    ax2.legend(loc="lower left")
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=160)
+    plt.close(fig)
+
+    # сохраним точки кривых (на всякий случай)
+    base, _ = os.path.splitext(save_path)
+    pd.DataFrame({"fpr":fpr, "tpr":tpr}).to_csv(base+"_roc_points.csv", index=False)
+    pd.DataFrame({"recall":rec, "precision":prec}).to_csv(base+"_pr_points.csv", index=False)
 
 def build_table(manifest_csv: str, data_dir: str, schema: Schema, fps: int,
                 workers: int = 1, stride: int = 1, fast_axes: bool = True
@@ -501,6 +541,15 @@ def train_xgb(X: pd.DataFrame, y: np.ndarray, groups: np.ndarray, files: np.ndar
     auroc_dv = roc_auc_score(y_dv, prob_dv)
     auprc_te = average_precision_score(y_te, prob_te)
     auroc_te = roc_auc_score(y_te, prob_te)
+    
+    # вероятности
+    prob_dv = bst.predict(dvalid, iteration_range=(0, bst.best_iteration + 1))
+    prob_te = bst.predict(dtest,  iteration_range=(0, bst.best_iteration + 1))
+
+    # ROC/PR графики
+    plot_roc_pr_curves(y_dv, prob_dv, os.path.join(out_dir, "roc_pr_dev.png"),  "DEV")
+    plot_roc_pr_curves(y_te, prob_te, os.path.join(out_dir, "roc_pr_test.png"), "TEST")
+
 
     # подбор порога под цели
     best = find_threshold_balanced(y_dv, prob_dv,
