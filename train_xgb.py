@@ -486,15 +486,26 @@ def extract_features(path: str, schema: Schema, fps: int = 30, stride: int = 1, 
     flat["ds_ratio"] = float(np.nanmean(ds_vals)) if ds_vals else np.nan
 
     # Outlier rate across per-step key features (beyond median±1.5*IQR) — stability
+# Outlier rate across per-step key features (nan-safe)
     key = ["step_len","step_time","cadence","stance_time","pelvis_vert_osc","pelvis_ml_osc"]
-    count_out=0; count_all=0
+    count_out = 0
+    count_all = 0
     for k in key:
-        v = num[k].values if k in num else None
-        if v is None or len(v)<3: continue
-        med = np.nanmedian(v); i = iqr(v); lo=med-1.5*i; hi=med+1.5*i
-        out = np.sum((v<lo)|(v>hi))
-        count_out += int(out); count_all += int(np.isfinite(v).sum())
-    flat["outlier_rate"] = float(count_out/max(1,count_all))
+        if k not in num:
+            continue
+        v = num[k].values
+        m = np.isfinite(v)
+        vv = v[m]
+        if vv.size < 3:
+            continue
+        med = np.median(vv)
+        i = np.percentile(vv, 75) - np.percentile(vv, 25)  # IQR без NaN
+        lo = med - 1.5 * i
+        hi = med + 1.5 * i
+        out = np.sum((vv < lo) | (vv > hi))
+        count_out += int(out)
+        count_all += int(vv.size)
+    flat["outlier_rate"] = float(count_out / max(1, count_all))
 
     # cycles_count
     flat["cycles_count"] = int(len(num))
