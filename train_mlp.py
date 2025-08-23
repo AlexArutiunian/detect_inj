@@ -13,6 +13,7 @@ End-to-end обучение: npy -> фичи -> subject-wise сплиты -> PyT
 - model.pt, scaler.pkl, features_cols.json, threshold.txt
 - metrics.json, curves.png, roc_pr.png
 """
+from tqdm import tqdm
 
 import os, json, math, argparse, random, re, warnings
 from dataclasses import dataclass
@@ -285,21 +286,30 @@ def build_table(manifest_csv: str, data_dir: str, schema: Schema, fps: int
     assert y_col is not None, "Не найден столбец с меткой (например 'No inj/ inj')"
 
     X_rows, y_list, groups, files = [], [], [], []
-    for _, r in df.iterrows():
-        fn = str(r["filename"])
+    skipped = 0
+
+    print(f"[info] Всего строк в манифесте: {len(df)}")
+    for r in tqdm(df.itertuples(index=False), total=len(df), desc="Extract features"):
+        fn = str(getattr(r, "filename"))
         p = os.path.join(data_dir, fn)
         if not p.endswith(".npy"):
             p += ".npy"
         if not os.path.exists(p):
-            print("[skip] нет файла", p); continue
+            skipped += 1
+            tqdm.write(f"[skip] нет файла {p}")
+            continue
         try:
             feats = extract_features(p, schema, fps=fps)   # одна строка, только числа
             X_rows.append(feats)
-            y_list.append(label_to_int(r[y_col]))
+            y_list.append(label_to_int(getattr(r, y_col)))
             groups.append(guess_subject_id(fn))
             files.append(p)
         except Exception as e:
-            print("[skip]", p, "->", type(e).__name__, e)
+            skipped += 1
+            tqdm.write(f"[skip] {p} -> {type(e).__name__} {e}")
+
+    if not X_rows:
+        raise RuntimeError("Не удалось собрать ни одной строки с фичами. Проверь пути и schema_joints.json")
 
     X = pd.concat(X_rows, ignore_index=True).fillna(0.0)
     y = np.asarray(y_list, dtype=np.int64)
@@ -307,14 +317,19 @@ def build_table(manifest_csv: str, data_dir: str, schema: Schema, fps: int
     files = np.asarray(files)
 
     ok = np.isin(y, [0, 1])
+    bad = (~ok).sum()
+    if bad:
+        print(f"[warn] удалены {bad} строк(и) из-за некорректных меток")
     X = X.loc[ok].reset_index(drop=True)
     y = y[ok]; groups = groups[ok]; files = files[ok]
 
     # На всякий случай: оставим только числовые признаки
     X = X.select_dtypes(include=[np.number]).copy()
 
+    print(f"[info] Собрано примеров: {len(X)} (пропущено: {skipped})")
+    print(f"[info] Позитивов (Injury): {(y==1).sum()} | Негативов (No Injury): {(y==0).sum()}")
+    print(f"[info] Число признаков: {X.shape[1]}")
     return X, y, groups, files
-
 
 # --------------------- Torch model ---------------------
 def build_mlp(in_dim: int):
@@ -325,8 +340,8 @@ def build_mlp(in_dim: int):
         nn.Linear(64, 1)  # logits
     )
 
-def train_nn(X: pd.DataFrame, y: np.ndarray, groups: np.ndarray, out_dir: str,
-             epochs=50, batch_size=64, lr=1e-3, weight_decay=1e-4, seed=42):
+def train_nn(X: pd.DataFrame, y: np.ndarray, groups: np.ndarray, files: np.ndarray,
+             out_dir: str, epochs=50, batch_size=64, lr=1e-3, weight_decay=1e-4, seed=42):
     import torch, torch.nn as nn
     from torch.utils.data import TensorDataset, DataLoader
     from sklearn.preprocessing import StandardScaler
@@ -340,21 +355,47 @@ def train_nn(X: pd.DataFrame, y: np.ndarray, groups: np.ndarray, out_dir: str,
     torch.backends.cudnn.benchmark = True
     print("Device:", device)
 
-    # subject-wise: train/dev/test (60/20/20)
-    gss1 = GroupShuffleSplit(n_splits=1, test_size=0.20, random_state=seed)
+    # --------- SUBJECT-WISE SPLIT: 60/20/20 ----------
+    gss1 = GroupShuffleSplit(n_splits=1, test_size=0.20, random_state=seed)   # test = 20%
     tr_idx, te_idx = next(gss1.split(X, y, groups))
-    gss2 = GroupShuffleSplit(n_splits=1, test_size=0.25, random_state=seed)  # от train отделим dev (итого 60/20)
+    gss2 = GroupShuffleSplit(n_splits=1, test_size=0.25, random_state=seed)   # dev = 25% от train => 0.8*0.25=0.20
     tr2_idx, dv_idx = next(gss2.split(X.iloc[tr_idx], y[tr_idx], groups[tr_idx]))
     tr_idx = tr_idx[tr2_idx]
 
-    # масштабирование по train
+    def split_stats(name, idx):
+        return {
+            "n": int(len(idx)),
+            "pos": int((y[idx]==1).sum()),
+            "neg": int((y[idx]==0).sum()),
+            "subjects": int(len(np.unique(groups[idx])))
+        }
+
+    stats = {"train": split_stats("train", tr_idx),
+             "dev":   split_stats("dev",   dv_idx),
+             "test":  split_stats("test",  te_idx)}
+    print("[split] subject-wise 60/20/20")
+    for k,v in stats.items():
+        print(f"  {k:5s}: n={v['n']}, pos={v['pos']}, neg={v['neg']}, subjects={v['subjects']}")
+
+    # сохраним разбиение (удобно для воспроизводимости/отладки)
+    split_df = pd.DataFrame({
+        "file": files,
+        "group": groups,
+        "y": y,
+        "split": ["train"]*len(files)
+    })
+    split_df.loc[dv_idx, "split"] = "dev"
+    split_df.loc[te_idx, "split"] = "test"
+    split_df.to_csv(os.path.join(out_dir, "split_subjectwise.csv"), index=False)
+
+    # --------- масштабирование по train ----------
     scaler = StandardScaler().fit(X.iloc[tr_idx])
     X_tr = scaler.transform(X.iloc[tr_idx]); X_dv = scaler.transform(X.iloc[dv_idx]); X_te = scaler.transform(X.iloc[te_idx])
 
     joblib.dump(scaler, os.path.join(out_dir, "scaler.pkl"))
     json.dump(list(X.columns), open(os.path.join(out_dir, "features_cols.json"), "w", encoding="utf-8"), ensure_ascii=False, indent=2)
 
-    # DataLoaders
+    # --------- DataLoaders ----------
     def mkdl(Xn, yn, bs, shuffle=False):
         tX = torch.tensor(Xn, dtype=torch.float32)
         ty = torch.tensor(yn.reshape(-1,1), dtype=torch.float32)
@@ -365,7 +406,7 @@ def train_nn(X: pd.DataFrame, y: np.ndarray, groups: np.ndarray, out_dir: str,
     dl_dv = mkdl(X_dv, y[dv_idx], batch_size, False)
     dl_te = mkdl(X_te, y[te_idx], batch_size, False)
 
-    # Модель
+    # --------- Модель/оптимизатор ----------
     model = build_mlp(X_tr.shape[1]).to(device)
     pos = max(1, int((y[tr_idx]==1).sum()))
     neg = max(1, int((y[tr_idx]==0).sum()))
@@ -376,18 +417,20 @@ def train_nn(X: pd.DataFrame, y: np.ndarray, groups: np.ndarray, out_dir: str,
     best = {"auprc": -1, "state": None}
     hist = {"loss": [], "val_loss": [], "val_auroc": [], "val_auprc": []}
 
+    # --------- Тренировка с прогрессом по батчам ----------
     for epoch in range(1, epochs+1):
         model.train(); run_loss = 0.0
-        for bx, by in dl_tr:
+        pbar = tqdm(dl_tr, total=len(dl_tr), desc=f"Epoch {epoch}/{epochs} [train]", leave=False)
+        for bx, by in pbar:
             bx, by = bx.to(device, non_blocking=True), by.to(device, non_blocking=True)
             opt.zero_grad()
-            logits = model(bx)
-            loss = crit(logits, by)
+            loss = crit(model(bx), by)
             loss.backward(); opt.step()
             run_loss += float(loss.item())*len(bx)
+            pbar.set_postfix({"loss": f"{loss.item():.4f}"})
         run_loss /= len(dl_tr.dataset)
 
-        # val
+        # val (быстрый прогон, без прогресс-бара чтобы не засорять)
         model.eval()
         with torch.no_grad():
             logits = []
@@ -400,49 +443,34 @@ def train_nn(X: pd.DataFrame, y: np.ndarray, groups: np.ndarray, out_dir: str,
 
         hist["loss"].append(run_loss); hist["val_loss"].append(float("nan"))
         hist["val_auroc"].append(auroc); hist["val_auprc"].append(auprc)
+        print(f"[epoch {epoch:03d}] train_loss={run_loss:.4f} | val_AUROC={auroc:.3f} | val_AUPRC={auprc:.3f}")
 
         if auprc > best["auprc"]:
             best["auprc"] = auprc
             best["state"] = {k:v.cpu() for k,v in model.state_dict().items()}
 
-        print(f"[{epoch:03d}] loss={run_loss:.4f}  val_AUROC={auroc:.3f}  val_AUPRC={auprc:.3f}")
-
-    # применим лучший
+    # --------- Лучшее состояние, подбор порога, тест ----------
     model.load_state_dict(best["state"])
     torch.save(model.state_dict(), os.path.join(out_dir, "model.pt"))
 
-    # подберём порог по F1 на деве
     model.eval()
     with torch.no_grad():
-        dev_logits = []
-        for bx, _ in dl_dv:
-            bx = bx.to(device); dev_logits.append(model(bx).cpu().numpy())
-        dev_logits = np.vstack(dev_logits).ravel()
-        dev_prob = 1/(1+np.exp(-dev_logits))
+        dev_logits = np.vstack([model(torch.tensor(X_dv, dtype=torch.float32).to(device)).cpu().numpy()]).ravel()
     from sklearn.metrics import precision_recall_curve
-    pr, rc, th = precision_recall_curve(y[dv_idx], dev_prob)
+    pr, rc, th = precision_recall_curve(y[dv_idx], 1/(1+np.exp(-dev_logits)))
     f1 = 2*pr[:-1]*rc[:-1]/np.clip(pr[:-1]+rc[:-1], 1e-12, None)
     thr = float(th[np.nanargmax(f1)])
     open(os.path.join(out_dir, "threshold.txt"), "w").write(str(thr))
 
-    # тест
     with torch.no_grad():
-        te_logits = []
-        for bx, _ in dl_te:
-            bx = bx.to(device); te_logits.append(model(bx).cpu().numpy())
-        te_logits = np.vstack(te_logits).ravel()
-        te_prob = 1/(1+np.exp(-te_logits))
+        te_logits = np.vstack([model(torch.tensor(X_te, dtype=torch.float32).to(device)).cpu().numpy()]).ravel()
+    te_prob = 1/(1+np.exp(-te_logits))
     y_te = y[te_idx]; te_pred = (te_prob >= thr).astype(int)
 
-    from sklearn.metrics import classification_report, confusion_matrix
-    from sklearn.metrics import RocCurveDisplay, PrecisionRecallDisplay
+    from sklearn.metrics import classification_report, confusion_matrix, roc_curve, average_precision_score
     rep = classification_report(y_te, te_pred, digits=3, output_dict=False)
     cm = confusion_matrix(y_te, te_pred).tolist()
-    metrics = {
-        "val_best_auprc": float(best["auprc"]),
-        "test_cm": cm,
-        "test_report": rep
-    }
+    metrics = {"val_best_auprc": float(best["auprc"]), "test_cm": cm, "test_report": rep}
     json.dump(metrics, open(os.path.join(out_dir, "metrics.json"), "w", encoding="utf-8"), ensure_ascii=False, indent=2)
 
     # графики
@@ -469,6 +497,7 @@ def train_nn(X: pd.DataFrame, y: np.ndarray, groups: np.ndarray, out_dir: str,
     print(rep)
     print("Saved to:", out_dir)
     return out_dir
+
 
 # --------------------- Inference ---------------------
 def predict_one(npy_path: str, schema: Schema, out_dir: str, fps: int = 30):
@@ -513,8 +542,8 @@ def main():
         assert args.csv and args.data_dir, "--csv и --data_dir обязательны в режиме train"
         X, y, groups, files = build_table(args.csv, args.data_dir, schema, fps=args.fps)
         print(f"[info] samples={len(X)}, positives={int((y==1).sum())}, features={X.shape[1]}")
-        train_nn(X, y, groups, args.out_dir,
-                 epochs=args.epochs, batch_size=args.batch_size, lr=args.lr, weight_decay=args.weight_decay)
+        train_nn(X, y, groups, files, args.out_dir,
+            epochs=args.epochs, batch_size=args.batch_size, lr=args.lr, weight_decay=args.weight_decay)
     else:
         assert args.npy, "--npy обязателен в режиме predict"
         res = predict_one(args.npy, schema, args.out_dir, fps=args.fps)
