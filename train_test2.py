@@ -31,6 +31,10 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 from concurrent.futures import ProcessPoolExecutor, as_completed
+import math
+from math import pi
+from numpy.linalg import eigvals
+from scipy.signal import stft
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
@@ -352,6 +356,162 @@ def acf_regularities(sig: np.ndarray, fps: int, f0: Optional[float]):
     out["acf_ratio_2_1"] = (a2/(abs(a1)+1e-6)) if np.isfinite(a1) else np.nan
     return out
 
+# --------- Extra metrics: entropy / DFA / phase / STFT sidebands / ellipse areas ---------
+
+def sample_entropy(x, m=2, r_ratio=0.2):
+    x = np.asarray(x, float)
+    x = x[np.isfinite(x)]
+    n = len(x)
+    if n < m + 2: return np.nan
+    r = r_ratio * np.std(x) + 1e-12
+
+    def _phi(mm):
+        if n - mm + 1 <= 1: return 0.0
+        Y = np.array([x[i:i+mm] for i in range(n-mm+1)])
+        # Chebyshev (∞-норма)
+        C = np.max(np.abs(Y[:, None, :] - Y[None, :, :]), axis=2)
+        # exclude self-matches by subtracting diagonal==0 later
+        B = (C <= r).sum(axis=1) - 1
+        return np.sum(B) / ((n - mm + 1) * (n - mm))
+    try:
+        phi_m   = _phi(m)
+        phi_m1  = _phi(m+1)
+        if phi_m <= 0 or phi_m1 <= 0: return np.nan
+        return -np.log(phi_m1 / (phi_m + 1e-12))
+    except Exception:
+        return np.nan
+
+
+def poincare_sd(x):
+    """SD1/SD2 и их отношение для последовательности x_t (например, step_time)."""
+    x = np.asarray(x, float)
+    x = x[np.isfinite(x)]
+    if len(x) < 3: 
+        return np.nan, np.nan, np.nan
+    x1, x2 = x[:-1], x[1:]
+    diff = (x2 - x1) / math.sqrt(2.0)
+    summ = (x2 + x1) / math.sqrt(2.0)
+    SD1 = np.std(diff)
+    SD2 = np.std(summ)
+    return float(SD1), float(SD2), float(SD1 / (SD2 + 1e-12))
+
+
+def dfa_alpha(x, box_sizes=(4,5,6,8,10,12,16,20,24,32)):
+    """Простейшая DFA α (склонность масштабир. флуктуаций)."""
+    x = np.asarray(x, float)
+    x = x[np.isfinite(x)]
+    n = len(x)
+    if n < max(box_sizes) + 2: 
+        return np.nan
+    y = np.cumsum(x - np.mean(x))
+    Fs, Ns = [], []
+    for s in box_sizes:
+        if s >= n: break
+        k = n // s
+        if k < 2: break
+        yy = y[:k*s].reshape(k, s)
+        t = np.arange(s)
+        # линейный тренд по каждому окну
+        A = np.vstack([t, np.ones_like(t)]).T
+        coeffs = np.linalg.lstsq(A, yy.T, rcond=None)[0]  # (2,k)
+        trend = (A @ coeffs).T
+        res = yy - trend
+        F = np.sqrt(np.mean(np.mean(res**2, axis=1)))
+        Fs.append(F)
+        Ns.append(s)
+    if len(Fs) < 2: return np.nan
+    logN = np.log(Ns); logF = np.log(Fs)
+    a = np.polyfit(logN, logF, 1)[0]
+    return float(a)
+
+
+def compute_phase_metrics(fsL, fsR, fps):
+    """Phase Coordination Index/вариативность фаз L↔R (по FS)."""
+    # фазу φ определяем как сдвиг FS_R относительно середины соседних FS_L, в градусах цикла L
+    fsL = np.asarray(fsL, int); fsR = np.asarray(fsR, int)
+    if len(fsL) < 2 or len(fsR) < 1:
+        return dict(pci=np.nan, phase_std=np.nan, phase_abs_mean_err=np.nan, phase_circ_var=np.nan)
+    phases = []
+    for i in range(1, len(fsL)):
+        a, b = fsL[i-1], fsL[i]        # цикл Л
+        mid  = (a + b) / 2.0
+        # возьмем R, попавшие внутрь цикла Л
+        r = fsR[(fsR >= a) & (fsR < b)]
+        if len(r) == 0: 
+            continue
+        for rr in r:
+            phi = 360.0 * (rr - mid) / (b - a + 1e-12) + 180.0  # ~180° ideal
+            # приведем в [0,360)
+            phi = (phi + 360.0) % 360.0
+            phases.append(phi)
+    phases = np.asarray(phases, float)
+    if len(phases) == 0:
+        return dict(pci=np.nan, phase_std=np.nan, phase_abs_mean_err=np.nan, phase_circ_var=np.nan)
+    # классический PCI: std(phi) + |mean(phi-180)| (в градусах)
+    err = ((phases - 180.0 + 540.0) % 360.0) - 180.0  # отклонение от 180 в [-180,180]
+    pci = float(np.std(err) + np.abs(np.mean(err)))
+    # circular variance
+    ang = np.deg2rad(phases)
+    R = np.sqrt(np.mean(np.cos(ang))**2 + np.mean(np.sin(ang))**2)
+    circ_var = 1.0 - R
+    return dict(
+        pci=pci,
+        phase_std=float(np.std(err)),
+        phase_abs_mean_err=float(np.mean(np.abs(err))),
+        phase_circ_var=float(circ_var)
+    )
+
+
+def stft_sideband_metrics(sig, fps, f0, halfwin_hz=0.6):
+    """Асимметрия боковых лепестков вокруг f0 и локальная bandwidth (STFT)."""
+    x = np.asarray(sig, float)
+    if not np.isfinite(f0) or f0 <= 0.3 or len(x) < 64:
+        return dict(sb_asym=np.nan, sb_bandwidth=np.nan, harm23_ratio=np.nan)
+    # короткая STFT
+    nperseg = int(max(32, round(2.0 * fps / max(f0,1e-6))))  # ~2 периода
+    nperseg = min(nperseg, len(x)//2)
+    if nperseg < 32: 
+        return dict(sb_asym=np.nan, sb_bandwidth=np.nan, harm23_ratio=np.nan)
+    f, _, Z = stft(x - np.mean(x), fs=fps, nperseg=nperseg, noverlap=nperseg//2)
+    P = np.abs(Z)**2
+    # усредним по времени
+    ps = np.mean(P, axis=1)
+    # окно вокруг f0
+    lo = max(0.0, f0 - halfwin_hz); hi = min(f.max(), f0 + halfwin_hz)
+    mask = (f >= lo) & (f <= hi)
+    if not mask.any(): 
+        return dict(sb_asym=np.nan, sb_bandwidth=np.nan, harm23_ratio=np.nan)
+    # делим на ниж/верх половины окна
+    m0 = (f >= lo) & (f < f0)
+    m1 = (f > f0) & (f <= hi)
+    e_low  = float(np.sum(ps[m0])) if m0.any() else np.nan
+    e_high = float(np.sum(ps[m1])) if m1.any() else np.nan
+    sb_asym = (e_high - e_low) / (e_high + e_low + 1e-12)
+
+    # bandwidth как σ частот с весами ps в окне
+    pw = ps[mask]; fw = f[mask]
+    cen = np.sum(fw*pw) / (np.sum(pw) + 1e-12)
+    bw = np.sqrt(np.sum(pw*(fw-cen)**2) / (np.sum(pw) + 1e-12))
+
+    # harmonic ratio (2f0+3f0)/f0 из усреднённого спектра
+    def _p_at(freq):
+        idx = int(np.argmin(np.abs(f - freq)))
+        return float(ps[idx]) if 0 <= idx < len(ps) else np.nan
+    p1 = _p_at(f0); p2 = _p_at(2.0*f0); p3 = _p_at(3.0*f0)
+    harm23 = (p2 + p3) / (p1 + 1e-12) if np.isfinite(p1) and p1 > 0 else np.nan
+    return dict(sb_asym=float(sb_asym), sb_bandwidth=float(bw), harm23_ratio=float(harm23))
+
+
+def swing_ellipse_area(ap, ml):
+    """Площадь 1σ-эллипса траектории стопы в плоскости AP×ML за swing интервал."""
+    X = np.vstack([ap, ml]).T
+    if len(X) < 5: 
+        return np.nan
+    C = np.cov(X.T)
+    lam = np.sort(eigvals(C).real)
+    a = math.sqrt(max(lam[-1], 0.0))
+    b = math.sqrt(max(lam[0], 0.0))
+    return float(pi * a * b)
 
 # -------------------- Extract --------------------
 
@@ -409,7 +569,10 @@ def extract_features(path: str, schema: Schema, fps: int = 30, stride: int = 1,
     rows = []
     cadence_list = []
     foot_clearances = []
-    cycle_kappa_median = []  # для turn-mask
+    low_clear_flags = []       # частота низких клиренсов
+    swing_areas = []           # площади эллипсов траекторий swing
+    cycle_kappa_median = []    # для turn-mask
+
 
     for side in ("L", "R"):
         foot = cogs.get(f"{side}_foot"); sh = axes.get(f"{side}_shank")
@@ -453,15 +616,22 @@ def extract_features(path: str, schema: Schema, fps: int = 30, stride: int = 1,
             duty = (stance/step_t) if (np.isfinite(stance) and step_t>0) else np.nan
             speed = step_len/step_t if step_t>1e-6 else 0.0
 
-            # foot clearance: swing peak (FO -> next FS)
+            # foot clearance: swing peak (FO -> next FS)    
             clearance = np.nan
             if len(fo_in):
                 st = int(fo_in[0]); en = b
                 yy = foot[st:en,1]
-                if yy.size>2:
+                if yy.size > 2:
                     base = np.nanmedian(foot[max(a-3,0):min(a+3,T),1])
                     clearance = float(np.nanmax(yy) - base)
+                    # площадь эллипса траектории стопы в swing (AP×ML)
+                    area = swing_ellipse_area(foot[st:en,0], foot[st:en,2])
+                    swing_areas.append(area)
             foot_clearances.append(clearance)
+
+            # флаг низкого клиренса (порог можно подправить; в нормированных ед.)
+            LOW_CLEAR_THR = 0.02
+            low_clear_flags.append(int(np.isfinite(clearance) and (clearance < LOW_CLEAR_THR)))
 
             rows.append(dict(
                 side=0 if side=="L" else 1,
@@ -628,6 +798,13 @@ def extract_features(path: str, schema: Schema, fps: int = 30, stride: int = 1,
         "acfZ_2step": acfZ["acf_at_2step"],
         "acfZ_ratio": acfZ["acf_ratio_2_1"],
     })
+    
+    # --- STFT sidebands & harmonic ratios around cadence
+    sb = stft_sideband_metrics(pelvis[:,1], fps, f0 if np.isfinite(f0) else np.nan, halfwin_hz=0.6)
+    flat["stft_sideband_asym"] = sb["sb_asym"]
+    flat["stft_sideband_bandwidth"] = sb["sb_bandwidth"]
+    flat["harmonics_23_to_1"] = sb["harm23_ratio"]
+
 
     # Frequency peak power near cadence (vertical pelvis)
     if np.isfinite(f0):
@@ -689,6 +866,54 @@ def extract_features(path: str, schema: Schema, fps: int = 30, stride: int = 1,
                 if a1<b1: i+=1
                 else: j+=1
     flat["ds_ratio"] = float(np.nanmean(ds_vals)) if ds_vals else np.nan
+    
+        # --- Phase coordination (PCI) и фазовая вариабельность
+    if "L_foot" in cogs and "R_foot" in cogs:
+        fsL, _ = detect_gait_events(cogs["L_foot"], fps=fps, f0=f0 if np.isfinite(f0) else None)
+        fsR, _ = detect_gait_events(cogs["R_foot"], fps=fps, f0=f0 if np.isfinite(f0) else None)
+        ph = compute_phase_metrics(fsL, fsR, fps)
+        flat["phase_pci"] = ph["pci"]
+        flat["phase_std"] = ph["phase_std"]
+        flat["phase_abs_mean_err"] = ph["phase_abs_mean_err"]
+        flat["phase_circ_var"] = ph["phase_circ_var"]
+    else:
+        flat["phase_pci"] = np.nan
+        flat["phase_std"] = np.nan
+        flat["phase_abs_mean_err"] = np.nan
+        flat["phase_circ_var"] = np.nan
+        
+            # --- Regularity/complexity
+    flat["sampen_pelvisY"] = float(sample_entropy(pelvis[:,1], m=2, r_ratio=0.2))
+    flat["sampen_pelvisZ"] = float(sample_entropy(pelvis[:,2], m=2, r_ratio=0.2))
+
+    # Poincaré SD1/SD2 и DFA для времен/длин шагов
+    if "step_time" in df.columns and len(df) >= 3:
+        st = df["step_time"].values
+        sd1, sd2, sd_ratio = poincare_sd(st)
+        flat["poincare_step_time_sd1"] = sd1
+        flat["poincare_step_time_sd2"] = sd2
+        flat["poincare_step_time_ratio"] = sd_ratio
+        flat["dfa_alpha_step_time"] = dfa_alpha(st)
+    else:
+        flat["poincare_step_time_sd1"] = np.nan
+        flat["poincare_step_time_sd2"] = np.nan
+        flat["poincare_step_time_ratio"] = np.nan
+        flat["dfa_alpha_step_time"] = np.nan
+
+    if "step_len" in df.columns and len(df) >= 3:
+        sl = df["step_len"].values
+        sd1l, sd2l, sdrl = poincare_sd(sl)
+        flat["poincare_step_len_sd1"] = sd1l
+        flat["poincare_step_len_sd2"] = sd2l
+        flat["poincare_step_len_ratio"] = sdrl
+        flat["dfa_alpha_step_len"] = dfa_alpha(sl)
+    else:
+        flat["poincare_step_len_sd1"] = np.nan
+        flat["poincare_step_len_sd2"] = np.nan
+        flat["poincare_step_len_ratio"] = np.nan
+        flat["dfa_alpha_step_len"] = np.nan
+
+
 
     # Outlier rate across per-step key features
     key = ["step_len","step_time","cadence","stance_time","pelvis_vert_osc","pelvis_ml_osc"]
@@ -725,6 +950,25 @@ def extract_features(path: str, schema: Schema, fps: int = 30, stride: int = 1,
     fc = df["foot_clearance"].values if "foot_clearance" in df else np.array([])
     flat["foot_clearance_median"] = float(np.nanmedian(fc)) if np.isfinite(fc).any() else np.nan
     flat["foot_clearance_std"]    = float(np.nanstd(fc))    if np.isfinite(fc).any() else np.nan
+    
+        # --- Low toe clearance stats
+    fc = df["foot_clearance"].values if "foot_clearance" in df else np.array([])
+    if np.isfinite(fc).any():
+        flat["toe_clearance_p05"] = float(np.nanpercentile(fc, 5))
+        flat["low_clearance_rate"] = float(np.mean(np.array(low_clear_flags))) if len(low_clear_flags) else np.nan
+    else:
+        flat["toe_clearance_p05"] = np.nan
+        flat["low_clearance_rate"] = np.nan
+
+    # --- Swing ellipse area stats
+    if len(swing_areas):
+        sa = np.asarray(swing_areas, float)
+        flat["swing_ellipse_area_median"] = float(np.nanmedian(sa))
+        flat["swing_ellipse_area_cv"] = float(np.nanstd(sa)/(np.nanmean(sa)+1e-12))
+    else:
+        flat["swing_ellipse_area_median"] = np.nan
+        flat["swing_ellipse_area_cv"] = np.nan
+
 
     # ---- Add generic per-channel stats/spectrum 31*F from raw array
     A2 = A.reshape(A.shape[0], -1).astype(np.float32, copy=False)
