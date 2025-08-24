@@ -230,23 +230,11 @@ def _spectral_stats(x):
 
 
 def _extract_generic_feats(seq_2d):
-    T, F = seq_2d.shape
-    feats = []
-    feat_names = []
+    T,F=seq_2d.shape; feats=[]
     for j in range(F):
-        x = np.asarray(seq_2d[:, j], np.float32)
-        prefix = f"ch{j:03d}"
-        basic = _basic_stats(x)
-        spec = _spectral_stats(x)
-        feats.append(basic)
-        feats.append(spec)
-        for i in range(len(basic)):
-            feat_names.append(f"{prefix}_stat_{i}")
-        for i in range(len(spec)):
-            feat_names.append(f"{prefix}_spec_{i}")
-    feats = np.concatenate(feats, axis=0).astype(np.float32, copy=False)
-    return feats, feat_names
-
+        x=np.asarray(seq_2d[:,j], np.float32)
+        feats.append(_basic_stats(x)); feats.append(_spectral_stats(x))
+    return np.concatenate(feats, axis=0).astype(np.float32, copy=False)
 
 # -------------------- Feature Extraction --------------------
 
@@ -537,10 +525,8 @@ def extract_features(path: str, schema: Schema, fps: int = 30, stride: int = 1,
     if df.empty:
         out = _empty_row()
         A2 = A.reshape(A.shape[0], -1).astype(np.float32, copy=False)
-        raw_vals, raw_names = _extract_generic_feats(A2)
-        for k, name in enumerate(raw_names):
-            out[name] = float(raw_vals[k])
-
+        raw = _extract_generic_feats(A2)
+        for k, val in enumerate(raw): out[f"raw_{k}"] = float(val)
         return pd.DataFrame([out])
 
     # ---- Aggregates over cycles (all)
@@ -742,9 +728,9 @@ def extract_features(path: str, schema: Schema, fps: int = 30, stride: int = 1,
 
     # ---- Add generic per-channel stats/spectrum 31*F from raw array
     A2 = A.reshape(A.shape[0], -1).astype(np.float32, copy=False)
-    raw_vals, raw_names = _extract_generic_feats(A2)
-    for k, name in enumerate(raw_names):
-        out[name] = float(raw_vals[k])
+    raw = _extract_generic_feats(A2)
+    for k, val in enumerate(raw):
+        flat[f"raw_{k}"] = float(val)
 
     return pd.DataFrame([flat])
 
