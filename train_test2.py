@@ -1076,7 +1076,11 @@ def train_xgb(X: pd.DataFrame, y: np.ndarray, groups: np.ndarray, files: np.ndar
     plot_confusion_matrix(cm, class_names, normalize=True,
                           save_path=os.path.join(out_dir, "confusion_matrix_normalized.png"),
                           title="Confusion Matrix (row-normalized)")
-
+    # --- Feature importance (polnyy CSV)
+    try:
+        dump_feature_importance_csv(bst, feat_names, out_dir)
+    except Exception as e:
+        print("[warn] dump_feature_importance_csv failed:", e)
     # Feature importance (top-25)
     try:
         score = bst.get_score(importance_type="gain")
@@ -1159,6 +1163,29 @@ def predict_one(npy_path: str, schema_path: str, out_dir: str, fps: int = 30, st
         prob = float(cal.transform(np.array([prob]))[0])
     pred = int(prob >= thr)
     return {"file": npy_path, "prob_injury": prob, "pred": pred, "threshold": thr}
+
+def dump_feature_importance_csv(bst: "xgb.Booster", feature_names: List[str], out_dir: str):
+    """
+    Сохраняет полный CSV со всеми фичами и важностями XGBoost.
+    Включены: weight, gain, cover, total_gain, total_cover + нормализованный gain_frac и ранг.
+    """
+    ensure_dir(out_dir)
+    types = ["weight", "gain", "cover", "total_gain", "total_cover"]
+    data = {"feature": list(feature_names)}
+
+    for t in types:
+        imp = bst.get_score(importance_type=t)  # dict: {feat_name: value}
+        data[t] = [float(imp.get(f, 0.0)) for f in feature_names]
+
+    df = pd.DataFrame(data)
+    gsum = df["gain"].sum()
+    df["gain_frac"] = df["gain"] / gsum if gsum > 0 else 0.0
+    df["rank_gain"] = df["gain"].rank(ascending=False, method="min").astype(int)
+
+    out_csv = os.path.join(out_dir, "feature_importance_full.csv")
+    df.sort_values("gain", ascending=False).to_csv(out_csv, index=False)
+    print(f"[feat-importance] saved: {out_csv}")
+
 
 # -------------------- CLI --------------------
 
