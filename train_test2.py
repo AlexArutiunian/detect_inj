@@ -705,7 +705,7 @@ def extract_features(path: str, schema: Schema, fps: int = 30, stride: int = 1,
                 else: j+=1
     flat["ds_ratio"] = float(np.nanmean(ds_vals)) if ds_vals else np.nan
 
-    # Outlier rate across per-step key features
+    # --- Outlier rate across per-step key features
     key = ["step_len","step_time","cadence","stance_time","pelvis_vert_osc","pelvis_ml_osc"]
     count_out = 0; count_all = 0
     for k in key:
@@ -715,9 +715,11 @@ def extract_features(path: str, schema: Schema, fps: int = 30, stride: int = 1,
         med = np.median(vv)
         i = np.percentile(vv, 75) - np.percentile(vv, 25)
         lo = med - 1.5 * i; hi = med + 1.5 * i
-        out = np.sum((vv < lo) | (vv > hi))
-        count_out += int(out); count_all += int(vv.size)
+        n_out = int(np.sum((vv < lo) | (vv > hi)))   # <<< РАНЬШЕ БЫЛО: out = np.sum(...)
+        count_out += n_out
+        count_all += int(vv.size)
     flat["outlier_rate"] = float(count_out / max(1, count_all))
+
 
     # cycles_count
     flat["cycles_count"] = int(len(num))
@@ -745,9 +747,9 @@ def extract_features(path: str, schema: Schema, fps: int = 30, stride: int = 1,
     A2 = A.reshape(A.shape[0], -1).astype(np.float32, copy=False)
     raw_vals, raw_names = _extract_generic_feats(A2)
     for k, name in enumerate(raw_names):
-        out[name] = float(raw_vals[k])
-
+        flat[name] = float(raw_vals[k])   # <<< РАНЬШЕ БЫЛО: out[name] = ...
     return pd.DataFrame([flat])
+
 
 # -------------------- Parallel dataset build --------------------
 
