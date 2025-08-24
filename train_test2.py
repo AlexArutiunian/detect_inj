@@ -981,9 +981,11 @@ def train_xgb(X: pd.DataFrame, y: np.ndarray, groups: np.ndarray, files: np.ndar
     sw_dv = np.where(y_dv == 0, w0, w1).astype(np.float32)
 
     # DMatrix
-    dtrain = xgb.DMatrix(X_tr, label=y_tr, weight=sw_tr)
-    dvalid = xgb.DMatrix(X_dv, label=y_dv, weight=sw_dv)
-    dtest  = xgb.DMatrix(X_te, label=y_te)
+    feat_names = list(X.columns)
+    dtrain = xgb.DMatrix(X_tr, label=y_tr, weight=sw_tr, feature_names=feat_names)
+    dvalid = xgb.DMatrix(X_dv, label=y_dv, weight=sw_dv, feature_names=feat_names)
+    dtest  = xgb.DMatrix(X_te, label=y_te, weight=None, feature_names=feat_names)
+
 
     params = dict(
         objective="binary:logistic",
