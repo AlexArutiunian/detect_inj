@@ -390,6 +390,7 @@ def extract_features(path: str, schema: Schema, fps: int = 30, stride: int = 1,
     net = np.linalg.norm(horiz[-1]-horiz[0])
     seglen = np.linalg.norm(np.diff(horiz, axis=0), axis=1)
     path_straightness = float(net / (seglen.sum()+1e-6))
+    flat = {}
     if len(horiz) >= 3:
         v = np.gradient(horiz, axis=0)
         a = np.gradient(v, axis=0)
