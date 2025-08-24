@@ -24,7 +24,7 @@ import json
 import argparse
 import warnings
 from pathlib import Path
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 import importlib.util
 
 import numpy as np
@@ -161,7 +161,8 @@ def main():
                 skipped += 1
                 tqdm.write(f"[skip] {p} -> {type(e).__name__}: {e}")
     else:
-        with ProcessPoolExecutor(max_workers=args.workers) as ex:
+        pool = ThreadPoolExecutor(max_workers=args.workers)
+        with pool as ex:
             futs = [
                 ex.submit(
                     _process_one,
