@@ -1,0 +1,13 @@
+{
+  "manifest_csv": "detect_inj/run_data.csv",
+  "data_dir": "/kaggle/input/detect-inj-by-run/npy_run",
+  "fps": 60,
+  "stride": 2,
+  "fast_axes": true,
+  "n_samples": 1832,
+  "n_features": 2725,
+  "positives": 1370,
+  "negatives": 462,
+  "schema": "/kaggle/working/detect_inj/schema_joints.json",
+  "turn_curv_thr": 0.15
+}
