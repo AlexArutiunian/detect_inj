@@ -667,7 +667,7 @@ def find_threshold_balanced(y_true, probs, target_r1=0.95, target_r0=0.90):
         r0 = recall_score(y_true, pred, pos_label=0)
         bal = 0.5*(r1 + r0)
         if (r1 >= target_r1) and (r0 >= target_r0):
-            if not best["ok"] or bal > best["bal"]):
+            if not best["ok"] or bal > best["bal"]:
                 best = {"thr": float(thr), "r1": float(r1), "r0": float(r0), "ok": True, "bal": float(bal)}
         if not best["ok"] and bal > best["bal"]:
             best = {"thr": float(thr), "r1": float(r1), "r0": float(r0), "ok": False, "bal": float(bal)}
