@@ -390,6 +390,7 @@ def extract_features(path: str, schema: Schema, fps: int = 30, stride: int = 1,
     net = np.linalg.norm(horiz[-1]-horiz[0])
     seglen = np.linalg.norm(np.diff(horiz, axis=0), axis=1)
     path_straightness = float(net / (seglen.sum()+1e-6))
+    flat = {}
     if len(horiz) >= 3:
         v = np.gradient(horiz, axis=0)
         a = np.gradient(v, axis=0)
@@ -537,8 +538,10 @@ def extract_features(path: str, schema: Schema, fps: int = 30, stride: int = 1,
     if df.empty:
         out = _empty_row()
         A2 = A.reshape(A.shape[0], -1).astype(np.float32, copy=False)
-        raw = _extract_generic_feats(A2)
-        for k, val in enumerate(raw): out[f"raw_{k}"] = float(val)
+        raw_vals, raw_names = _extract_generic_feats(A2)
+        for k, name in enumerate(raw_names):
+            out[name] = float(raw_vals[k])
+
         return pd.DataFrame([out])
 
     # ---- Aggregates over cycles (all)
@@ -702,7 +705,7 @@ def extract_features(path: str, schema: Schema, fps: int = 30, stride: int = 1,
                 else: j+=1
     flat["ds_ratio"] = float(np.nanmean(ds_vals)) if ds_vals else np.nan
 
-    # Outlier rate across per-step key features
+    # --- Outlier rate across per-step key features
     key = ["step_len","step_time","cadence","stance_time","pelvis_vert_osc","pelvis_ml_osc"]
     count_out = 0; count_all = 0
     for k in key:
@@ -712,9 +715,11 @@ def extract_features(path: str, schema: Schema, fps: int = 30, stride: int = 1,
         med = np.median(vv)
         i = np.percentile(vv, 75) - np.percentile(vv, 25)
         lo = med - 1.5 * i; hi = med + 1.5 * i
-        out = np.sum((vv < lo) | (vv > hi))
-        count_out += int(out); count_all += int(vv.size)
+        n_out = int(np.sum((vv < lo) | (vv > hi)))   # <<< РАНЬШЕ БЫЛО: out = np.sum(...)
+        count_out += n_out
+        count_all += int(vv.size)
     flat["outlier_rate"] = float(count_out / max(1, count_all))
+
 
     # cycles_count
     flat["cycles_count"] = int(len(num))
@@ -740,11 +745,11 @@ def extract_features(path: str, schema: Schema, fps: int = 30, stride: int = 1,
 
     # ---- Add generic per-channel stats/spectrum 31*F from raw array
     A2 = A.reshape(A.shape[0], -1).astype(np.float32, copy=False)
-    raw = _extract_generic_feats(A2)
-    for k, val in enumerate(raw):
-        flat[f"raw_{k}"] = float(val)
-
+    raw_vals, raw_names = _extract_generic_feats(A2)
+    for k, name in enumerate(raw_names):
+        flat[name] = float(raw_vals[k])   # <<< РАНЬШЕ БЫЛО: out[name] = ...
     return pd.DataFrame([flat])
+
 
 # -------------------- Parallel dataset build --------------------
 
@@ -979,9 +984,11 @@ def train_xgb(X: pd.DataFrame, y: np.ndarray, groups: np.ndarray, files: np.ndar
     sw_dv = np.where(y_dv == 0, w0, w1).astype(np.float32)
 
     # DMatrix
-    dtrain = xgb.DMatrix(X_tr, label=y_tr, weight=sw_tr)
-    dvalid = xgb.DMatrix(X_dv, label=y_dv, weight=sw_dv)
-    dtest  = xgb.DMatrix(X_te, label=y_te)
+    feat_names = list(X.columns)
+    dtrain = xgb.DMatrix(X_tr, label=y_tr, weight=sw_tr, feature_names=feat_names)
+    dvalid = xgb.DMatrix(X_dv, label=y_dv, weight=sw_dv, feature_names=feat_names)
+    dtest  = xgb.DMatrix(X_te, label=y_te, weight=None, feature_names=feat_names)
+
 
     params = dict(
         objective="binary:logistic",
@@ -1069,7 +1076,11 @@ def train_xgb(X: pd.DataFrame, y: np.ndarray, groups: np.ndarray, files: np.ndar
     plot_confusion_matrix(cm, class_names, normalize=True,
                           save_path=os.path.join(out_dir, "confusion_matrix_normalized.png"),
                           title="Confusion Matrix (row-normalized)")
-
+    # --- Feature importance (polnyy CSV)
+    try:
+        dump_feature_importance_csv(bst, feat_names, out_dir)
+    except Exception as e:
+        print("[warn] dump_feature_importance_csv failed:", e)
     # Feature importance (top-25)
     try:
         score = bst.get_score(importance_type="gain")
@@ -1152,6 +1163,29 @@ def predict_one(npy_path: str, schema_path: str, out_dir: str, fps: int = 30, st
         prob = float(cal.transform(np.array([prob]))[0])
     pred = int(prob >= thr)
     return {"file": npy_path, "prob_injury": prob, "pred": pred, "threshold": thr}
+
+def dump_feature_importance_csv(bst: "xgb.Booster", feature_names: List[str], out_dir: str):
+    """
+    Сохраняет полный CSV со всеми фичами и важностями XGBoost.
+    Включены: weight, gain, cover, total_gain, total_cover + нормализованный gain_frac и ранг.
+    """
+    ensure_dir(out_dir)
+    types = ["weight", "gain", "cover", "total_gain", "total_cover"]
+    data = {"feature": list(feature_names)}
+
+    for t in types:
+        imp = bst.get_score(importance_type=t)  # dict: {feat_name: value}
+        data[t] = [float(imp.get(f, 0.0)) for f in feature_names]
+
+    df = pd.DataFrame(data)
+    gsum = df["gain"].sum()
+    df["gain_frac"] = df["gain"] / gsum if gsum > 0 else 0.0
+    df["rank_gain"] = df["gain"].rank(ascending=False, method="min").astype(int)
+
+    out_csv = os.path.join(out_dir, "feature_importance_full.csv")
+    df.sort_values("gain", ascending=False).to_csv(out_csv, index=False)
+    print(f"[feat-importance] saved: {out_csv}")
+
 
 # -------------------- CLI --------------------
 
