@@ -742,9 +742,9 @@ def extract_features(path: str, schema: Schema, fps: int = 30, stride: int = 1,
 
     # ---- Add generic per-channel stats/spectrum 31*F from raw array
     A2 = A.reshape(A.shape[0], -1).astype(np.float32, copy=False)
-    raw = _extract_generic_feats(A2)
-    for k, val in enumerate(raw):
-        flat[f"raw_{k}"] = float(val)
+    raw_vals, raw_names = _extract_generic_feats(A2)
+    for k, name in enumerate(raw_names):
+        out[name] = float(raw_vals[k])
 
     return pd.DataFrame([flat])
 
