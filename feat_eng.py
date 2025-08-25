@@ -43,20 +43,6 @@ def guess_subject_id(filename: str) -> str:
     m = re.match(r"(\d{8})", b)
     return m.group(1) if m else b.split("T")[0][:8]
 
-def label_to_int(v):
-    if v is None:
-        return np.nan
-    s = str(v).strip().lower()
-    if s in ("1", "0"):
-        return int(s)
-    if s.startswith("inj"):      # "inj", "injury", ...
-        return 1
-    if s.startswith("no"):       # "no inj", "no-injury", ...
-        return 0
-    try:
-        return int(float(s))
-    except Exception:
-        return np.nan
 
 # -------------------- Schema / I/O --------------------
 
@@ -208,7 +194,8 @@ def spectral_extras(x: np.ndarray, fps: int, f0: Optional[float]) -> Dict[str, f
     x = np.asarray(x, np.float32) - np.nanmean(x)
     n = len(x)
     out = dict(spec_flatness=np.nan, spec_centroid=np.nan, spec_spread=np.nan,
-               peak_width_hz=np.nan, peak_prominence=np.nan)
+               peak_width_hz=np.nan, peak_prominence=np.nan,
+               spec_entropy=np.nan)  # NEW
     if n < 16:
         return out
     fft = np.fft.rfft(x * np.hanning(n))
@@ -221,6 +208,9 @@ def spectral_extras(x: np.ndarray, fps: int, f0: Optional[float]) -> Dict[str, f
     spread = float(np.sqrt(np.sum(p * (freqs - centroid)**2) / np.sum(p)))
     out["spec_centroid"] = centroid
     out["spec_spread"] = spread
+    # NEW: spectral entropy
+    pp = p / np.sum(p)
+    out["spec_entropy"] = float(-np.sum(pp * np.log(pp + 1e-12)))
     if f0 is None or not np.isfinite(f0):
         mask = (freqs >= 0.5) & (freqs <= 3.0)
         if not mask.any(): return out
@@ -254,6 +244,78 @@ def acf_regularities(x: np.ndarray, fps: int, f0: Optional[float]) -> Dict[str, 
         return float(np.sum(v0 * v1) / (np.sum(x * x) + 1e-12))
     a1 = acf_at(L); a2 = acf_at(2 * L)
     return dict(acf_at_step=a1, acf_at_2step=a2, acf_ratio_2_1=(a2 / (abs(a1) + 1e-6)))
+
+# NEW: helpers for extra stats / cross-corr / jerk
+def _nan_skew(v: np.ndarray) -> float:
+    v = v[np.isfinite(v)]
+    if v.size < 3: return np.nan
+    m = v.mean(); s = v.std()
+    if s <= 0: return 0.0
+    z = (v - m) / s
+    return float(np.mean(z**3))
+
+def _nan_kurt(v: np.ndarray) -> float:
+    v = v[np.isfinite(v)]
+    if v.size < 4: return np.nan
+    m = v.mean(); s = v.std()
+    if s <= 0: return -3.0
+    z = (v - m) / s
+    return float(np.mean(z**4) - 3.0)  # Fisher
+
+def _mad(v: np.ndarray) -> float:
+    v = v[np.isfinite(v)]
+    if v.size == 0: return np.nan
+    med = np.median(v)
+    return float(np.median(np.abs(v - med)))
+
+def _iqr(v: np.ndarray) -> float:
+    v = v[np.isfinite(v)]
+    if v.size == 0: return np.nan
+    return float(np.percentile(v, 75) - np.percentile(v, 25))
+
+def _cv(v: np.ndarray) -> float:
+    v = v[np.isfinite(v)]
+    if v.size == 0: return np.nan
+    m = np.mean(v); s = np.std(v)
+    return float(s / (abs(m) + 1e-6))
+
+def _rmssd(v: np.ndarray) -> float:
+    v = v[np.isfinite(v)]
+    if v.size < 3: return np.nan
+    d = np.diff(v)
+    return float(np.sqrt(np.mean(d*d)))
+
+def _roll_median_std(v: np.ndarray, w: int = 5) -> float:
+    v = v[np.isfinite(v)]
+    if v.size < w + 2: return np.nan
+    med = pd.Series(v).rolling(window=w, center=True, min_periods=w//2).median()
+    return float(np.nanstd(med.values))
+
+def _crosscorr_max(x: np.ndarray, y: np.ndarray, max_lag: int) -> Tuple[float, float]:
+    x = np.asarray(x, np.float32); y = np.asarray(y, np.float32)
+    n = min(len(x), len(y))
+    if n < 6: return np.nan, np.nan
+    x = x - np.mean(x); y = y - np.mean(y)
+    denom = (np.linalg.norm(x) * np.linalg.norm(y) + 1e-12)
+    best_c, best_l = 0.0, 0
+    for L in range(-max_lag, max_lag+1):
+        if L < 0:
+            a = x[-L:]; b = y[:n+L]
+        elif L > 0:
+            a = x[:n-L]; b = y[L:]
+        else:
+            a = x; b = y
+        if len(a) < 4: continue
+        c = float(np.sum(a*b) / denom)
+        if abs(c) > abs(best_c):
+            best_c, best_l = c, L
+    return float(best_c), float(best_l)
+
+def _jerk_rms(sig: np.ndarray) -> float:
+    v = np.gradient(sig)
+    a = np.gradient(v)
+    j = np.gradient(a)
+    return float(np.sqrt(np.nanmean(j*j)))
 
 
 # -------------------- Feature extraction --------------------
@@ -303,6 +365,8 @@ def extract_features(path: str, schema: Schema, fps: int = 30, stride: int = 1,
 
     # per-step features
     rows = []
+    cntL = 0  # NEW
+    cntR = 0  # NEW
     for side in ("L", "R"):
         foot = cogs.get(f"{side}_foot"); sh = axes.get(f"{side}_shank")
         th = axes.get(f"{side}_thigh"); pel_ax = axes.get("pelvis")
@@ -322,9 +386,13 @@ def extract_features(path: str, schema: Schema, fps: int = 30, stride: int = 1,
                              rom_knee=np.nan, rom_hip=np.nan, rom_ankle=np.nan,
                              stance_time=np.nan, duty_factor=np.nan,
                              kappa_med=np.nan, foot_clearance=np.nan))
+            if side == "L": cntL += 1
+            else: cntR += 1
         else:
-            for k in range(len(fs_idx) - 1):
-                a, b = int(fs_idx[k]), int(fs_idx[k + 1])
+            if side == "L": cntL += max(0, len(fs_idx)-1)
+            else: cntR += max(0, len(fs_idx)-1)
+            for k_i in range(len(fs_idx) - 1):
+                a, b = int(fs_idx[k_i]), int(fs_idx[k_i + 1])
                 if b - a < max(4, int(0.2 * fps)): continue
                 segslice = slice(a, b + 1)
                 step_time = (b - a) / max(1, fps)
@@ -348,7 +416,7 @@ def extract_features(path: str, schema: Schema, fps: int = 30, stride: int = 1,
 
     df = pd.DataFrame(rows)
 
-    # aggregates
+    # aggregates (basic)
     base = dict(
         step_time_median=np.nan, step_time_mean=np.nan, step_time_std=0.0,
         cadence_median=np.nan, cadence_mean=np.nan, cadence_std=0.0,
@@ -369,7 +437,98 @@ def extract_features(path: str, schema: Schema, fps: int = 30, stride: int = 1,
         out = {f"{feat}_{stat}": float(agg.loc[feat, stat]) for feat in agg.index for stat in agg.columns}
         out["cycles_count"] = int(len(df))
 
-    # path / spectral / HR / ACF
+    # NEW: extended stats over per-step metrics
+    def add_stats(colname: str, prefix: str):
+        if colname not in df.columns: 
+            out[f"{prefix}_min"] = np.nan; out[f"{prefix}_max"] = np.nan
+            out[f"{prefix}_p10"] = np.nan; out[f"{prefix}_p90"] = np.nan
+            out[f"{prefix}_iqr"] = np.nan; out[f"{prefix}_cv"]  = np.nan
+            out[f"{prefix}_skew"] = np.nan; out[f"{prefix}_kurt"] = np.nan
+            out[f"{prefix}_mad"]  = np.nan
+            return
+        v = df[colname].to_numpy(dtype=float)
+        msk = np.isfinite(v); v = v[msk]
+        if v.size == 0:
+            out[f"{prefix}_min"] = out[f"{prefix}_max"] = np.nan
+            out[f"{prefix}_p10"] = out[f"{prefix}_p90"] = np.nan
+            out[f"{prefix}_iqr"] = out[f"{prefix}_cv"]  = np.nan
+            out[f"{prefix}_skew"] = out[f"{prefix}_kurt"] = np.nan
+            out[f"{prefix}_mad"]  = np.nan
+        else:
+            out[f"{prefix}_min"]  = float(np.min(v))
+            out[f"{prefix}_max"]  = float(np.max(v))
+            out[f"{prefix}_p10"]  = float(np.percentile(v, 10))
+            out[f"{prefix}_p90"]  = float(np.percentile(v, 90))
+            out[f"{prefix}_iqr"]  = _iqr(v)
+            out[f"{prefix}_cv"]   = _cv(v)
+            out[f"{prefix}_skew"] = _nan_skew(v)
+            out[f"{prefix}_kurt"] = _nan_kurt(v)
+            out[f"{prefix}_mad"]  = _mad(v)
+
+    for c in ["step_time","cadence","step_len","step_speed",
+              "pelvis_vert_osc","pelvis_ml_osc","pelvis_ap_osc","foot_clearance"]:
+        add_stats(c, c)
+
+    # NEW: RMSSD and cadence drift
+    for c in ["step_time","step_len","cadence"]:
+        if c in df.columns:
+            v = df[c].to_numpy(dtype=float)
+            out[f"rmssd_{c}"] = _rmssd(v)
+            if c == "cadence":
+                out["drift_cadence_std"] = _roll_median_std(v, w=5)
+    if "drift_cadence_std" not in out: out["drift_cadence_std"] = np.nan
+
+    # NEW: cycles per side
+    out["cycles_count_L"] = int(cntL)
+    out["cycles_count_R"] = int(cntR)
+
+    # NEW: step width stats (ML distance between feet)
+    if ("L_foot" in cogs) and ("R_foot" in cogs):
+        sw = np.abs(cogs["L_foot"][:,2] - cogs["R_foot"][:,2]).astype(float)
+        sw = sw[np.isfinite(sw)]
+        if sw.size:
+            out["step_width_ml_median"] = float(np.median(sw))
+            out["step_width_ml_mean"]   = float(np.mean(sw))
+            out["step_width_ml_std"]    = float(np.std(sw))
+            out["step_width_ml_cv"]     = _cv(sw)
+            out["step_width_ml_iqr"]    = _iqr(sw)
+        else:
+            out["step_width_ml_median"]=out["step_width_ml_mean"]=np.nan
+            out["step_width_ml_std"]=out["step_width_ml_cv"]=out["step_width_ml_iqr"]=np.nan
+    else:
+        out["step_width_ml_median"]=out["step_width_ml_mean"]=np.nan
+        out["step_width_ml_std"]=out["step_width_ml_cv"]=out["step_width_ml_iqr"]=np.nan
+
+    # NEW: asymmetry by side (median L vs R)
+    if not df.empty and "side" in df.columns:
+        try:
+            Lmed = df.loc[df["side"]=="L"].median(numeric_only=True)
+            Rmed = df.loc[df["side"]=="R"].median(numeric_only=True)
+            def asym(a, b):
+                num = abs(a - b); den = (abs(a) + abs(b))/2.0 + 1e-6
+                return float(num/den)
+            for col in ["step_len","step_time","cadence","pelvis_ml_osc"]:
+                if (col in Lmed) and (col in Rmed) and np.isfinite(Lmed[col]) and np.isfinite(Rmed[col]):
+                    out[f"asym_{col}"] = asym(Lmed[col], Rmed[col])
+                else:
+                    out[f"asym_{col}"] = np.nan
+        except Exception:
+            for col in ["step_len","step_time","cadence","pelvis_ml_osc"]:
+                out[f"asym_{col}"] = np.nan
+    else:
+        for col in ["step_len","step_time","cadence","pelvis_ml_osc"]:
+            out[f"asym_{col}"] = np.nan
+
+    # NEW: jerk RMS of pelvis + normalized jerk
+    out["pelvis_jerk_rms_x"] = _jerk_rms(pelvis[:,0])
+    out["pelvis_jerk_rms_y"] = _jerk_rms(pelvis[:,1])
+    out["pelvis_jerk_rms_z"] = _jerk_rms(pelvis[:,2])
+    mean_step_t = float(out.get("step_time_mean", np.nan))
+    mean_step_l = float(out.get("step_len_mean",  np.nan))
+    denom_norm = (abs(mean_step_t) * abs(mean_step_l) + 1e-6)
+    out["pelvis_jerk_norm"] = (out["pelvis_jerk_rms_y"] + out["pelvis_jerk_rms_z"]) / denom_norm
+
+    # path / spectral / HR / ACF (+ entropy)
     out.update({
         "path_straightness": path_straightness,
         "path_curv_mean": path_curv_mean,
@@ -380,12 +539,39 @@ def extract_features(path: str, schema: Schema, fps: int = 30, stride: int = 1,
         "specY_flatness": specY["spec_flatness"], "specY_centroid": specY["spec_centroid"],
         "specY_spread":   specY["spec_spread"],   "specY_peak_width_hz": specY["peak_width_hz"],
         "specY_peak_prominence": specY["peak_prominence"],
+        "specY_entropy":  specY["spec_entropy"],  # NEW
         "specZ_flatness": specZ["spec_flatness"], "specZ_centroid": specZ["spec_centroid"],
         "specZ_spread":   specZ["spec_spread"],   "specZ_peak_width_hz": specZ["peak_width_hz"],
         "specZ_peak_prominence": specZ["peak_prominence"],
+        "specZ_entropy":  specZ["spec_entropy"],  # NEW
         "acfY_step": acfY["acf_at_step"], "acfY_2step": acfY["acf_at_2step"], "acfY_ratio": acfY["acf_ratio_2_1"],
         "acfZ_step": acfZ["acf_at_step"], "acfZ_2step": acfZ["acf_at_2step"], "acfZ_ratio": acfZ["acf_ratio_2_1"],
     })
+
+    # NEW: cross-correlation L/R (AP=x, ML=z)
+    if ("L_foot" in cogs) and ("R_foot" in cogs):
+        maxlag = int(0.5 * fps)
+        cc_ap, lag_ap = _crosscorr_max(cogs["L_foot"][:,0], cogs["R_foot"][:,0], maxlag)
+        cc_ml, lag_ml = _crosscorr_max(cogs["L_foot"][:,2], cogs["R_foot"][:,2], maxlag)
+        out["cc_AP"] = float(cc_ap); out["cc_AP_lag"] = float(lag_ap / fps)
+        out["cc_ML"] = float(cc_ml); out["cc_ML_lag"] = float(lag_ml / fps)
+    else:
+        out["cc_AP"]=out["cc_AP_lag"]=out["cc_ML"]=out["cc_ML_lag"]=np.nan
+
+    # NEW: outlier rate across key step features
+    key = ["step_len","step_time","cadence","pelvis_vert_osc","pelvis_ml_osc","pelvis_ap_osc"]
+    count_out = 0; count_all = 0
+    for kf in key:
+        if kf not in df.columns: continue
+        v = df[kf].to_numpy(dtype=float)
+        v = v[np.isfinite(v)]
+        if v.size < 3: continue
+        med = np.median(v)
+        iqr = np.percentile(v, 75) - np.percentile(v, 25)
+        lo = med - 1.5 * iqr; hi = med + 1.5 * iqr
+        count_out += int(np.sum((v < lo) | (v > hi)))
+        count_all += int(v.size)
+    out["outlier_rate"] = float(count_out / max(1, count_all))
 
     return pd.DataFrame([out])
 
@@ -488,7 +674,7 @@ def main():
     # decide label column
     label_col = args.label_col
     if label_col is None:
-        for cand in ["label", "injury", "target", "y", "class", "No inj/ inj"]:
+        for cand in ["label", "injury", "target", "y", "class"]:
             if cand in labels_df.columns:
                 label_col = cand
                 break
@@ -497,12 +683,12 @@ def main():
 
     # decide filename column
     fname_col = None
-    for cand in ["filename", "file", "path", "basename", "stem", "name"]:
+    for cand in ["filename", "file", "path", "basename", "stem"]:
         if cand in labels_df.columns:
             fname_col = cand
             break
     if fname_col is None:
-        raise SystemExit("[err] Filename column not found in CSV (expected one of: filename/file/path/basename/stem/name)")
+        raise SystemExit("[err] Filename column not found in CSV (expected one of: filename/file/path/basename/stem)")
 
     def norm_stem(s: str) -> str:
         b = os.path.basename(str(s))
@@ -512,19 +698,11 @@ def main():
     labels_df["_key"] = labels_df[fname_col].astype(str).map(norm_stem)
     meta_df["_key"]   = meta_df["stem"].astype(str).map(lambda x: str(x).lower())
 
-    # Оставляем по одному ряду на ключ и нормализуем метку -> 0/1
-    labels_df_small = (
-        labels_df[["_key", label_col]]
-        .drop_duplicates("_key", keep="last")
-        .rename(columns={label_col: "label"})
-    )
-    labels_df_small["label"] = labels_df_small["label"].map(label_to_int)
+    dups = labels_df["_key"].duplicated(keep="last").sum()
+    if dups:
+        print(f"[warn] CSV has {dups} duplicate filename rows — keeping last.")
 
-    # Удаляем старую пустую колонку label, чтобы не получить label_x/label_y
-    if "label" in meta_df.columns:
-        meta_df.drop(columns=["label"], inplace=True)
-
-    # merge
+    labels_df_small = labels_df[["_key", label_col]].drop_duplicates("_key", keep="last").rename(columns={label_col: "label"})
     meta_df = meta_df.merge(labels_df_small, on="_key", how="left")
     meta_df.drop(columns=["_key"], inplace=True, errors="ignore")
 
@@ -533,7 +711,6 @@ def main():
     cnt1 = int((meta_df["label"] == 1).sum())
     cntN = int(meta_df["label"].isna().sum())
     print(f"[labels] 0={cnt0}  1={cnt1}  missing={cntN}")
-
 
     # keep only numeric features
     feats_num = feats_df.select_dtypes(include=[np.number]).copy()
