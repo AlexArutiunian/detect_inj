@@ -1,7 +1,8 @@
 label,InjuryClass
 1,No Injury
 2,Knee
-3,Leg
-4,Foot/Ankle
-5,Hip/Pelvis
-6,Lower Back
+3,Lower Leg
+4,Thigh
+5,Foot
+6,Hip/Pelvis
+7,Ankle
