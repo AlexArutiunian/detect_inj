@@ -482,7 +482,29 @@ def main():
     meta_df = pd.DataFrame(rows_meta)
     feats_df = pd.DataFrame(rows_feats)
     feats_num = feats_df.select_dtypes(include=[np.number]).copy()
+    
+    # --- фикс: индексы по строкам и уникальные имена колонок ---
+    meta_df = meta_df.reset_index(drop=True)
+    feats_num = feats_num.reset_index(drop=True)
+
+    # если вдруг появились дубликаты фичей (одинаковые имена колонок) — оставляем первые
+    dup_cols = feats_num.columns[feats_num.columns.duplicated(keep="first")]
+    if len(dup_cols) > 0:
+        print(f"[warn] Найдены дубликаты фичей, будут удалены: {list(dup_cols)}")
+        feats_num = feats_num.loc[:, ~feats_num.columns.duplicated(keep="first")]
+
+    # (опционально) проверим длины на всякий случай
+    if len(meta_df) != len(feats_num):
+        print(f"[warn] Размерности не совпадают: meta={len(meta_df)} feats={len(feats_num)} — выравниваю по минимальному")
+        n = min(len(meta_df), len(feats_num))
+        meta_df = meta_df.iloc[:n].reset_index(drop=True)
+        feats_num = feats_num.iloc[:n].reset_index(drop=True)
+
+    # теперь безопасно
     final = pd.concat([meta_df, feats_num], axis=1)
+
+        
+
 
     final_csv = out_dir / "features.csv"
     final.to_csv(final_csv, index=False)
