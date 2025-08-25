@@ -8,6 +8,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import (
     classification_report, roc_auc_score, confusion_matrix, recall_score
 )
+from sklearn.utils.class_weight import compute_class_weight
 import xgboost as xgb
 
 def stem_lower(s: str) -> str:
@@ -25,24 +26,30 @@ def map_label(v):
     return np.nan
 
 def pick_threshold_by_dev(prob_dev: np.ndarray, y_dev: np.ndarray,
-                          min_recall_pos: float = 0.90) -> float:
-    """Сканируем thr ∈ [0.05..0.95] и выбираем тот, который
-       максимизирует среднюю recall (r0+r1)/2 при условии recall(1)≥min_recall_pos.
-       Если DEV одно-классовый, возвращаем 0.5.
+                          min_recall_pos: float = 0.90,
+                          min_recall_neg: float = 0.0) -> float:
+    """
+    Сканируем thr и выбираем тот, где:
+      1) recall(1) >= min_recall_pos и recall(0) >= min_recall_neg
+      2) максимизируется сбалансированная полнота 0.5*(r0+r1).
+    Если DEV одно-классовый — thr=0.5.
     """
     if len(np.unique(y_dev)) < 2:
         print("[thr] WARNING: DEV одно-классовый → thr=0.5")
         return 0.5
-    thr_grid = np.linspace(0.05, 0.95, 181)
+
+    thr_grid = np.linspace(0.01, 0.99, 199)
     best_thr, best_bal, best_r0, best_r1 = 0.5, -1.0, 0.0, 0.0
     for thr in thr_grid:
         pp = (prob_dev >= thr).astype(int)
         r0 = recall_score(y_dev, pp, pos_label=0)
         r1 = recall_score(y_dev, pp, pos_label=1)
-        bal = 0.5 * (r0 + r1)
-        if (r1 >= min_recall_pos) and (bal > best_bal):
-            best_thr, best_bal, best_r0, best_r1 = float(thr), float(bal), float(r0), float(r1)
-    if best_bal < 0:  # не нашлось с ограничением → возьмём просто максимальный bal
+        if (r1 >= min_recall_pos) and (r0 >= min_recall_neg):
+            bal = 0.5 * (r0 + r1)
+            if bal > best_bal:
+                best_thr, best_bal, best_r0, best_r1 = float(thr), float(bal), float(r0), float(r1)
+
+    if best_bal < 0:  # не нашлось с ограничениями → просто max(bal)
         for thr in thr_grid:
             pp = (prob_dev >= thr).astype(int)
             r0 = recall_score(y_dev, pp, pos_label=0)
@@ -50,6 +57,7 @@ def pick_threshold_by_dev(prob_dev: np.ndarray, y_dev: np.ndarray,
             bal = 0.5 * (r0 + r1)
             if bal > best_bal:
                 best_thr, best_bal, best_r0, best_r1 = float(thr), float(bal), float(r0), float(r1)
+
     print(f"[thr] chosen on DEV={best_thr:.3f} | recall0={best_r0:.3f} recall1={best_r1:.3f} bal={best_bal:.3f}")
     return best_thr
 
@@ -61,7 +69,14 @@ def main():
     ap.add_argument("--fname_in_labels", default=None, help="Колонка с именем файла в labels_csv (auto: filename/file/path/basename/stem)")
     ap.add_argument("--out_dir", default="out_xgb_simple")
     ap.add_argument("--use_gpu", action="store_true")
+    # что оптимизировать ранней остановкой
+    ap.add_argument("--eval_metric", choices=["auc","aucpr","logloss"], default="auc",
+                    help="Метрика для early stopping (по DEV)")
+    # требования к полнотам при подборе порога
     ap.add_argument("--min_recall_pos", type=float, default=0.90, help="Цель по recall(класс=1) при подборе thr на DEV")
+    ap.add_argument("--min_recall_neg", type=float, default=0.0,  help="Минимальная recall(класс=0) при подборе thr")
+    # усиление класса 0 на трейне
+    ap.add_argument("--w0_scale", type=float, default=1.0, help="Множитель веса для класса 0 в трейне (усилить здоровых)")
     args = ap.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -119,39 +134,50 @@ def main():
     feature_names = list(X.columns)
     X = X.to_numpy(dtype=np.float32)
 
-    # 4) subject-agnostic сплит: Train/Dev/Test = 60/20/20
+    # 4) Train/Dev/Test = 60/20/20 (Test фиксируем первым сплитом)
     X_tr_all, X_te, y_tr_all, y_te = train_test_split(X, y, test_size=0.20, random_state=42, stratify=y)
     X_tr, X_dv, y_tr, y_dv = train_test_split(X_tr_all, y_tr_all, test_size=0.25, random_state=42, stratify=y_tr_all)
     print(f"[split] train={len(y_tr)}  dev={len(y_dv)}  test={len(y_te)}")
 
-    # 5) XGBoost (учим на TRAIN, early stopping по DEV)
+    # 5) class weights: сбалансировать + усилить класс 0 по флагу
+    cw = compute_class_weight(class_weight="balanced", classes=np.array([0,1], dtype=int), y=y_tr)
+    w0, w1 = float(cw[0]) * float(args.w0_scale), float(cw[1])
+    sw_tr = np.where(y_tr == 0, w0, w1).astype(np.float32)
+
+    # 6) XGBoost: ранняя остановка по выбранной метрике (maximize для auc/aucpr)
     clf = xgb.XGBClassifier(
-        n_estimators=2000,
-        learning_rate=0.05,
+        n_estimators=4000,
+        learning_rate=0.03,
         max_depth=6,
         min_child_weight=6,
-        subsample=0.85,
-        colsample_bytree=0.85,
+        subsample=0.9,
+        colsample_bytree=0.9,
         reg_lambda=1.0,
         objective="binary:logistic",
         tree_method="gpu_hist" if args.use_gpu else "hist",
-        eval_metric="logloss",
+        eval_metric=args.eval_metric,  # <— ключевое
         random_state=42,
         n_jobs=0,
     )
 
+    # в sklearn-обёртке maximize выбирается автоматически для auc/aucpr
     clf.fit(
         X_tr, y_tr,
+        sample_weight=sw_tr,
         eval_set=[(X_dv, y_dv)],
         verbose=False,
-        early_stopping_rounds=100
+        early_stopping_rounds=200
     )
 
-    # 6) подбор порога на DEV
+    # 7) подбор порога на DEV
     prob_dv = clf.predict_proba(X_dv)[:, 1]
-    thr = pick_threshold_by_dev(prob_dv, y_dv, min_recall_pos=args.min_recall_pos)
+    thr = pick_threshold_by_dev(
+        prob_dv, y_dv,
+        min_recall_pos=args.min_recall_pos,
+        min_recall_neg=args.min_recall_neg
+    )
 
-    # 7) финальные метрики на TEST при выбранном thr
+    # 8) метрики на TEST (AUC + отчёт при выбранном thr)
     prob_te = clf.predict_proba(X_te)[:, 1]
     pred_te = (prob_te >= thr).astype(int)
     auc_te = roc_auc_score(y_te, prob_te)
@@ -162,15 +188,15 @@ def main():
     print("[TEST] Confusion matrix:\n", cm_te)
     print("\n[TEST] Report:\n", rep_te)
 
-    # 8) сохранения: модель, список фич, выбранный порог, импорта́нсы
+    # 9) сохранения: модель, список фич, выбранный порог, импорта́нсы, метрики
     booster = clf.get_booster()
     booster.save_model(os.path.join(args.out_dir, "xgb.json"))
-    json.dump(feature_names, open(os.path.join(args.out_dir, "features_cols.json"), "w"), ensure_ascii=False, indent=2)
+    json.dump(feature_names, open(os.path.join(args.out_dir, "features_cols.json"), "w"),
+              ensure_ascii=False, indent=2)
     open(os.path.join(args.out_dir, "threshold.txt"), "w").write(str(thr))
 
-    bst = clf.get_booster()
     kinds = ["gain","total_gain","weight","cover","total_cover"]
-    scores = {k: bst.get_score(importance_type=k) for k in kinds}
+    scores = {k: booster.get_score(importance_type=k) for k in kinds}
     imp = pd.DataFrame({
         "feature": feature_names,
         **{k: [scores[k].get(f"f{i}", 0.0) for i in range(len(feature_names))] for k in kinds}
@@ -179,14 +205,16 @@ def main():
         .sort_values("total_gain", ascending=False)
         .to_csv(os.path.join(args.out_dir, "feature_importance.csv"), index=False))
 
-    # 9) быстрый dump метрик
     metrics = {
         "dev_threshold": float(thr),
         "test_auc": float(auc_te),
         "test_confusion_matrix": cm_te.tolist(),
         "test_report": rep_te,
+        "eval_metric": args.eval_metric,
+        "w0_scale": args.w0_scale
     }
-    json.dump(metrics, open(os.path.join(args.out_dir, "metrics.json"), "w"), ensure_ascii=False, indent=2)
+    json.dump(metrics, open(os.path.join(args.out_dir, "metrics.json"), "w"),
+              ensure_ascii=False, indent=2)
 
     print("\n[done] saved to", args.out_dir)
 
