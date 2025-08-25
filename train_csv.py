@@ -1,269 +1,195 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+"""
+Train XGBoost on features.csv + labels CSV (filename -> Injury/No Injury).
+
+- subject-wise split 60/20/20 (GroupShuffleSplit)
+- removes leakage cols: file/basename/stem/subject/label/label-like
+- robust label mapping: "No inj/ inj", "No Injury"/"Injury", 0/1
+- saves: xgb.json, features_cols.json, metrics.json, split_subjectwise.csv, threshold.txt
+
+Usage example (под твои пути в Kaggle):
+python train_xgb_from_features_csv.py \
+  --features_csv /kaggle/working/out_features/features.csv \
+  --labels_csv   /kaggle/working/detect_inj/run_data.csv \
+  --label_col    "No inj/ inj" \
+  --fname_col    filename \
+  --out_dir      /kaggle/working/out_model \
+  --use_gpu
+"""
+
 import os, json, argparse, re
 from pathlib import Path
-from typing import Optional, List
 import numpy as np
 import pandas as pd
 
 from sklearn.model_selection import GroupShuffleSplit
-from sklearn.utils.class_weight import compute_class_weight
 from sklearn.metrics import (
-    roc_auc_score, average_precision_score,
-    classification_report, confusion_matrix
+    confusion_matrix, classification_report,
+    roc_auc_score, average_precision_score
 )
-
 import xgboost as xgb
-
 
 def ensure_dir(p: Path):
     p.mkdir(parents=True, exist_ok=True)
 
-
-def norm_stem(p: str) -> str:
-    b = os.path.basename(str(p))
-    st, _ = os.path.splitext(b)
+def norm_stem(x: str) -> str:
+    b = os.path.basename(str(x))
+    st = os.path.splitext(b)[0]
     return st.lower()
 
-
-def guess_label_col(df: pd.DataFrame) -> Optional[str]:
-    cands = ["No inj/ inj", "No inj/ inj", "injury", "target", "y", "class"]
-    for c in cands:
-        if c in df.columns:
-            return c
-    return None
-
-
-def guess_fname_col(df: pd.DataFrame) -> Optional[str]:
-    # имя файла в манифесте
-    cands = ["filename", "file", "path", "basename", "stem"]
-    for c in cands:
-        if c in df.columns:
-            return c
-    # попробуем по подстроке
-    for c in df.columns:
-        if "file" in c.lower() or "name" in c.lower():
-            return c
-    return None
-
-
-def label_to_int(v):
-    if pd.isna(v): return None
+def map_label(v):
     s = str(v).strip().lower()
-    if s in {"0", "no", "no inj", "no-inj", "no injury", "healthy"}: return 0
-    if s in {"1", "yes", "inj", "injury"}: return 1
-    # иногда в csv бывают "No inj/ inj" как 0/1 уже в int/float
+    if s in {"1","inj","injury","yes","y","true","t"}: return 1
+    if s in {"0","no inj","no injury","no","n","false","f"}: return 0
+    # иногда в таблицах "No inj/ inj" пишут как 0/1 — попробуем привести к int
     try:
-        f = float(s)
-        if f in (0.0, 1.0): return int(f)
+        return int(float(s))
     except Exception:
-        pass
-    return None
+        return np.nan
 
-
-def load_and_merge(features_csv: str, labels_csv: str,
-                   label_col: Optional[str], fname_col: Optional[str]) -> pd.DataFrame:
-    feats = pd.read_csv(features_csv)
-    # убедимся, что есть чем мёрджить
-    if "stem" not in feats.columns:
-        if "basename" in feats.columns:
-            feats["stem"] = feats["basename"].astype(str).map(norm_stem)
-        elif "file" in feats.columns:
-            feats["stem"] = feats["file"].astype(str).map(norm_stem)
-        else:
-            raise SystemExit("[err] features.csv must contain 'basename' or 'file' to derive stem")
-    else:
-        feats["stem"] = feats["stem"].astype(str).str.lower()
-
-    labs = pd.read_csv(labels_csv)
-    labs.columns = [c.strip() for c in labs.columns]
-
-    if label_col is None:
-        label_col = guess_label_col(labs)
-    if label_col is None or label_col not in labs.columns:
-        raise SystemExit("[err] label column not found in labels_csv. Pass --label_col")
-
-    if fname_col is None:
-        fname_col = guess_fname_col(labs)
-    if fname_col is None or fname_col not in labs.columns:
-        raise SystemExit("[err] filename column not found in labels_csv. Pass --fname_col")
-
-    labs["_key"] = labs[fname_col].astype(str).map(norm_stem)
-    labs_small = labs[["_key", label_col]].copy()
-    labs_small.rename(columns={label_col: "No inj/ inj"}, inplace=True)
-
-    # к числам 0/1
-    labs_small["No inj/ inj"] = labs_small["No inj/ inj"].map(label_to_int)
-
-    df = feats.merge(labs_small, left_on="stem", right_on="_key", how="left")
-    df.drop(columns=["_key"], inplace=True, errors="ignore")
-    return df
-
-
-def split_subjectwise(df: pd.DataFrame, seed: int = 42):
-    # группы — по subject если есть, иначе по stem
-    if "subject" in df.columns:
-        groups = df["subject"].astype(str).values
-    else:
-        groups = df["stem"].astype(str).values
-
-    idx = np.arange(len(df))
-    gss1 = GroupShuffleSplit(n_splits=1, test_size=0.20, random_state=seed)
-    tr_idx, te_idx = next(gss1.split(idx, groups=groups))
-    gss2 = GroupShuffleSplit(n_splits=1, test_size=0.25, random_state=seed)
-    tr2_idx, dv_idx = next(gss2.split(tr_idx, groups=groups[tr_idx]))
-    tr_idx = tr_idx[tr2_idx]
-    return tr_idx, dv_idx, te_idx
-
+def choose_threshold(y, prob):
+    # простой порог по 0.5; можно усложнить при желании
+    return 0.5
 
 def main():
-    ap = argparse.ArgumentParser(description="Train XGBoost on features.csv + run_data.csv")
-    ap.add_argument("--features_csv", required=True, help="path to features.csv (with per-file features)")
-    ap.add_argument("--labels_csv",   required=True, help="path to run_data.csv (with labels)")
-    ap.add_argument("--label_col", default=None, help="label column in labels_csv (e.g., 'No inj/ inj')")
-    ap.add_argument("--fname_col",  default=None, help="filename column in labels_csv")
-    ap.add_argument("--out_dir", required=True)
-    ap.add_argument("--use_gpu", action="store_true")
-    ap.add_argument("--seed", type=int, default=42)
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--features_csv", required=True)
+    ap.add_argument("--labels_csv",   required=True)
+    ap.add_argument("--label_col",    required=True, help='Колонка меток в labels CSV (например, "No inj/ inj")')
+    ap.add_argument("--fname_col",    default="filename", help="Колонка с именем файла в labels CSV")
+    ap.add_argument("--out_dir",      default="out_model")
+    ap.add_argument("--use_gpu",      action="store_true")
     args = ap.parse_args()
 
     out_dir = Path(args.out_dir); ensure_dir(out_dir)
 
-    # 1) merge
-    df = load_and_merge(args.features_csv, args.labels_csv, args.label_col, args.fname_col)
+    # 1) read features (из твоего экстрактора)
+    F = pd.read_csv(args.features_csv)
+    # плавающее: иногда нет stem — сделаем
+    if "stem" not in F.columns:
+        if "basename" in F.columns:
+            F["stem"] = F["basename"].astype(str).map(lambda s: os.path.splitext(s)[0])
+        elif "file" in F.columns:
+            F["stem"] = F["file"].astype(str).map(norm_stem)
+        else:
+            raise SystemExit("[err] features.csv must contain either stem/basename/file")
 
-    # 2) оставить только валидные метки
-    if "No inj/ inj" not in df.columns:
-        raise SystemExit("[err] merge produced no 'label' column — check filename keys")
+    if "subject" not in F.columns:
+        # если вдруг нет — грубо из stem (первые 8 цифр)
+        F["subject"] = F["stem"].astype(str).str.extract(r"(\d{8})", expand=False).fillna(F["stem"].astype(str))
 
-    valid = df["No inj/ inj"].isin([0, 1])
-    dropped = int((~valid).sum())
-    if dropped:
-        print(f"[warn] dropped {dropped} rows without valid labels")
+    # 2) read labels CSV и сматчить по stem
+    L = pd.read_csv(args.labels_csv)
+    if args.fname_col not in L.columns:
+        raise SystemExit(f"[err] labels CSV has no '{args.fname_col}' column")
+    if args.label_col not in L.columns:
+        raise SystemExit(f"[err] labels CSV has no '{args.label_col}' column")
 
-    df = df.loc[valid].reset_index(drop=True)
-    if len(df) == 0:
-        raise SystemExit("[err] no labeled rows after merge")
+    L["_key"] = L[args.fname_col].astype(str).map(norm_stem)
+    F["_key"] = F["stem"].astype(str).map(lambda s: s.lower())
 
-    # 3) построим X/y (+ вспомогательные столбцы)
-    id_cols = [c for c in ["file", "basename", "subject", "stem", "No inj/ inj"] if c in df.columns]
-    y = df["No inj/ inj"].astype(int).values
-    # все числовые колонки минус label и, на всякий случай, subject если он числовой
-    X = df.select_dtypes(include=[np.number]).copy()
-    for c in ["No inj/ inj", "subject"]:
-        if c in X.columns:
-            X.drop(columns=[c], inplace=True)
+    lab = L[["_key", args.label_col]].drop_duplicates("_key", keep="last").copy()
+    lab["label"] = lab[args.label_col].map(map_label)
+    lab = lab.drop(columns=[args.label_col])
+
+    DF = F.merge(lab, on="_key", how="left").drop(columns=["_key"])
+    if DF["label"].notna().sum() == 0:
+        ex = DF[["file","basename","stem"]].head(6) if "file" in DF else DF[["basename","stem"]].head(6)
+        raise SystemExit("[err] no labels matched. Check fname_col vs real filenames. Examples:\n"+ex.to_string(index=False))
+
+    # 3) build X, y, groups
+    drop_cols = {"label", "file", "basename", "stem", "subject"}
+    leak_like = [c for c in DF.columns if ("inj" in c.lower() or "label" in c.lower()) and c not in drop_cols]
+    drop_cols.update(leak_like)
+    feat_cols = [c for c in DF.columns if c not in drop_cols and pd.api.types.is_numeric_dtype(DF[c])]
+    X = DF[feat_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0)
+    y = DF["label"].astype("Int64").astype("float").astype("int").values
+    groups = DF["subject"].astype(str).values
 
     # sanity
-    assert len(X) == len(y)
-    print(f"[info] samples={len(y)} | features={X.shape[1]} | pos={int((y==1).sum())} neg={int((y==0).sum())}")
+    n0, n1 = int((y==0).sum()), int((y==1).sum())
+    print(f"[info] samples={len(y)} | features={X.shape[1]} | class0={n0} class1={n1}")
 
-    # 4) split subject-wise
-    tr_idx, dv_idx, te_idx = split_subjectwise(df, seed=args.seed)
+    # 4) subject-wise split 60/20/20
+    gss1 = GroupShuffleSplit(n_splits=1, test_size=0.20, random_state=42)
+    tr_idx, te_idx = next(gss1.split(X, y, groups))
+    gss2 = GroupShuffleSplit(n_splits=1, test_size=0.25, random_state=43)  # 0.25 of 0.8 -> 0.2 итог
+    tr_sub, dv_idx = next(gss2.split(X.iloc[tr_idx], y[tr_idx], groups[tr_idx]))
+    tr_idx = tr_idx[tr_sub]
+
+    assert set(groups[tr_idx]).isdisjoint(set(groups[dv_idx]))
+    assert set(groups[tr_idx]).isdisjoint(set(groups[te_idx]))
+    assert set(groups[dv_idx]).isdisjoint(set(groups[te_idx]))
+
     def stat(idx):
-        subs = df.iloc[idx]
-        return {"n": len(idx), "pos": int((subs.label==1).sum()), "neg": int((subs.label==0).sum()),
-                "subjects": int(len(subs["subject"].astype(str).unique())) if "subject" in subs else None}
+        return {"n":len(idx), "pos":int((y[idx]==1).sum()), "neg":int((y[idx]==0).sum()),
+                "subjects": int(len(np.unique(groups[idx])))}
     print("[split] subject-wise 60/20/20")
     print("  train:", stat(tr_idx))
     print("  dev:  ", stat(dv_idx))
     print("  test: ", stat(te_idx))
 
-    split_map = pd.Series("train", index=df.index)
-    split_map.iloc[dv_idx] = "dev"
-    split_map.iloc[te_idx] = "test"
-    split_df = df[id_cols].copy()
-    split_df["split"] = split_map.values
-    split_df.to_csv(out_dir / "split_subjectwise.csv", index=False)
-
-    X_tr, y_tr = X.iloc[tr_idx], y[tr_idx]
-    X_dv, y_dv = X.iloc[dv_idx], y[dv_idx]
-    X_te, y_te = X.iloc[te_idx], y[te_idx]
-
-    # 5) class weights (balanced)
-    classes = np.array([0, 1], dtype=np.int32)
-    cw = compute_class_weight(class_weight="balanced", classes=classes, y=y_tr)
-    w0, w1 = float(cw[0]), float(cw[1])
-    sw_tr = np.where(y_tr == 0, w0, w1).astype(np.float32)
-
-    # 6) XGBoost
-    clf = xgb.XGBClassifier(
+    # 5) train XGBoost
+    params = dict(
         objective="binary:logistic",
-        tree_method="gpu_hist" if args.use_gpu else "hist",
-        n_estimators=3000,
-        learning_rate=0.03,
+        learning_rate=0.05,
         max_depth=6,
-        min_child_weight=6,
-        subsample=0.85,
-        colsample_bytree=0.85,
-        reg_alpha=0.0,
+        min_child_weight=5,
+        subsample=0.9,
+        colsample_bytree=0.9,
         reg_lambda=1.0,
-        random_state=args.seed,
+        reg_alpha=0.0,
+        tree_method="gpu_hist" if args.use_gpu else "hist",
         eval_metric="logloss",
-        n_jobs=0,
+        seed=42,
+    )
+    dtrain = xgb.DMatrix(X.iloc[tr_idx], label=y[tr_idx])
+    dvalid = xgb.DMatrix(X.iloc[dv_idx], label=y[dv_idx])
+    dtest  = xgb.DMatrix(X.iloc[te_idx], label=y[te_idx])
+
+    print("[train] fitting XGBoost...")
+    bst = xgb.train(
+        params,
+        dtrain,
+        num_boost_round=2000,
+        evals=[(dtrain,"train"),(dvalid,"valid")],
+        early_stopping_rounds=100,
+        verbose_eval=50
     )
 
-    clf.fit(
-        X_tr, y_tr,
-        sample_weight=sw_tr,
-        eval_set=[(X_tr, y_tr), (X_dv, y_dv)],
-        verbose=100,
-        early_stopping_rounds=150,
-    )
+    prob_dv = bst.predict(dvalid, iteration_range=(0, bst.best_iteration+1))
+    prob_te = bst.predict(dtest,  iteration_range=(0, bst.best_iteration+1))
 
-    # 7) метрики
-    def safe_auc(y_true, prob):
-        try:
-            return float(roc_auc_score(y_true, prob))
-        except Exception:
-            return float("nan")
-
-    def safe_ap(y_true, prob):
-        try:
-            return float(average_precision_score(y_true, prob))
-        except Exception:
-            return float("nan")
-
-    prob_dv = clf.predict_proba(X_dv)[:, 1]
-    prob_te = clf.predict_proba(X_te)[:, 1]
-    thr = 0.5
+    thr = choose_threshold(y[dv_idx], prob_dv)
     pred_te = (prob_te >= thr).astype(int)
 
     metrics = {
-        "dev_auroc": safe_auc(y_dv, prob_dv),
-        "dev_auprc": safe_ap(y_dv, prob_dv),
-        "test_auroc": safe_auc(y_te, prob_te),
-        "test_auprc": safe_ap(y_te, prob_te),
-        "threshold": thr,
+        "dev_auroc": float(roc_auc_score(y[dv_idx], prob_dv)) if len(np.unique(y[dv_idx]))>1 else None,
+        "dev_auprc": float(average_precision_score(y[dv_idx], prob_dv)) if len(np.unique(y[dv_idx]))>1 else None,
+        "test_auroc": float(roc_auc_score(y[te_idx], prob_te)) if len(np.unique(y[te_idx]))>1 else None,
+        "test_auprc": float(average_precision_score(y[te_idx], prob_te)) if len(np.unique(y[te_idx]))>1 else None,
+        "threshold": float(thr),
+        "test_confusion_matrix": confusion_matrix(y[te_idx], pred_te).tolist(),
+        "test_report": classification_report(y[te_idx], pred_te, digits=3),
     }
+    print(json.dumps(metrics, ensure_ascii=False, indent=2))
 
-    try:
-        metrics["test_confusion_matrix"] = confusion_matrix(y_te, pred_te).tolist()
-        metrics["test_report"] = classification_report(y_te, pred_te, digits=3)
-    except Exception:
-        pass
+    # 6) save artifacts
+    bst.save_model(str(out_dir / "xgb.json"))
+    json.dump(feat_cols, open(out_dir / "features_cols.json","w",encoding="utf-8"), ensure_ascii=False, indent=2)
+    json.dump(metrics,   open(out_dir / "metrics.json","w",encoding="utf-8"), ensure_ascii=False, indent=2)
+    (out_dir / "threshold.txt").write_text(str(thr), encoding="utf-8")
 
-    json.dump(metrics, open(out_dir / "metrics.json", "w", encoding="utf-8"),
-              ensure_ascii=False, indent=2)
+    split_df = pd.DataFrame({"idx": np.arange(len(y)),
+                             "subject": groups,
+                             "y": y, "split": "train"})
+    split_df.loc[dv_idx, "split"] = "dev"
+    split_df.loc[te_idx, "split"] = "test"
+    split_df.to_csv(out_dir / "split_subjectwise.csv", index=False)
 
-    # 8) сохранить модель и мета
-    clf.get_booster().save_model(str(out_dir / "xgb.json"))
-    json.dump(list(X.columns), open(out_dir / "features_cols.json", "w", encoding="utf-8"),
-              ensure_ascii=False, indent=2)
-
-    # 9) сохранить прогнозы
-    def dump_pred(idx, prob, name):
-        tmp = df.iloc[idx][["file","basename","subject"]].copy() if "subject" in df.columns else df.iloc[idx][["file","basename"]].copy()
-        tmp["y"] = df.iloc[idx]["No inj/ inj"].values
-        tmp["prob_injury"] = prob
-        tmp.to_csv(out_dir / f"pred_{name}.csv", index=False)
-
-    dump_pred(dv_idx, prob_dv, "dev")
-    dump_pred(te_idx, prob_te, "test")
-
-    print("[done] saved to", out_dir)
-
+    print("Saved to:", out_dir)
 
 if __name__ == "__main__":
     main()
