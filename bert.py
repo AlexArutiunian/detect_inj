@@ -294,7 +294,7 @@ def main():
         if not p.is_file():
             p1 = data_dir / (str(stem) + ".npy")
             p2 = data_dir / str(stem)
-            print(p1, p2)
+         #   print(p1, p2)
             if p1.is_file():
                 p = p1
             elif p2.is_file():
