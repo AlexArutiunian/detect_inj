@@ -130,13 +130,14 @@ def main():
     booster = clf.get_booster()
     booster.save_model(os.path.join(args.out_dir, "xgb.json"))
     json.dump(feature_names, open(os.path.join(args.out_dir, "features_cols.json"), "w"), ensure_ascii=False, indent=2)
-    pd.DataFrame(
-        {"feature": feature_names, "gain": clf.feature_importances_}
-    ).sort_values("gain", ascending=False).to_csv(
-        os.path.join(args.out_dir, "feature_importance_gain.csv"), index=False
-    )
-
     
+    bst = clf.get_booster(); kinds = ["gain","total_gain","weight","cover","total_cover"]
+    scores = {k: bst.get_score(importance_type=k) for k in kinds}
+    imp = pd.DataFrame({"feature": feature_names, **{k: [scores[k].get(f"f{i}", 0.0) for i in range(len(feature_names))] for k in kinds}})
+    (imp.assign(total_gain_pct=lambda d: d.total_gain/(d.total_gain.sum()+1e-12))
+    .sort_values("total_gain", ascending=False)
+    .to_csv(os.path.join(args.out_dir, "feature_importance.csv"), index=False))
+        
     print("\n[done] модель сохранена в", args.out_dir)
 
 if __name__ == "__main__":
