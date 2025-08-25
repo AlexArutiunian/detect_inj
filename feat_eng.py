@@ -474,7 +474,7 @@ def main():
     # decide label column
     label_col = args.label_col
     if label_col is None:
-        for cand in ["label", "injury", "target", "y", "class"]:
+        for cand in ["label", "injury", "target", "y", "class", "No inj/ inj"]:
             if cand in labels_df.columns:
                 label_col = cand
                 break
