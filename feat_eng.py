@@ -484,8 +484,8 @@ def main():
     if not rows_feats:
         raise SystemExit("[err] Не удалось извлечь ни одной строки фичей.")
 
-    # --- вычистим и склеим признаки безопасно ---
-    meta_df = meta_df.reset_index(drop=True)
+        # --- вычистим и склеим признаки безопасно ---
+    meta_df = pd.DataFrame(rows_meta).reset_index(drop=True)   # <-- ЭТОГО НЕ ХВАТАЛО
     feats_df = pd.DataFrame(rows_feats).reset_index(drop=True)
 
     # оставляем только числовые фичи
@@ -504,9 +504,9 @@ def main():
     meta_df = meta_df.iloc[:n].reset_index(drop=True)
     feats_num = feats_num.iloc[:n].reset_index(drop=True)
 
-    # общий CSV (если он тебе всё ещё нужен)
+    # общий CSV (опционально)
     final = pd.concat([meta_df, feats_num], axis=1)
-    (final_dir := out_dir).mkdir(parents=True, exist_ok=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
     final_csv = out_dir / "features.csv"
     final.to_csv(final_csv, index=False)
 
@@ -527,12 +527,10 @@ def main():
     groups_path   = Path(args.groups)   if args.groups   else (out_dir / "groups.npy")
     files_path    = Path(args.files_list) if args.files_list else (out_dir / "files.txt")
 
-    features_path.parent.mkdir(parents=True, exist_ok=True)
-    labels_path.parent.mkdir(parents=True, exist_ok=True)
-    groups_path.parent.mkdir(parents=True, exist_ok=True)
-    files_path.parent.mkdir(parents=True, exist_ok=True)
+    for pth in (features_path, labels_path, groups_path, files_path):
+        pth.parent.mkdir(parents=True, exist_ok=True)
 
-    # сохраняем 4 файла
+    # сохраняем 4 файла под train_features
     X.to_parquet(features_path)
     np.save(labels_path, y)
     np.save(groups_path, groups)
@@ -540,27 +538,20 @@ def main():
         for p in files:
             f.write(str(p) + "\n")
 
-    # доп. файлы «на будущее»
+    # доп. файлы
     (out_dir / "feature_names.txt").write_text("\n".join(list(X.columns)), encoding="utf-8")
     json.dump(list(X.columns), open(out_dir / "features_cols.json", "w", encoding="utf-8"),
-            ensure_ascii=False, indent=2)
+              ensure_ascii=False, indent=2)
 
     print("[done] Saved cache for train_features:")
     print("  features:", features_path)
     print("  labels:  ", labels_path)
     print("  groups:  ", groups_path)
     print("  files:   ", files_path)
+    print(f"[done] Сохранено:\n  - общий CSV: {final_csv}\n  - per-file CSV: {per_file_dir}\n"
+          f"  - feature_names.txt и features_cols.json\n"
+          f"Пропущено файлов: {skipped}")
 
-
-        
-
-
-    final_csv = out_dir / "features.csv"
-    final.to_csv(final_csv, index=False)
-    (out_dir / "feature_names.txt").write_text("\n".join(list(feats_num.columns)), encoding="utf-8")
-    json.dump(list(feats_num.columns), open(out_dir / "features_cols.json", "w", encoding="utf-8"),
-              ensure_ascii=False, indent=2)
-    final.to_parquet(out_dir / "features.parquet")
 
     print(f"[done] Сохранено:\n  - общий CSV: {final_csv}\n  - per-file CSV: {per_file_dir}\n"
           f"  - feature_names.txt и features_cols.json\n  - parquet: {out_dir/'features.parquet'}\n"
