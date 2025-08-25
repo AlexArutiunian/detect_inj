@@ -30,7 +30,7 @@ def main():
     ap.add_argument("--label_col", default=None, help="Имя колонки метки в labels_csv (напр. \"No inj/ inj\")")
     ap.add_argument("--fname_in_labels", default=None, help="Колонка с именем файла в labels_csv (auto: filename/file/path/basename/stem)")
     ap.add_argument("--out_dir", default="out_xgb_simple")
-    ap.add_argument("--use_gpu", action="store_true")
+    ap.add_argument("--use_gpu", action="store_true") ap.add_argument("--test_size", type=float, default=0.2, help="Доля данных в тесте (по умолчанию 0.2)")
     args = ap.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -92,8 +92,9 @@ def main():
     X = X.to_numpy(dtype=np.float32)
 
     # 4) трейн/тест (просто, стратифицировано)
-    Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
-
+    Xtr, Xte, ytr, yte = train_test_split(
+        X, y, test_size=args.test_size, random_state=42, stratify=y
+    )
     # 5) XGBoost
     clf = xgb.XGBClassifier(
         n_estimators=800,
