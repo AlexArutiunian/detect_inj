@@ -290,10 +290,11 @@ def main():
     miss = 0
     for stem, raw, lab in L[["_key", fname_col, "label"]].itertuples(index=False, name=None):
         p = Path(str(raw))
-        print(p)
+       
         if not p.is_file():
             p1 = data_dir / (str(stem) + ".npy")
             p2 = data_dir / str(stem)
+            print(p1, p2)
             if p1.is_file():
                 p = p1
             elif p2.is_file():
