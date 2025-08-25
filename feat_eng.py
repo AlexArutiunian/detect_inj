@@ -2,23 +2,25 @@
 # -*- coding: utf-8 -*-
 
 """
-Сбор фичей из .npy-файлов (полностью самодостаточный скрипт).
-- Рекурсивный обход каталога с .npy
-- Нормализация: центрирование по тазу, масштаб по длине бедро↔голень
-- Детекция шагов по траектории стопы (FS/FO)
-- Перешаговые признаки + агрегаты
-- Спектральные признаки, гармоническое соотношение, ACF
-- Сохранение per-file CSV и общего features.csv (готово для XGBoost)
+Feature extractor for .npy sequences with labels from CSV.
 
-Формат входного массива: (T, N, 3) либо (T, 3*N).
-Схема (schema_joints.json): список имён сочленений (N имен).
-Сегменты собираются по префиксам: pelvis, L_/R_(foot|shank|thigh).
+Saves:
+  - <out_dir>/per_file/<basename>.csv  (one CSV per .npy, for debugging)
+  - <out_dir>/features.csv             (meta + numeric features)
+  - --features   features.parquet      (numeric features only; for train_features)
+  - --labels     labels.npy            (0/1)
+  - --groups     groups.npy            (subject IDs / grouping)
+  - --files_list files.txt             (absolute .npy paths)
+
+Label source: --labels_csv (must contain filename and label columns).
+Filename is matched by stem (basename without extension), case-insensitive.
+
+Requires: numpy, pandas, scipy, tqdm.
 """
 
 import os
 import re
 import json
-import math
 import argparse
 from dataclasses import dataclass
 from pathlib import Path
@@ -31,26 +33,18 @@ from tqdm import tqdm
 from scipy.signal import find_peaks, peak_widths, peak_prominences
 
 
-# -------------------- Метаданные / утилиты --------------------
+# -------------------- Utils --------------------
 
-def label_to_int(v):
-    if v is None: return None
-    s = str(v).strip().lower()
-    if s.startswith("inj"): return 1
-    if s.startswith("no"):  return 0
-    if s in ("1", "0"): return int(s)
-    return None
+def ensure_dir(p: Path):
+    p.mkdir(parents=True, exist_ok=True)
 
 def guess_subject_id(filename: str) -> str:
     b = Path(filename).stem
     m = re.match(r"(\d{8})", b)
     return m.group(1) if m else b.split("T")[0][:8]
 
-def ensure_dir(p: Path):
-    p.mkdir(parents=True, exist_ok=True)
 
-
-# -------------------- Схема и ввод --------------------
+# -------------------- Schema / I/O --------------------
 
 @dataclass
 class Schema:
@@ -84,7 +78,7 @@ def load_npy(path: str, schema: Schema) -> np.ndarray:
     return arr  # (T, N, 3)
 
 
-# -------------------- Биомех-хелперы --------------------
+# -------------------- Biomech helpers --------------------
 
 def centroid_series(x: np.ndarray) -> np.ndarray:
     # x: (T, K, 3) -> (T, 3)
@@ -103,9 +97,11 @@ def center_and_scale(all_xyz: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
         if th is not None and sh is not None:
             th_c = centroid_series(th); sh_c = centroid_series(sh)
             d = np.linalg.norm(th_c - sh_c, axis=1)
-            scale_list.append(np.median(d[d > 0]))
+            pos = d[d > 0]
+            if pos.size:
+                scale_list.append(np.median(pos))
     scale = float(np.median(scale_list)) if scale_list else 1.0
-    if scale <= 0 or not np.isfinite(scale):
+    if not np.isfinite(scale) or scale <= 0:
         scale = 1.0
     for k in all_xyz:
         all_xyz[k] = all_xyz[k] / scale
@@ -130,7 +126,7 @@ def fast_segment_axes(cogs: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
     thL = cogs.get("L_thigh"); thR = cogs.get("R_thigh")
     if pel is not None and (thL is not None or thR is not None):
         tgt = pel.copy()
-        if thL is not None and thR is not None: tgt = (thL + thR) / 2.0
+        if thL is not None and thR is not None: tgt = (thL + thR)/2.0
         elif thL is not None: tgt = thL
         else: tgt = thR
         v = tgt - pel
@@ -138,34 +134,28 @@ def fast_segment_axes(cogs: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
     return axes
 
 
-# -------------------- События шага и спектр --------------------
+# -------------------- Events / spectral --------------------
 
 def detect_gait_events(foot_centroid: np.ndarray, fps: int = 30, f0: Optional[float] = None):
-    """ Возвращает списки индексов FS/FO (простая эвристика по вертикали стопы). """
+    """Возвращает индексы FS/FO (эвристика по вертикали стопы)."""
     y = foot_centroid[:, 1]
-    # сглаживание
     if len(y) >= 5:
         y = pd.Series(y).rolling(window=5, center=True, min_periods=1).median().values
-    # шаги — пики "махов" + интервалы по частоте каденции
     if f0 is None or not np.isfinite(f0):
         min_dist = max(5, int(0.3 * fps))
     else:
         min_dist = max(5, int((0.5 / max(f0, 1e-3)) * fps))
     peaks, _ = find_peaks(y, distance=min_dist)  # swing max ~ mid-swing
     if len(peaks) < 2:
-        # fallback: равномерная нарезка
         step = max(8, int(0.5 * fps))
         peaks = np.arange(step, len(y) - 1, step)
-    # FS — минимумы после пика; FO — минимумы до пика
-    fs = []
-    fo = []
+    fs = []; fo = []
     for k in range(len(peaks) - 1):
         a, b = peaks[k], peaks[k + 1]
         seg = y[a:b+1]
         if seg.size < 3: continue
         i_min = int(np.argmin(seg)) + a
         fs.append(i_min)
-        # FO приблизим минимумом перед текущим пиком
         if k == 0:
             pre = y[:peaks[k]+1]
             if pre.size >= 3:
@@ -188,11 +178,9 @@ def _harmonic_ratio(x: np.ndarray, fps: int, cadence_hz: Optional[float] = None)
     if cadence_hz is None or not np.isfinite(cadence_hz):
         mask = (freqs >= 0.5) & (freqs <= 3.0)
         if not mask.any(): return np.nan, np.nan
-        k = np.argmax(p[mask])
-        f0 = float(freqs[mask][k])
+        k = np.argmax(p[mask]); f0 = float(freqs[mask][k])
     else:
         f0 = float(cadence_hz)
-    # HR: сумма чётных / нечётных гармоник вокруг f0
     def band_power(mult):
         f = mult * f0
         idx = np.argmin(np.abs(freqs - f))
@@ -203,8 +191,7 @@ def _harmonic_ratio(x: np.ndarray, fps: int, cadence_hz: Optional[float] = None)
     return float(hr), f0
 
 def spectral_extras(x: np.ndarray, fps: int, f0: Optional[float]) -> Dict[str, float]:
-    x = np.asarray(x, np.float32)
-    x = x - np.nanmean(x)
+    x = np.asarray(x, np.float32) - np.nanmean(x)
     n = len(x)
     out = dict(spec_flatness=np.nan, spec_centroid=np.nan, spec_spread=np.nan,
                peak_width_hz=np.nan, peak_prominence=np.nan)
@@ -214,8 +201,7 @@ def spectral_extras(x: np.ndarray, fps: int, f0: Optional[float]) -> Dict[str, f
     p = (fft.real**2 + fft.imag**2)
     p = np.clip(p, 1e-12, None)
     freqs = np.fft.rfftfreq(n, d=1.0/max(fps,1))
-    gm = float(np.exp(np.mean(np.log(p))))
-    am = float(np.mean(p))
+    gm = float(np.exp(np.mean(np.log(p)))); am = float(np.mean(p))
     out["spec_flatness"] = gm / am
     centroid = float(np.sum(freqs * p) / np.sum(p))
     spread = float(np.sqrt(np.sum(p * (freqs - centroid)**2) / np.sum(p)))
@@ -240,32 +226,26 @@ def spectral_extras(x: np.ndarray, fps: int, f0: Optional[float]) -> Dict[str, f
     return out
 
 def acf_regularities(x: np.ndarray, fps: int, f0: Optional[float]) -> Dict[str, float]:
-    x = np.asarray(x, np.float32)
-    x = x - np.nanmean(x)
+    x = np.asarray(x, np.float32) - np.nanmean(x)
     n = len(x)
     if n < 8:
         return dict(acf_at_step=np.nan, acf_at_2step=np.nan, acf_ratio_2_1=np.nan)
-    # шаг в сэмплах:
     if f0 is None or not np.isfinite(f0):
         L = max(4, int(0.6 * fps))
     else:
         L = max(4, int((1.0 / max(f0, 1e-3)) * fps))
     def acf_at(k):
+        if k >= len(x): return np.nan
         v0 = x[:-k]; v1 = x[k:]
-        d = float(np.sum(v0 * v1) / (np.sum(x * x) + 1e-12))
-        return d
-    a1 = acf_at(L)
-    a2 = acf_at(2 * L)
+        return float(np.sum(v0 * v1) / (np.sum(x * x) + 1e-12))
+    a1 = acf_at(L); a2 = acf_at(2 * L)
     return dict(acf_at_step=a1, acf_at_2step=a2, acf_ratio_2_1=(a2 / (abs(a1) + 1e-6)))
 
 
-# -------------------- Извлечение фич --------------------
+# -------------------- Feature extraction --------------------
 
 def extract_features(path: str, schema: Schema, fps: int = 30, stride: int = 1,
                      fast_axes_flag: bool = True, turn_curv_thr: float = 0.15) -> pd.DataFrame:
-    """
-    Возвращает одну строку фич: перешаговые агрегаты + спектр/HR/ACF и пр.
-    """
     A = load_npy(path, schema)
     if stride > 1:
         A = A[::stride]
@@ -281,43 +261,47 @@ def extract_features(path: str, schema: Schema, fps: int = 30, stride: int = 1,
     if pelvis is None:
         raise ValueError("pelvis segment is required")
 
-    # Кривая пути таза в горизонте для индикатора поворота
+    # curvature / straightness (pelvis horizontal path)
     d = pelvis[:, [0, 2]]
-    v = np.vstack([d[1:] - d[:-1], d[[-1]] - d[[-2]]])
-    num = (v[1:, 0] * v[:-1, 1] - v[1:, 1] * v[:-1, 0])
-    den = (np.linalg.norm(v[1:], axis=1) * np.linalg.norm(v[:-1], axis=1) + 1e-8)
-    turn_kappa = np.abs(num / den)
-    straight_mask = np.ones(len(pelvis), bool)
-    if len(turn_kappa) > 0:
-        thr = np.quantile(turn_kappa, 0.75) if not np.isnan(turn_kappa).all() else 0.0
-        thr = max(thr, turn_curv_thr)
-        straight_mask[1:len(turn_kappa)+1] = (turn_kappa < thr)
+    if len(d) >= 3:
+        v = np.gradient(d, axis=0)
+        a = np.gradient(v, axis=0)
+        num = np.abs(v[:, 0] * a[:, 1] - v[:, 1] * a[:, 0])
+        den = (np.linalg.norm(v, axis=1) ** 3 + 1e-12)
+        kappa = num / den
+        path_curv_mean = float(np.nanmean(kappa))
+        path_curv_rms = float(np.sqrt(np.nanmean(kappa*kappa)))
+    else:
+        kappa = np.zeros(len(d))
+        path_curv_mean = 0.0
+        path_curv_rms = 0.0
+    net = float(np.linalg.norm(d[-1] - d[0])) if len(d) else 0.0
+    seglen = np.linalg.norm(np.diff(d, axis=0), axis=1) if len(d) > 1 else np.array([0.0])
+    path_straightness = float(net / (seglen.sum() + 1e-6))
 
-    # оценка частоты шага (через HR)
+    # cadence / HR / spectral
     hr_vert, f0 = _harmonic_ratio(pelvis[:, 1], fps, cadence_hz=None)
+    hr_ml,   _  = _harmonic_ratio(pelvis[:, 2], fps, cadence_hz=f0 if np.isfinite(f0) else None)
     specY = spectral_extras(pelvis[:, 1], fps, f0 if np.isfinite(f0) else None)
     specZ = spectral_extras(pelvis[:, 2], fps, f0 if np.isfinite(f0) else None)
     acfY  = acf_regularities(pelvis[:, 1], fps, f0 if np.isfinite(f0) else None)
     acfZ  = acf_regularities(pelvis[:, 2], fps, f0 if np.isfinite(f0) else None)
 
-    # Перешаговые признаки по каждой ноге
+    # per-step features
     rows = []
     for side in ("L", "R"):
-        foot = cogs.get(f"{side}_foot")
-        sh = axes.get(f"{side}_shank")
-        th = axes.get(f"{side}_thigh")
-        pel_ax = axes.get("pelvis")
+        foot = cogs.get(f"{side}_foot"); sh = axes.get(f"{side}_shank")
+        th = axes.get(f"{side}_thigh"); pel_ax = axes.get("pelvis")
         if foot is None or pel_ax is None:
             continue
         fs_idx, fo_idx = detect_gait_events(foot, fps=fps, f0=f0 if np.isfinite(f0) else None)
         if len(fs_idx) < 2:
-            # fallback: один псевдо-цикл
             a = 0; b = len(pelvis) - 1
+            if b <= a: continue
             step_time = (b - a) / max(1, fps)
             step_len = float(np.linalg.norm(pelvis[b, [0, 2]] - pelvis[a, [0, 2]]))
-            cadence = 1.0 / max(step_time, 1e-6)
-            rows.append(dict(side=side, step_time=step_time, cadence=cadence,
-                             step_len=step_len, step_speed=step_len / max(step_time, 1e-6),
+            rows.append(dict(side=side, step_time=step_time, cadence=1.0/max(step_time,1e-6),
+                             step_len=step_len, step_speed=step_len/max(step_time,1e-6),
                              pelvis_vert_osc=np.ptp(pelvis[a:b+1, 1]),
                              pelvis_ml_osc=np.ptp(pelvis[a:b+1, 2]),
                              pelvis_ap_osc=np.ptp(pelvis[a:b+1, 0]),
@@ -330,7 +314,6 @@ def extract_features(path: str, schema: Schema, fps: int = 30, stride: int = 1,
                 if b - a < max(4, int(0.2 * fps)): continue
                 segslice = slice(a, b + 1)
                 step_time = (b - a) / max(1, fps)
-                cadence = 1.0 / max(step_time, 1e-6)
                 p0 = pelvis[a, [0, 2]]; p1 = pelvis[b, [0, 2]]
                 step_len = float(np.linalg.norm(p1 - p0))
                 vo = float(np.ptp(pelvis[segslice, 1]))
@@ -340,19 +323,19 @@ def extract_features(path: str, schema: Schema, fps: int = 30, stride: int = 1,
                 if foot is not None:
                     fy = foot[:, 1]; clearance = float(np.nanmedian(fy[segslice]) - np.nanmin(fy[segslice]))
                 rows.append(dict(
-                    side=side, step_time=step_time, cadence=cadence,
-                    step_len=step_len, step_speed=step_len / max(step_time, 1e-6),
+                    side=side, step_time=step_time, cadence=1.0/max(step_time,1e-6),
+                    step_len=step_len, step_speed=step_len/max(step_time,1e-6),
                     pelvis_vert_osc=vo, pelvis_ml_osc=ml, pelvis_ap_osc=ap,
                     rom_knee=np.nan, rom_hip=np.nan, rom_ankle=np.nan,
                     stance_time=np.nan, duty_factor=np.nan,
-                    kappa_med=float(np.nanmedian(turn_kappa[a:b])) if np.isfinite(turn_kappa[a:b]).any() else np.nan,
+                    kappa_med=float(np.nanmedian(kappa[a:b])) if np.isfinite(kappa[a:b]).any() else np.nan,
                     foot_clearance=clearance
                 ))
 
     df = pd.DataFrame(rows)
 
-    # Если совсем пусто — вернём набор NaN/0 c понятными именами
-    base_empty = dict(
+    # aggregates
+    base = dict(
         step_time_median=np.nan, step_time_mean=np.nan, step_time_std=0.0,
         cadence_median=np.nan, cadence_mean=np.nan, cadence_std=0.0,
         step_len_median=0.0, step_len_mean=0.0, step_len_std=0.0,
@@ -362,48 +345,38 @@ def extract_features(path: str, schema: Schema, fps: int = 30, stride: int = 1,
         pelvis_ap_osc_median=0.0, pelvis_ap_osc_mean=0.0, pelvis_ap_osc_std=0.0,
         foot_clearance_median=np.nan, foot_clearance_mean=np.nan, foot_clearance_std=np.nan,
         cycles_count=0,
-        hr_vert=np.nan, hr_ml=np.nan, cadence_hz_est=np.nan,
-        specY_flatness=np.nan, specY_centroid=np.nan, specY_spread=np.nan,
-        specY_peak_width_hz=np.nan, specY_peak_prominence=np.nan,
-        specZ_flatness=np.nan, specZ_centroid=np.nan, specZ_spread=np.nan,
-        specZ_peak_width_hz=np.nan, specZ_peak_prominence=np.nan,
-        acfY_step=np.nan, acfY_2step=np.nan, acfY_ratio=np.nan,
-        acfZ_step=np.nan, acfZ_2step=np.nan, acfZ_ratio=np.nan,
-        straight_ratio=np.nan
     )
 
     if df.empty:
-        out = base_empty.copy()
+        out = base.copy()
     else:
         num = df.select_dtypes(include=[np.number]).copy()
         agg = num.agg(["median", "mean", "std"]).T
         out = {f"{feat}_{stat}": float(agg.loc[feat, stat]) for feat in agg.index for stat in agg.columns}
         out["cycles_count"] = int(len(df))
 
-    # HR/ACF/спектральные + оценка прямолинейности
-    hr_ml, _ = _harmonic_ratio(pelvis[:, 2], fps, cadence_hz=f0 if np.isfinite(f0) else None)
-    out["hr_vert"] = float(hr_vert) if np.isfinite(hr_vert) else np.nan
-    out["hr_ml"] = float(hr_ml) if np.isfinite(hr_ml) else np.nan
-    out["cadence_hz_est"] = float(f0) if np.isfinite(f0) else np.nan
-
+    # path / spectral / HR / ACF
     out.update({
+        "path_straightness": path_straightness,
+        "path_curv_mean": path_curv_mean,
+        "path_curv_rms": path_curv_rms,
+        "hr_vert": float(hr_vert) if np.isfinite(hr_vert) else np.nan,
+        "hr_ml":   float(hr_ml)   if np.isfinite(hr_ml)   else np.nan,
+        "cadence_hz_est": float(f0) if np.isfinite(f0) else np.nan,
         "specY_flatness": specY["spec_flatness"], "specY_centroid": specY["spec_centroid"],
-        "specY_spread": specY["spec_spread"], "specY_peak_width_hz": specY["peak_width_hz"],
+        "specY_spread":   specY["spec_spread"],   "specY_peak_width_hz": specY["peak_width_hz"],
         "specY_peak_prominence": specY["peak_prominence"],
         "specZ_flatness": specZ["spec_flatness"], "specZ_centroid": specZ["spec_centroid"],
-        "specZ_spread": specZ["spec_spread"], "specZ_peak_width_hz": specZ["peak_width_hz"],
+        "specZ_spread":   specZ["spec_spread"],   "specZ_peak_width_hz": specZ["peak_width_hz"],
         "specZ_peak_prominence": specZ["peak_prominence"],
         "acfY_step": acfY["acf_at_step"], "acfY_2step": acfY["acf_at_2step"], "acfY_ratio": acfY["acf_ratio_2_1"],
         "acfZ_step": acfZ["acf_at_step"], "acfZ_2step": acfZ["acf_at_2step"], "acfZ_ratio": acfZ["acf_ratio_2_1"],
     })
 
-    out["straight_ratio"] = float(np.mean(straight_mask)) if straight_mask.size else np.nan
-
-    # вернём DataFrame с 1 строкой
     return pd.DataFrame([out])
 
 
-# -------------------- Пакетная обработка и сохранение --------------------
+# -------------------- Per-file processing --------------------
 
 def process_one(npy_path: Path, schema_path: Path, fps: int, stride: int,
                 fast_axes: bool, turn_thr: float, per_file_dir: Path):
@@ -411,38 +384,45 @@ def process_one(npy_path: Path, schema_path: Path, fps: int, stride: int,
     feats_df = extract_features(str(npy_path), schema, fps=fps, stride=stride,
                                 fast_axes_flag=fast_axes, turn_curv_thr=turn_thr)
 
-    stem = npy_path.stem
+    # meta; label добавим позже из CSV
     meta = {
         "file": str(npy_path),
         "basename": npy_path.name,
+        "stem": npy_path.stem,
         "subject": guess_subject_id(npy_path.name),
-        "label": label_to_int(stem),
+        "label": None,
     }
 
-    # per-file CSV
+    # per-file CSV (debug)
     per_file = feats_df.copy()
     for k, v in list(meta.items())[::-1]:
         per_file.insert(0, k, v)
-    out_csv = per_file_dir / f"{stem}.csv"
+    out_csv = per_file_dir / f"{npy_path.stem}.csv"
     per_file.to_csv(out_csv, index=False)
 
     return meta, feats_df.iloc[0]
 
 
+# -------------------- CLI --------------------
+
 def main():
-    ap = argparse.ArgumentParser(description="Сбор фичей из .npy для XGBoost (самодостаточный)")
-    ap.add_argument("--data_dir", required=True, help="Папка с .npy (обход рекурсивный)")
+    ap = argparse.ArgumentParser(description="Extract features from .npy and save caches for train_features")
+    ap.add_argument("--data_dir", required=True, help="Folder with .npy (recursive)")
     ap.add_argument("--schema", required=True, help="schema_joints.json")
-    ap.add_argument("--out_dir", default="out_features", help="Куда сохранять результаты")
+    ap.add_argument("--labels_csv", required=True, help="CSV with filename & label columns")
+    ap.add_argument("--label_col", default=None, help="Label column name in CSV (auto: label/injury/target/y/class)")
+    ap.add_argument("--out_dir", default="out_features", help="Where to save per_file and features.csv")
     ap.add_argument("--fps", type=int, default=30)
-    ap.add_argument("--stride", type=int, default=2, help="Прореживание кадров")
-    ap.add_argument("--fast_axes", action="store_true", help="Быстрые оси сегментов")
-    ap.add_argument("--turn_curv_thr", type=float, default=0.15, help="Порог кривизны для straight-агрегатов")
+    ap.add_argument("--stride", type=int, default=2, help="Frame decimation")
+    ap.add_argument("--fast_axes", action="store_true", help="Fast segment axes")
+    ap.add_argument("--turn_curv_thr", type=float, default=0.15)
     ap.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) - 1))
-    ap.add_argument("--features", default=None, help="Куда сохранить features.parquet")
-    ap.add_argument("--labels",   default=None, help="Куда сохранить labels.npy")
-    ap.add_argument("--groups",   default=None, help="Куда сохранить groups.npy (subject ids)")
-    ap.add_argument("--files_list", default=None, help="Куда сохранить files.txt (список путей .npy)")
+
+    # exact cache paths for train_features
+    ap.add_argument("--features", default=None, help="features.parquet path")
+    ap.add_argument("--labels",   default=None, help="labels.npy path")
+    ap.add_argument("--groups",   default=None, help="groups.npy path (subject ids)")
+    ap.add_argument("--files_list", default=None, help="files.txt path")
 
     args = ap.parse_args()
 
@@ -454,13 +434,12 @@ def main():
 
     files = sorted(list(data_dir.rglob("*.npy")))
     if not files:
-        raise SystemExit(f"[err] В {data_dir} не найдено .npy файлов")
+        raise SystemExit(f"[err] No .npy files in {data_dir}")
 
-    print(f"[info] Найдено {len(files)} .npy; workers={args.workers}; stride={args.stride}; fast_axes={args.fast_axes}")
+    print(f"[info] Found {len(files)} .npy; workers={args.workers}; stride={args.stride}; fast_axes={args.fast_axes}")
 
-    rows_meta = []; rows_feats = []; skipped = 0
-    tasks = [(p, schema_path, args.fps, args.stride, args.fast_axes, args.turn_curv_thr, per_file_dir)
-             for p in files]
+    tasks = [(p, schema_path, args.fps, args.stride, args.fast_axes, args.turn_curv_thr, per_file_dir) for p in files]
+    rows_meta, rows_feats, skipped = [], [], 0
 
     if args.workers <= 1:
         for t in tqdm(tasks, desc="Extract"):
@@ -482,46 +461,87 @@ def main():
                     tqdm.write(f"[skip] -> {type(e).__name__}: {e}")
 
     if not rows_feats:
-        raise SystemExit("[err] Не удалось извлечь ни одной строки фичей.")
+        raise SystemExit("[err] No features extracted.")
 
-        # --- вычистим и склеим признаки безопасно ---
-    meta_df = pd.DataFrame(rows_meta).reset_index(drop=True)   # <-- ЭТОГО НЕ ХВАТАЛО
+    # Assemble dataframes
+    meta_df  = pd.DataFrame(rows_meta).reset_index(drop=True)
     feats_df = pd.DataFrame(rows_feats).reset_index(drop=True)
 
-    # оставляем только числовые фичи
+    # -------------------- join labels from CSV --------------------
+    labels_df = pd.read_csv(args.labels_csv)
+    labels_df.columns = [c.strip() for c in labels_df.columns]
+
+    # decide label column
+    label_col = args.label_col
+    if label_col is None:
+        for cand in ["label", "injury", "target", "y", "class"]:
+            if cand in labels_df.columns:
+                label_col = cand
+                break
+    if label_col is None:
+        raise SystemExit("[err] Label column not found. Use --label_col")
+
+    # decide filename column
+    fname_col = None
+    for cand in ["filename", "file", "path", "basename", "stem"]:
+        if cand in labels_df.columns:
+            fname_col = cand
+            break
+    if fname_col is None:
+        raise SystemExit("[err] Filename column not found in CSV (expected one of: filename/file/path/basename/stem)")
+
+    def norm_stem(s: str) -> str:
+        b = os.path.basename(str(s))
+        st = os.path.splitext(b)[0]
+        return st.lower()
+
+    labels_df["_key"] = labels_df[fname_col].astype(str).map(norm_stem)
+    meta_df["_key"]   = meta_df["stem"].astype(str).map(lambda x: str(x).lower())
+
+    dups = labels_df["_key"].duplicated(keep="last").sum()
+    if dups:
+        print(f"[warn] CSV has {dups} duplicate filename rows — keeping last.")
+
+    labels_df_small = labels_df[["_key", label_col]].drop_duplicates("_key", keep="last").rename(columns={label_col: "label"})
+    meta_df = meta_df.merge(labels_df_small, on="_key", how="left")
+    meta_df.drop(columns=["_key"], inplace=True, errors="ignore")
+
+    # diagnostics
+    cnt0 = int((meta_df["label"] == 0).sum())
+    cnt1 = int((meta_df["label"] == 1).sum())
+    cntN = int(meta_df["label"].isna().sum())
+    print(f"[labels] 0={cnt0}  1={cnt1}  missing={cntN}")
+
+    # keep only numeric features
     feats_num = feats_df.select_dtypes(include=[np.number]).copy()
+    # drop duplicate feature names if any
+    feats_num = feats_num.loc[:, ~feats_num.columns.duplicated(keep="first")]
 
-    # удалим дубли колонок фич (если вдруг совпали имена)
-    dup_cols = feats_num.columns[feats_num.columns.duplicated(keep="first")]
-    if len(dup_cols) > 0:
-        print(f"[warn] Найдены дубликаты фичей, будут удалены: {list(dup_cols)}")
-        feats_num = feats_num.loc[:, ~feats_num.columns.duplicated(keep="first")]
-
-    # выровняем длины на всякий случай
+    # align lengths
     n = min(len(meta_df), len(feats_num))
     if len(meta_df) != len(feats_num):
-        print(f"[warn] Размерности не совпадают: meta={len(meta_df)} feats={len(feats_num)} — беру первые {n}")
+        print(f"[warn] Length mismatch: meta={len(meta_df)} feats={len(feats_num)} -> trunc to {n}")
     meta_df = meta_df.iloc[:n].reset_index(drop=True)
     feats_num = feats_num.iloc[:n].reset_index(drop=True)
 
-    # общий CSV (опционально)
+    # combined CSV (for quick inspection)
     final = pd.concat([meta_df, feats_num], axis=1)
-    out_dir.mkdir(parents=True, exist_ok=True)
     final_csv = out_dir / "features.csv"
     final.to_csv(final_csv, index=False)
 
-    # --- подготовим кэши для train_features ---
-    # валидные метки (0/1)
+    # valid labels
     valid_mask = meta_df["label"].isin([0, 1])
-    if valid_mask.sum() < len(valid_mask):
-        print(f"[warn] Отброшено без меток/некорректных: {len(valid_mask) - int(valid_mask.sum())}")
+    if valid_mask.sum() == 0:
+        examples = meta_df[["file", "basename"]].head(8).to_string(index=False)
+        raise SystemExit("[err] No valid labels (all NaN or not in {0,1}). "
+                         "Check CSV filename keys vs .npy names.\nExamples:\n" + examples)
 
     X = feats_num.loc[valid_mask].reset_index(drop=True)
     y = meta_df.loc[valid_mask, "label"].astype("int64").to_numpy()
     groups = meta_df.loc[valid_mask, "subject"].astype(str).to_numpy()
     files = meta_df.loc[valid_mask, "file"].astype(str).to_numpy()
 
-    # пути сохранения (если явно не переданы — кладём в out_dir)
+    # -------------------- save caches for train_features --------------------
     features_path = Path(args.features) if args.features else (out_dir / "features.parquet")
     labels_path   = Path(args.labels)   if args.labels   else (out_dir / "labels.npy")
     groups_path   = Path(args.groups)   if args.groups   else (out_dir / "groups.npy")
@@ -530,7 +550,6 @@ def main():
     for pth in (features_path, labels_path, groups_path, files_path):
         pth.parent.mkdir(parents=True, exist_ok=True)
 
-    # сохраняем 4 файла под train_features
     X.to_parquet(features_path)
     np.save(labels_path, y)
     np.save(groups_path, groups)
@@ -538,9 +557,9 @@ def main():
         for p in files:
             f.write(str(p) + "\n")
 
-    # доп. файлы
-    (out_dir / "feature_names.txt").write_text("\n".join(list(X.columns)), encoding="utf-8")
-    json.dump(list(X.columns), open(out_dir / "features_cols.json", "w", encoding="utf-8"),
+    # extras
+    (out_dir / "feature_names.txt").write_text("\n".join(map(str, X.columns)), encoding="utf-8")
+    json.dump(list(map(str, X.columns)), open(out_dir / "features_cols.json", "w", encoding="utf-8"),
               ensure_ascii=False, indent=2)
 
     print("[done] Saved cache for train_features:")
@@ -548,14 +567,7 @@ def main():
     print("  labels:  ", labels_path)
     print("  groups:  ", groups_path)
     print("  files:   ", files_path)
-    print(f"[done] Сохранено:\n  - общий CSV: {final_csv}\n  - per-file CSV: {per_file_dir}\n"
-          f"  - feature_names.txt и features_cols.json\n"
-          f"Пропущено файлов: {skipped}")
-
-
-    print(f"[done] Сохранено:\n  - общий CSV: {final_csv}\n  - per-file CSV: {per_file_dir}\n"
-          f"  - feature_names.txt и features_cols.json\n  - parquet: {out_dir/'features.parquet'}\n"
-          f"Пропущено файлов: {skipped}")
+    print(f"[info] Also saved: {final_csv} and per-file CSVs in {per_file_dir}  |  skipped files: {skipped}")
 
 
 if __name__ == "__main__":
