@@ -288,21 +288,20 @@ def main():
     # сматчим реальные пути к npy
     rows = []
     miss = 0
-    for row in L.itertuples(index=False):
-        stem = getattr(row, "_key")
-        # ищем файл: сначала точное имя из CSV (может уже с .npy), иначе по stem
-        raw = getattr(row, fname_col)
+    for stem, raw, lab in L[["_key", fname_col, "label"]].itertuples(index=False, name=None):
         p = Path(str(raw))
         if not p.is_file():
-            # составим из data_dir
-            p1 = data_dir / (stem + ".npy")
-            p2 = data_dir / stem
-            if p1.is_file(): p = p1
-            elif p2.is_file(): p = p2
+            p1 = data_dir / (str(stem) + ".npy")
+            p2 = data_dir / str(stem)
+            if p1.is_file():
+                p = p1
+            elif p2.is_file():
+                p = p2
             else:
                 miss += 1
                 continue
-        rows.append( (str(p), int(getattr(row, "label"))) )
+        rows.append((str(p), int(lab)))
+
     if miss:
         print(f"[warn] пропущено {miss} строк (файлы не найдены)")
     if not rows:
