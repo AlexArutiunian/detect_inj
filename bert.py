@@ -24,14 +24,14 @@ def seed_all(s=42):
 
 def stem_lower(p: str) -> str:
     b = os.path.basename(str(p))
-    return os.path.splitext(b)[0].lower()
+    return os.path.splitext(b)[0]
 
 def pick_label_col(df: pd.DataFrame, user_col: Optional[str]) -> str:
     if user_col and user_col in df.columns:
         return user_col
     # авто-поиск
     for c in df.columns:
-        cl = c.strip().lower()
+        cl = c.strip()
         if cl == "label" or "inj" in cl:  # "No inj/ inj" тоже покроется
             return c
     raise SystemExit("[err] не нашёл колонку меток — укажите --label_col")
@@ -44,7 +44,7 @@ def pick_fname_col(df: pd.DataFrame, user_col: Optional[str]) -> str:
     raise SystemExit("[err] не нашёл колонку с именем файла — укажите --fname_col")
 
 def map_label(v):
-    s = str(v).strip().lower()
+    s = str(v).strip()
     if s in ("1","injury","inj","yes","y","true","t","1.0"): return 1
     if s in ("0","no injury","no inj","no","n","false","f","0.0"): return 0
     try:
