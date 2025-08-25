@@ -439,6 +439,11 @@ def main():
     ap.add_argument("--fast_axes", action="store_true", help="Быстрые оси сегментов")
     ap.add_argument("--turn_curv_thr", type=float, default=0.15, help="Порог кривизны для straight-агрегатов")
     ap.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) - 1))
+    ap.add_argument("--features", default=None, help="Куда сохранить features.parquet")
+    ap.add_argument("--labels",   default=None, help="Куда сохранить labels.npy")
+    ap.add_argument("--groups",   default=None, help="Куда сохранить groups.npy (subject ids)")
+    ap.add_argument("--files_list", default=None, help="Куда сохранить files.txt (список путей .npy)")
+
     args = ap.parse_args()
 
     data_dir = Path(args.data_dir)
@@ -479,29 +484,73 @@ def main():
     if not rows_feats:
         raise SystemExit("[err] Не удалось извлечь ни одной строки фичей.")
 
-    meta_df = pd.DataFrame(rows_meta)
-    feats_df = pd.DataFrame(rows_feats)
-    feats_num = feats_df.select_dtypes(include=[np.number]).copy()
-    
-    # --- фикс: индексы по строкам и уникальные имена колонок ---
+    # --- вычистим и склеим признаки безопасно ---
     meta_df = meta_df.reset_index(drop=True)
-    feats_num = feats_num.reset_index(drop=True)
+    feats_df = pd.DataFrame(rows_feats).reset_index(drop=True)
 
-    # если вдруг появились дубликаты фичей (одинаковые имена колонок) — оставляем первые
+    # оставляем только числовые фичи
+    feats_num = feats_df.select_dtypes(include=[np.number]).copy()
+
+    # удалим дубли колонок фич (если вдруг совпали имена)
     dup_cols = feats_num.columns[feats_num.columns.duplicated(keep="first")]
     if len(dup_cols) > 0:
         print(f"[warn] Найдены дубликаты фичей, будут удалены: {list(dup_cols)}")
         feats_num = feats_num.loc[:, ~feats_num.columns.duplicated(keep="first")]
 
-    # (опционально) проверим длины на всякий случай
+    # выровняем длины на всякий случай
+    n = min(len(meta_df), len(feats_num))
     if len(meta_df) != len(feats_num):
-        print(f"[warn] Размерности не совпадают: meta={len(meta_df)} feats={len(feats_num)} — выравниваю по минимальному")
-        n = min(len(meta_df), len(feats_num))
-        meta_df = meta_df.iloc[:n].reset_index(drop=True)
-        feats_num = feats_num.iloc[:n].reset_index(drop=True)
+        print(f"[warn] Размерности не совпадают: meta={len(meta_df)} feats={len(feats_num)} — беру первые {n}")
+    meta_df = meta_df.iloc[:n].reset_index(drop=True)
+    feats_num = feats_num.iloc[:n].reset_index(drop=True)
 
-    # теперь безопасно
+    # общий CSV (если он тебе всё ещё нужен)
     final = pd.concat([meta_df, feats_num], axis=1)
+    (final_dir := out_dir).mkdir(parents=True, exist_ok=True)
+    final_csv = out_dir / "features.csv"
+    final.to_csv(final_csv, index=False)
+
+    # --- подготовим кэши для train_features ---
+    # валидные метки (0/1)
+    valid_mask = meta_df["label"].isin([0, 1])
+    if valid_mask.sum() < len(valid_mask):
+        print(f"[warn] Отброшено без меток/некорректных: {len(valid_mask) - int(valid_mask.sum())}")
+
+    X = feats_num.loc[valid_mask].reset_index(drop=True)
+    y = meta_df.loc[valid_mask, "label"].astype("int64").to_numpy()
+    groups = meta_df.loc[valid_mask, "subject"].astype(str).to_numpy()
+    files = meta_df.loc[valid_mask, "file"].astype(str).to_numpy()
+
+    # пути сохранения (если явно не переданы — кладём в out_dir)
+    features_path = Path(args.features) if args.features else (out_dir / "features.parquet")
+    labels_path   = Path(args.labels)   if args.labels   else (out_dir / "labels.npy")
+    groups_path   = Path(args.groups)   if args.groups   else (out_dir / "groups.npy")
+    files_path    = Path(args.files_list) if args.files_list else (out_dir / "files.txt")
+
+    features_path.parent.mkdir(parents=True, exist_ok=True)
+    labels_path.parent.mkdir(parents=True, exist_ok=True)
+    groups_path.parent.mkdir(parents=True, exist_ok=True)
+    files_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # сохраняем 4 файла
+    X.to_parquet(features_path)
+    np.save(labels_path, y)
+    np.save(groups_path, groups)
+    with open(files_path, "w", encoding="utf-8") as f:
+        for p in files:
+            f.write(str(p) + "\n")
+
+    # доп. файлы «на будущее»
+    (out_dir / "feature_names.txt").write_text("\n".join(list(X.columns)), encoding="utf-8")
+    json.dump(list(X.columns), open(out_dir / "features_cols.json", "w", encoding="utf-8"),
+            ensure_ascii=False, indent=2)
+
+    print("[done] Saved cache for train_features:")
+    print("  features:", features_path)
+    print("  labels:  ", labels_path)
+    print("  groups:  ", groups_path)
+    print("  files:   ", files_path)
+
 
         
 
