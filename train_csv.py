@@ -28,7 +28,7 @@ def norm_stem(p: str) -> str:
 
 
 def guess_label_col(df: pd.DataFrame) -> Optional[str]:
-    cands = ["No inj/ inj", "label", "injury", "target", "y", "class"]
+    cands = ["No inj/ inj", "No inj/ inj", "injury", "target", "y", "class"]
     for c in cands:
         if c in df.columns:
             return c
@@ -91,10 +91,10 @@ def load_and_merge(features_csv: str, labels_csv: str,
 
     labs["_key"] = labs[fname_col].astype(str).map(norm_stem)
     labs_small = labs[["_key", label_col]].copy()
-    labs_small.rename(columns={label_col: "label"}, inplace=True)
+    labs_small.rename(columns={label_col: "No inj/ inj"}, inplace=True)
 
     # к числам 0/1
-    labs_small["label"] = labs_small["label"].map(label_to_int)
+    labs_small["No inj/ inj"] = labs_small["No inj/ inj"].map(label_to_int)
 
     df = feats.merge(labs_small, left_on="stem", right_on="_key", how="left")
     df.drop(columns=["_key"], inplace=True, errors="ignore")
@@ -134,10 +134,10 @@ def main():
     df = load_and_merge(args.features_csv, args.labels_csv, args.label_col, args.fname_col)
 
     # 2) оставить только валидные метки
-    if "label" not in df.columns:
+    if "No inj/ inj" not in df.columns:
         raise SystemExit("[err] merge produced no 'label' column — check filename keys")
 
-    valid = df["label"].isin([0, 1])
+    valid = df["No inj/ inj"].isin([0, 1])
     dropped = int((~valid).sum())
     if dropped:
         print(f"[warn] dropped {dropped} rows without valid labels")
@@ -147,11 +147,11 @@ def main():
         raise SystemExit("[err] no labeled rows after merge")
 
     # 3) построим X/y (+ вспомогательные столбцы)
-    id_cols = [c for c in ["file", "basename", "subject", "stem", "label"] if c in df.columns]
-    y = df["label"].astype(int).values
+    id_cols = [c for c in ["file", "basename", "subject", "stem", "No inj/ inj"] if c in df.columns]
+    y = df["No inj/ inj"].astype(int).values
     # все числовые колонки минус label и, на всякий случай, subject если он числовой
     X = df.select_dtypes(include=[np.number]).copy()
-    for c in ["label", "subject"]:
+    for c in ["No inj/ inj", "subject"]:
         if c in X.columns:
             X.drop(columns=[c], inplace=True)
 
@@ -255,7 +255,7 @@ def main():
     # 9) сохранить прогнозы
     def dump_pred(idx, prob, name):
         tmp = df.iloc[idx][["file","basename","subject"]].copy() if "subject" in df.columns else df.iloc[idx][["file","basename"]].copy()
-        tmp["y"] = df.iloc[idx]["label"].values
+        tmp["y"] = df.iloc[idx]["No inj/ inj"].values
         tmp["prob_injury"] = prob
         tmp.to_csv(out_dir / f"pred_{name}.csv", index=False)
 
