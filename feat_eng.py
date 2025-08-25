@@ -43,6 +43,20 @@ def guess_subject_id(filename: str) -> str:
     m = re.match(r"(\d{8})", b)
     return m.group(1) if m else b.split("T")[0][:8]
 
+def label_to_int(v):
+    if v is None:
+        return np.nan
+    s = str(v).strip().lower()
+    if s in ("1", "0"):
+        return int(s)
+    if s.startswith("inj"):      # "inj", "injury", ...
+        return 1
+    if s.startswith("no"):       # "no inj", "no-injury", ...
+        return 0
+    try:
+        return int(float(s))
+    except Exception:
+        return np.nan
 
 # -------------------- Schema / I/O --------------------
 
@@ -483,12 +497,12 @@ def main():
 
     # decide filename column
     fname_col = None
-    for cand in ["filename", "file", "path", "basename", "stem"]:
+    for cand in ["filename", "file", "path", "basename", "stem", "name"]:
         if cand in labels_df.columns:
             fname_col = cand
             break
     if fname_col is None:
-        raise SystemExit("[err] Filename column not found in CSV (expected one of: filename/file/path/basename/stem)")
+        raise SystemExit("[err] Filename column not found in CSV (expected one of: filename/file/path/basename/stem/name)")
 
     def norm_stem(s: str) -> str:
         b = os.path.basename(str(s))
@@ -498,11 +512,19 @@ def main():
     labels_df["_key"] = labels_df[fname_col].astype(str).map(norm_stem)
     meta_df["_key"]   = meta_df["stem"].astype(str).map(lambda x: str(x).lower())
 
-    dups = labels_df["_key"].duplicated(keep="last").sum()
-    if dups:
-        print(f"[warn] CSV has {dups} duplicate filename rows — keeping last.")
+    # Оставляем по одному ряду на ключ и нормализуем метку -> 0/1
+    labels_df_small = (
+        labels_df[["_key", label_col]]
+        .drop_duplicates("_key", keep="last")
+        .rename(columns={label_col: "label"})
+    )
+    labels_df_small["label"] = labels_df_small["label"].map(label_to_int)
 
-    labels_df_small = labels_df[["_key", label_col]].drop_duplicates("_key", keep="last").rename(columns={label_col: "label"})
+    # Удаляем старую пустую колонку label, чтобы не получить label_x/label_y
+    if "label" in meta_df.columns:
+        meta_df.drop(columns=["label"], inplace=True)
+
+    # merge
     meta_df = meta_df.merge(labels_df_small, on="_key", how="left")
     meta_df.drop(columns=["_key"], inplace=True, errors="ignore")
 
@@ -511,6 +533,7 @@ def main():
     cnt1 = int((meta_df["label"] == 1).sum())
     cntN = int(meta_df["label"].isna().sum())
     print(f"[labels] 0={cnt0}  1={cnt1}  missing={cntN}")
+
 
     # keep only numeric features
     feats_num = feats_df.select_dtypes(include=[np.number]).copy()
