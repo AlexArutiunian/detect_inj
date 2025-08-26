@@ -42,7 +42,7 @@ def split_chunks(A: np.ndarray, k: int) -> list[np.ndarray]:
 def main():
     ap = argparse.ArgumentParser(description="Копировать все .npy в итоговую директорию; длинные нули (T>min_frames) резать на chunks; CSV с именами файлов (без путей)")
     ap.add_argument("--data_dir", required=True, help="Где лежат исходные .npy (рекурсивно)")
-    ap.add_argument("--run_csv",  required=True, help="Оригинальный run_data.csv")
+    ap.add_argument("--data_csv",  required=True, help="Оригинальный run_data.csv")
     ap.add_argument("--out_dir",  default="/kaggle/working", help="Итоговая директория")
     ap.add_argument("--out_npy_subdir", default="npy_all", help="Подпапка с итоговыми .npy внутри out_dir")
     ap.add_argument("--label_col", default=None, help="Имя колонки метки (если нестандартное)")
@@ -128,7 +128,7 @@ def main():
     new_df = pd.DataFrame(new_rows)
     new_df.drop(columns=["_label01"], inplace=True, errors="ignore")
 
-    out_csv = out_dir / "run_data_split.csv"
+    out_csv = out_dir / "data_split.csv"
     new_df.to_csv(out_csv, index=False)
 
     print(f"\n[done] CSV: {out_csv}  | rows={len(new_df)}")
