@@ -99,6 +99,7 @@ def main():
 
     # 4) X, y
     y = DF["label"].astype("int32").to_numpy()
+    X_df = X_df.drop(columns=["n_frames"], errors="ignore")
     X_df = DF.select_dtypes(include=[np.number]).drop(columns=["label"], errors="ignore")
 
     # --- опционально сузить признаки по total_gain
@@ -169,12 +170,21 @@ def main():
         n_jobs=0,
     )
 
+    # разбиение TRAIN -> (train, dev) по тем же groups_train
+    from sklearn.model_selection import GroupShuffleSplit
+    gss2 = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
+    tr_idx, dv_idx = next(gss2.split(Xtr, ytr, groups=DF.iloc[train_idx]["origin"].values))
+    Xtr2, ytr2 = Xtr[tr_idx], ytr[tr_idx]
+    Xdv,  ydv  = Xtr[dv_idx], ytr[dv_idx]
+
     clf.fit(
-        Xtr, ytr,
-        eval_set=[(Xtr, ytr), (Xte, yte)],
-        verbose=False,
-        early_stopping_rounds=100
+        Xtr2, ytr2,
+        eval_set=[(Xtr2, ytr2), (Xdv, ydv)],
+        early_stopping_rounds=100,
+        verbose=False
     )
+    # тест только для финальной оценки!
+
 
     # 7) метрики
     prob = clf.predict_proba(Xte)[:, 1]
