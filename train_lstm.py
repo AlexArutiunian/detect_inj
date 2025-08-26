@@ -315,6 +315,32 @@ def build_lstm_model(input_shape, learning_rate=1e-3, mixed_precision=False):
 class contextlib_null:
     def __enter__(self): return None
     def __exit__(self, *exc): return False
+def save_confidence_buckets(prob, out_dir, model_name="lstm", thr=0.5, fname="confidence_buckets.png"):
+    """Три горизонтальных гистограммы уверенности: все, pred==1, pred==0."""
+    prob = np.asarray(prob).ravel()              # p(injury)
+    pred = (prob >= thr).astype(int)             # предсказанный класс
+    conf = np.maximum(prob, 1.0 - prob)          # уверенность относительно предсказанного класса
+
+    bins   = [0.0, 0.5, 0.6, 0.8, 1.01]
+    labels = ["conf <50%", "conf 50–60%", "conf 60–80%", "conf >80%"]
+
+    def draw(ax, mask, title):
+        cnts, _ = np.histogram(conf[mask], bins=bins)
+        bars = ax.barh(range(len(labels)), cnts, height=0.55)
+        ax.set_yticks(range(len(labels)), labels)
+        ax.set_xlabel("Count")
+        ax.set_title(title, fontsize=10)
+        ax.set_xlim(0, max(int(cnts.max()*1.15), 1))      # небольшой запас вправо
+        ax.bar_label(bars, labels=[str(int(v)) for v in cnts], padding=3, fontsize=9)
+        ax.grid(axis="x", alpha=0.2)
+
+    fig, axs = plt.subplots(1, 3, figsize=(13.5, 3.2), dpi=150)
+    draw(axs[0], np.ones_like(conf, dtype=bool),     f"{model_name} — Confidence buckets (all)")
+    draw(axs[1], pred == 1,                          f"{model_name} — Injury buckets (pred==1)")
+    draw(axs[2], pred == 0,                          f"{model_name} — No-injury buckets (pred==0)")
+    fig.tight_layout()
+    fig.savefig(os.path.join(out_dir, fname), dpi=150)
+    plt.close(fig)
 
 # ---------------------- main ----------------------
 def main():
@@ -475,6 +501,8 @@ def main():
     dev_metrics  = compute_metrics(y_dev, dev_pred, prob_dev)
     test_metrics = compute_metrics(y_test, pred_test, prob_test)
     save_plots(hist, args.out_dir, y_test, prob_test)
+    
+    save_confidence_buckets(prob_test, args.out_dir, model_name="lstm", thr=thr)
 
     # Сохранения
     model.save(os.path.join(args.out_dir, "model.keras"))
