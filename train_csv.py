@@ -186,7 +186,7 @@ def main():
     (imp.assign(total_gain_pct=lambda d: d.total_gain/(d.total_gain.sum()+1e-12))
        .sort_values("total_gain", ascending=False)
        .to_csv(os.path.join(args.out_dir, "feature_importance.csv"), index=False))
-
+    
     print("\n[done] модель сохранена в", args.out_dir)
 
 if __name__ == "__main__":
