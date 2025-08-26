@@ -304,6 +304,37 @@ def build_gru_model(input_shape, learning_rate=1e-3, mixed_precision=False):
 class contextlib_null:
     def __enter__(self): return None
     def __exit__(self, *exc): return False
+def save_confidence_buckets(prob, y_true, out_dir, model_name="gru", thr=0.5, fname="confidence_buckets.png"):
+    os.makedirs(out_dir, exist_ok=True)
+    prob = np.asarray(prob).ravel()            # p(injury)
+    pred = (prob >= thr).astype(int)
+    conf = np.maximum(prob, 1.0 - prob)        # уверенность относительно предсказанного класса
+
+    bins   = [0.0, 0.5, 0.6, 0.8, 1.01]
+    labels = ["conf <50%", "conf 50–60%", "conf 60–80%", "conf >80%"]
+
+    def bucket_counts(mask):
+        h, _ = np.histogram(conf[mask], bins=bins)
+        return h
+
+    fig, axs = plt.subplots(1, 3, figsize=(13.5, 3.2), dpi=150)
+    panels = [
+        (np.ones_like(conf, dtype=bool), f"{model_name} — Confidence buckets (all)",    axs[0]),
+        (pred == 1,                       f"{model_name} — Injury buckets (pred==1)",    axs[1]),
+        (pred == 0,                       f"{model_name} — No-injury buckets (pred==0)", axs[2]),
+    ]
+    for mask, title, ax in panels:
+        cnts = bucket_counts(mask)
+        bars = ax.barh(range(len(labels)), cnts, height=0.55)
+        ax.set_yticks(range(len(labels)), labels)
+        ax.set_title(title, fontsize=10)
+        ax.set_xlabel("Count")
+        ax.set_xlim(0, max(cnts.max(), 1) * 1.15)   # запас справа, чтобы цифры не съезжали
+        ax.bar_label(bars, labels=[str(int(v)) for v in cnts], padding=3, fontsize=9)
+        ax.grid(axis="x", alpha=0.2)
+    fig.tight_layout()
+    fig.savefig(os.path.join(out_dir, fname), dpi=150)
+    plt.close(fig)
 
 # ---------------------- main ----------------------
 def main():
@@ -380,24 +411,7 @@ def main():
     idx_train_full, idx_test = train_test_split(idx, test_size=0.20, random_state=42, stratify=labels_all)
     idx_train, idx_dev = train_test_split(idx_train_full, test_size=0.125, random_state=42, stratify=labels_all[idx_train_full])
 
-    # --- сохраним test npy в отдельную папку ---
-    import shutil
-    test_dir = os.path.join(args.out_dir, "test_files")
-    os.makedirs(test_dir, exist_ok=True)
-    test_paths = [paths[i] for i in idx_test]
-
-    print(f"[info] Копируем {len(test_paths)} тестовых файлов в {test_dir}")
-    for p in tqdm(test_paths, desc="Copy test npy", unit="file"):
-        dst = os.path.join(test_dir, os.path.basename(p))
-        try:
-            shutil.copy2(p, dst)
-        except Exception as e:
-            print("[warn] не удалось скопировать", p, "->", e)
-
-    # при желании запишем список путей
-    with open(os.path.join(args.out_dir, "test_list.txt"), "w") as f:
-        for p in test_paths:
-            f.write(p + "\n")
+   
 
     
     # Норм-статы по train
@@ -467,6 +481,9 @@ def main():
     dev_metrics  = compute_metrics(y_dev, dev_pred, prob_dev)
     test_metrics = compute_metrics(y_test, pred_test, prob_test)
     save_plots(hist, args.out_dir, y_test, prob_test)
+    
+    save_confidence_buckets(prob_test, y_test, args.out_dir, model_name="gru", thr=thr)
+
 
     # Сохранения
     model.save(os.path.join(args.out_dir, "model.keras"))
