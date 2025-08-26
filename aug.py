@@ -57,7 +57,7 @@ def main():
     out_npy  = out_dir / args.out_npy_subdir
     out_npy.mkdir(parents=True, exist_ok=True)
 
-    df = pd.read_csv(args.run_csv)
+    df = pd.read_csv(args.data_csv)
     label_col = choose_col(df, args.label_col,
                            ("label","No inj/ inj","injury","target","y","class"),
                            "[err] не нашёл колонку метки — укажите --label_col")
