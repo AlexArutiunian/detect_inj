@@ -13,6 +13,10 @@ except Exception:
     HAS_SGKF = False
 import xgboost as xgb
 
+# NEW: plotting
+import matplotlib.pyplot as plt
+from sklearn.metrics import roc_curve, ConfusionMatrixDisplay
+
 def stem_lower(s: str) -> str:
     b = os.path.basename(str(s))
     return os.path.splitext(b)[0].lower()
@@ -36,11 +40,8 @@ def main():
     ap.add_argument("--out_dir", default="out_xgb_simple")
     ap.add_argument("--use_gpu", action="store_true")
     ap.add_argument("--test_size", type=float, default=0.2, help="Доля данных в тесте (по умолчанию 0.2)")
-
-    # отбор признаков по важности (опционально)
     ap.add_argument("--importance_csv", default=None, help="Путь к feature_importance.csv с прошлого запуска")
     ap.add_argument("--min_total_gain", type=float, default=10.0, help="Порог total_gain для отбора фич")
-
     args = ap.parse_args()
     os.makedirs(args.out_dir, exist_ok=True)
 
@@ -85,24 +86,21 @@ def main():
     if len(DF) == 0:
         raise SystemExit("[err] после приведения меток ни одной валидной строки (0/1)")
 
-    # 3.1) добавить колонку origin (стем без суффикса _<chunk>) для группового сплита
-    # источник для имени — предпочтительно 'stem', иначе используем fname_feat
+    # 3.1) origin для группового сплита
     origin_source = "stem" if "stem" in DF.columns else fname_feat
     def to_origin(v: str) -> str:
         name = os.path.basename(str(v))
-        st = os.path.splitext(name)[0]
-        st = st.lower()
-        # убрать в конце _1/_2/_3 ...
+        st = os.path.splitext(name)[0].lower()
         st = re.sub(r"_(\d+)$", "", st)
         return st
     DF["origin"] = DF[origin_source].astype(str).map(to_origin)
 
     # 4) X, y
     y = DF["label"].astype("int32").to_numpy()
-    
     X_df = DF.select_dtypes(include=[np.number]).drop(columns=["label"], errors="ignore")
     X_df = X_df.drop(columns=["n_frames"], errors="ignore")
-    # --- опционально сузить признаки по total_gain
+
+    # (опц.) сузить признаки по total_gain
     if args.importance_csv and os.path.exists(args.importance_csv):
         imp = pd.read_csv(args.importance_csv)
         if not {"feature","total_gain"}.issubset(imp.columns):
@@ -110,7 +108,7 @@ def main():
         selected = imp.loc[imp["total_gain"] > args.min_total_gain, "feature"].tolist()
         selected = [f for f in selected if f in X_df.columns]
         if len(selected) == 0:
-            raise SystemExit(f"[err] по порогу total_gain > {args.min_total_gain} не осталось фич. Понизьте порог или не указывайте --importance_csv.")
+            raise SystemExit(f"[err] по порогу total_gain > {args.min_total_gain} не осталось фич.")
         X_df = X_df[selected]
         print(f"[info] Использую {len(selected)} фич по важности из {args.importance_csv} (total_gain > {args.min_total_gain})")
     else:
@@ -121,40 +119,35 @@ def main():
     X = X_df.to_numpy(dtype=np.float32)
     groups = DF["origin"].values
 
-    # 5) ГРУППОВЫЙ train/test split: все куски одного origin держим вместе
+    # 5) групповой train/test split
     if HAS_SGKF:
         sgkf = StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=42)
         train_idx, test_idx = next(sgkf.split(X, y, groups))
     else:
-        print("[warn] StratifiedGroupKFold недоступен — использую GroupShuffleSplit (без строгой стратификации).")
+        print("[warn] StratifiedGroupKFold недоступен — GroupShuffleSplit (без строгой стратификации).")
         gss = GroupShuffleSplit(n_splits=1, test_size=args.test_size, random_state=42)
         train_idx, test_idx = next(gss.split(X, y, groups))
 
-    # sanity check: пересечений по origin быть не должно
     inter = set(DF.loc[train_idx, "origin"]) & set(DF.loc[test_idx, "origin"])
     if len(inter) > 0:
-        raise SystemExit(f"[err] Найдены пересечения групп между train/test: {sorted(list(inter))[:5]} ...")
+        raise SystemExit(f"[err] Пересечения групп между train/test: {sorted(list(inter))[:5]} ...")
 
     Xtr, Xte = X[train_idx], X[test_idx]
     ytr, yte = y[train_idx], y[test_idx]
-    
-    # --- Сохранить списки файлов/стемов для контроля сплита ---
+
+    # сохранить списки сплита
     cols_keep = [c for c in [fname_feat, "basename", "stem"] if c in DF.columns]
     train_tbl = DF.iloc[train_idx][cols_keep + ["origin", "label"]].copy()
     test_tbl  = DF.iloc[test_idx ][cols_keep + ["origin", "label"]].copy()
     train_tbl["split"] = "train"; test_tbl["split"] = "test"
-
-    # единый файл и по отдельности
     spl_all = pd.concat([train_tbl, test_tbl], axis=0, ignore_index=True)
     spl_all.to_csv(os.path.join(args.out_dir, "split_all.csv"), index=False)
     train_tbl.to_csv(os.path.join(args.out_dir, "split_train.csv"), index=False)
     test_tbl.to_csv(os.path.join(args.out_dir, "split_test.csv"), index=False)
     print(f"[split] списки сохранены в {args.out_dir}/split_*.csv")
-
-
     print(f"[split] train={len(ytr)}  test={len(yte)}  groups_train={DF.loc[train_idx,'origin'].nunique()}  groups_test={DF.loc[test_idx,'origin'].nunique()}")
 
-    # 6) XGBoost
+    # 6) XGBoost + dev из train-групп
     clf = xgb.XGBClassifier(
         n_estimators=800,
         learning_rate=0.05,
@@ -170,8 +163,6 @@ def main():
         n_jobs=0,
     )
 
-    # разбиение TRAIN -> (train, dev) по тем же groups_train
-    from sklearn.model_selection import GroupShuffleSplit
     gss2 = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
     tr_idx, dv_idx = next(gss2.split(Xtr, ytr, groups=DF.iloc[train_idx]["origin"].values))
     Xtr2, ytr2 = Xtr[tr_idx], ytr[tr_idx]
@@ -183,10 +174,8 @@ def main():
         early_stopping_rounds=100,
         verbose=False
     )
-    # тест только для финальной оценки!
 
-
-    # 7) метрики
+    # 7) метрики (TEST)
     prob = clf.predict_proba(Xte)[:, 1]
     pred = (prob >= 0.5).astype(int)
     auc = roc_auc_score(yte, prob)
@@ -195,12 +184,38 @@ def main():
     print("Confusion matrix:\n", cm)
     print("\nReport:\n", classification_report(yte, pred, digits=3))
 
-    # 8) сохранения
+    # === PLOTS ===
+    # ROC
+    try:
+        fpr, tpr, _ = roc_curve(yte, prob)
+        plt.figure()
+        plt.plot(fpr, tpr, label=f"AUC = {auc:.3f}")
+        plt.plot([0, 1], [0, 1], "--", linewidth=1)
+        plt.xlabel("False Positive Rate")
+        plt.ylabel("True Positive Rate")
+        plt.title("ROC (test)")
+        plt.legend(loc="lower right")
+        plt.grid(alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(os.path.join(args.out_dir, "roc_curve.png"), dpi=150)
+        plt.close()
+    except ValueError as e:
+        print(f"[warn] ROC не построен: {e}")
+
+    # Confusion Matrix
+    fig, ax = plt.subplots()
+    disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=[0, 1])
+    disp.plot(ax=ax, cmap="Blues", colorbar=False, values_format="d")
+    ax.set_title("Confusion Matrix (test)")
+    fig.tight_layout()
+    fig.savefig(os.path.join(args.out_dir, "confusion_matrix.png"), dpi=150)
+    plt.close(fig)
+
+    # 8) сохранения модели и важностей
     booster = clf.get_booster()
     booster.save_model(os.path.join(args.out_dir, "xgb.json"))
     json.dump(feature_names, open(os.path.join(args.out_dir, "features_cols.json"), "w"), ensure_ascii=False, indent=2)
 
-    # важности
     kinds = ["gain","total_gain","weight","cover","total_cover"]
     scores = {k: booster.get_score(importance_type=k) for k in kinds}
     imp = pd.DataFrame({
@@ -210,8 +225,8 @@ def main():
     (imp.assign(total_gain_pct=lambda d: d.total_gain/(d.total_gain.sum()+1e-12))
        .sort_values("total_gain", ascending=False)
        .to_csv(os.path.join(args.out_dir, "feature_importance.csv"), index=False))
-    
-    print("\n[done] модель сохранена в", args.out_dir)
+
+    print(f"\n[done] модель и графики сохранены в {args.out_dir}")
 
 if __name__ == "__main__":
     main()
