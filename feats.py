@@ -43,14 +43,13 @@ def load_npy_to_TxNx3(path: str, n_from_schema: Optional[int]) -> np.ndarray:
         raise ValueError(f"Unexpected array shape {A.shape}. Ожидалось (T,N,3) или (T,3*N).")
     return np.nan_to_num(A, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
 
-def select_frames(A: np.ndarray, max_len: int, mode: str = "uniform") -> np.ndarray:
-    """Ограничить число кадров до max_len (если нужно) перед расчётом фичей."""
-    if max_len is None or max_len <= 0 or A.shape[0] <= max_len:
+def select_frames(A: np.ndarray, max_len: int, mode: str = "uniform", len_slack: int = 0) -> np.ndarray:
+    """Ограничить число кадров до max_len, но сжимать только если T > max_len + len_slack."""
+    if max_len is None or max_len <= 0:
         return A
     T = A.shape[0]
-    if args.max_len and args.max_len > 0 and T > (args.max_len + args.len_slack):
-        idx = pick_indices(T, args.max_len, args.frame_pick)
-        A = A[idx]   # (T', N, 3) — порядок времени сохраняется
+    if T <= max_len + max(0, len_slack):
+        return A  # не сжимаем, попадает в «зазор»
 
     if mode == "head":
         return A[:max_len]
@@ -60,11 +59,13 @@ def select_frames(A: np.ndarray, max_len: int, mode: str = "uniform") -> np.ndar
         start = max(0, (T - max_len) // 2)
         return A[start:start + max_len]
     if mode == "random":
-        start = random.randint(0, T - max_len)
+        start = np.random.randint(0, T - max_len + 1)
         return A[start:start + max_len]
-    # uniform
+
+    # uniform (равномерная выборка индексов по всей длине)
     idx = np.linspace(0, T - 1, num=max_len, dtype=int)
     return A[idx]
+
 
 def _basic_stats(x: np.ndarray) -> dict:
     x = x.astype(np.float32, copy=False)
@@ -170,7 +171,8 @@ def main():
             else: raise ValueError(f"Unexpected shape {A_raw.shape}")
             names = load_schema(schema_path, N_detect)
             A = load_npy_to_TxNx3(str(p), len(names))
-            A = select_frames(A, args.max_len, args.frame_pick)  # <-- ограничение длины
+            A = select_frames(A, args.max_len, args.frame_pick, args.len_slack)  # <-- ограничение длины
+
             feats = extract_features(A, names)
             feats.update({"file": str(p.resolve()), "basename": p.name, "stem": p.stem})
             rows.append(feats)
