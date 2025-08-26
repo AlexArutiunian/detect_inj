@@ -16,6 +16,10 @@ from torch.utils.data import Dataset, DataLoader
 
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import roc_auc_score, confusion_matrix, classification_report, precision_recall_curve
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from sklearn.metrics import roc_curve, ConfusionMatrixDisplay
 
 # -------------------- Utils --------------------
 
@@ -136,6 +140,54 @@ def collate_pad(batch):
         pad[i, :t] = x
         attn[i, :t] = True
     return torch.from_numpy(pad), torch.from_numpy(attn), torch.from_numpy(np.asarray(ys, dtype=np.int64))
+
+def save_roc_plot(y_true, prob, out_dir, auc_val=None, fname="roc_curve.png"):
+    fpr, tpr, _ = roc_curve(y_true, prob)
+    plt.figure(dpi=150)
+    lbl = f"AUC = {auc_val:.3f}" if auc_val is not None else None
+    plt.plot(fpr, tpr, label=lbl)
+    plt.plot([0, 1], [0, 1], "--", linewidth=1)
+    plt.xlabel("False Positive Rate"); plt.ylabel("True Positive Rate")
+    plt.title("ROC (test)")
+    if lbl: plt.legend(loc="lower right")
+    plt.grid(alpha=0.3); plt.tight_layout()
+    plt.savefig(os.path.join(out_dir, fname)); plt.close()
+
+def save_confusion_matrix(cm, out_dir, fname="confusion_matrix.png"):
+    fig, ax = plt.subplots(dpi=150)
+    disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=[0, 1])
+    disp.plot(ax=ax, cmap="Blues", colorbar=False, values_format="d")
+    ax.set_title("Confusion Matrix (test)")
+    fig.tight_layout()
+    fig.savefig(os.path.join(out_dir, fname))
+    plt.close(fig)
+
+def save_confidence_buckets(prob, out_dir, model_name="bert-ts", thr=0.5, fname="confidence_buckets.png"):
+    prob = np.asarray(prob).ravel()
+    pred = (prob >= thr).astype(int)
+    conf = np.maximum(prob, 1.0 - prob)  # уверенность относительно предсказанного класса
+
+    bins   = [0.0, 0.5, 0.6, 0.8, 1.01]
+    labels = ["conf <50%", "conf 50–60%", "conf 60–80%", "conf >80%"]
+
+    def draw(ax, mask, title):
+        cnts, _ = np.histogram(conf[mask], bins=bins)
+        bars = ax.barh(range(len(labels)), cnts, height=0.55)
+        ax.set_yticks(range(len(labels)), labels)
+        ax.set_title(title, fontsize=10)
+        ax.set_xlabel("Count")
+        ax.set_xlim(0, max(int(cnts.max() * 1.15), 1))  # запас справа
+        ax.bar_label(bars, labels=[str(int(v)) for v in cnts], padding=3, fontsize=9)
+        ax.grid(axis="x", alpha=0.2)
+
+    fig, axs = plt.subplots(1, 3, figsize=(13.5, 3.2), dpi=150)
+    draw(axs[0], np.ones_like(conf, dtype=bool), f"{model_name} — Confidence buckets (all)")
+    draw(axs[1], pred == 1,                        f"{model_name} — Injury buckets (pred==1)")
+    draw(axs[2], pred == 0,                        f"{model_name} — No-injury buckets (pred==0)")
+    fig.tight_layout()
+    fig.savefig(os.path.join(out_dir, fname))
+    plt.close(fig)
+
 
 # -------------------- BERT-like model --------------------
 
@@ -364,6 +416,12 @@ def main():
     print(f"\n[TEST] AUC: {auc_te:.3f}")
     print("[TEST] Confusion matrix:\n", cm)
     print("\n[TEST] Report:\n", classification_report(y_te, pred_te, digits=3))
+    
+        # графики
+    save_roc_plot(y_te, prob_te, args.out_dir, auc_val=auc_te, fname="roc_curve.png")
+    save_confusion_matrix(cm, args.out_dir, fname="confusion_matrix.png")
+    save_confidence_buckets(prob_te, args.out_dir, model_name="bert-ts", thr=thr, fname="confidence_buckets.png")
+
 
     # save
     torch.save({
