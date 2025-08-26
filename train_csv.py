@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os, json, argparse
+import os, re, json, argparse
 import numpy as np
 import pandas as pd
-from sklearn.model_selection import train_test_split
 from sklearn.metrics import classification_report, roc_auc_score, confusion_matrix
+from sklearn.model_selection import train_test_split, GroupShuffleSplit
+try:
+    from sklearn.model_selection import StratifiedGroupKFold
+    HAS_SGKF = True
+except Exception:
+    HAS_SGKF = False
 import xgboost as xgb
 
 def stem_lower(s: str) -> str:
@@ -32,7 +37,7 @@ def main():
     ap.add_argument("--use_gpu", action="store_true")
     ap.add_argument("--test_size", type=float, default=0.2, help="Доля данных в тесте (по умолчанию 0.2)")
 
-    # >>> НОВОЕ: выбор фич по важности с прошлого запуска
+    # отбор признаков по важности (опционально)
     ap.add_argument("--importance_csv", default=None, help="Путь к feature_importance.csv с прошлого запуска")
     ap.add_argument("--min_total_gain", type=float, default=10.0, help="Порог total_gain для отбора фич")
 
@@ -47,7 +52,7 @@ def main():
     if fname_feat is None:
         raise SystemExit("[err] features_csv должен содержать колонку stem/basename/file для связи с labels_csv")
 
-    # 2) метки
+    # 2) подмешать метки при необходимости
     if "label" in F.columns and F["label"].notna().any():
         DF = F.copy()
     else:
@@ -80,19 +85,28 @@ def main():
     if len(DF) == 0:
         raise SystemExit("[err] после приведения меток ни одной валидной строки (0/1)")
 
-    # 4) сформировать X, y
-    y = DF["label"].astype("int32").to_numpy()
+    # 3.1) добавить колонку origin (стем без суффикса _<chunk>) для группового сплита
+    # источник для имени — предпочтительно 'stem', иначе используем fname_feat
+    origin_source = "stem" if "stem" in DF.columns else fname_feat
+    def to_origin(v: str) -> str:
+        name = os.path.basename(str(v))
+        st = os.path.splitext(name)[0]
+        st = st.lower()
+        # убрать в конце _1/_2/_3 ...
+        st = re.sub(r"_(\d+)$", "", st)
+        return st
+    DF["origin"] = DF[origin_source].astype(str).map(to_origin)
 
-    # --- базовый набор признаков: все числовые минус label
+    # 4) X, y
+    y = DF["label"].astype("int32").to_numpy()
     X_df = DF.select_dtypes(include=[np.number]).drop(columns=["label"], errors="ignore")
 
-    # >>> НОВОЕ: если указан importance_csv — сузить признаки по total_gain
+    # --- опционально сузить признаки по total_gain
     if args.importance_csv and os.path.exists(args.importance_csv):
         imp = pd.read_csv(args.importance_csv)
         if not {"feature","total_gain"}.issubset(imp.columns):
             raise SystemExit("[err] importance_csv должен содержать колонки 'feature' и 'total_gain'")
         selected = imp.loc[imp["total_gain"] > args.min_total_gain, "feature"].tolist()
-        # Пересечение с доступными колонками (на случай расхождений)
         selected = [f for f in selected if f in X_df.columns]
         if len(selected) == 0:
             raise SystemExit(f"[err] по порогу total_gain > {args.min_total_gain} не осталось фич. Понизьте порог или не указывайте --importance_csv.")
@@ -104,11 +118,26 @@ def main():
 
     feature_names = list(X_df.columns)
     X = X_df.to_numpy(dtype=np.float32)
+    groups = DF["origin"].values
 
-    # 5) train/test split
-    Xtr, Xte, ytr, yte = train_test_split(
-        X, y, test_size=args.test_size, random_state=42, stratify=y
-    )
+    # 5) ГРУППОВЫЙ train/test split: все куски одного origin держим вместе
+    if HAS_SGKF:
+        sgkf = StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=42)
+        train_idx, test_idx = next(sgkf.split(X, y, groups))
+    else:
+        print("[warn] StratifiedGroupKFold недоступен — использую GroupShuffleSplit (без строгой стратификации).")
+        gss = GroupShuffleSplit(n_splits=1, test_size=args.test_size, random_state=42)
+        train_idx, test_idx = next(gss.split(X, y, groups))
+
+    # sanity check: пересечений по origin быть не должно
+    inter = set(DF.loc[train_idx, "origin"]) & set(DF.loc[test_idx, "origin"])
+    if len(inter) > 0:
+        raise SystemExit(f"[err] Найдены пересечения групп между train/test: {sorted(list(inter))[:5]} ...")
+
+    Xtr, Xte = X[train_idx], X[test_idx]
+    ytr, yte = y[train_idx], y[test_idx]
+
+    print(f"[split] train={len(ytr)}  test={len(yte)}  groups_train={DF.loc[train_idx,'origin'].nunique()}  groups_test={DF.loc[test_idx,'origin'].nunique()}")
 
     # 6) XGBoost
     clf = xgb.XGBClassifier(
@@ -148,8 +177,8 @@ def main():
     json.dump(feature_names, open(os.path.join(args.out_dir, "features_cols.json"), "w"), ensure_ascii=False, indent=2)
 
     # важности
-    bst = clf.get_booster(); kinds = ["gain","total_gain","weight","cover","total_cover"]
-    scores = {k: bst.get_score(importance_type=k) for k in kinds}
+    kinds = ["gain","total_gain","weight","cover","total_cover"]
+    scores = {k: booster.get_score(importance_type=k) for k in kinds}
     imp = pd.DataFrame({
         "feature": feature_names,
         **{k: [scores[k].get(f"f{i}", 0.0) for i in range(len(feature_names))] for k in kinds}
