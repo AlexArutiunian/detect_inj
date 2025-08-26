@@ -165,40 +165,42 @@ def main():
     fig.tight_layout(); fig.savefig(os.path.join(args.out_dir, "confusion_matrix.png"), dpi=150); plt.close(fig)
 
     # --- Confidence buckets (как на твоём скрине)
-    def bucket_counts(p, bins):
-        if p.size == 0: return np.zeros(len(bins)-1, dtype=int)
-        idx = np.clip(np.digitize(p, bins, right=False) - 1, 0, len(bins)-2)
-        return np.bincount(idx, minlength=len(bins)-1)
+    def save_confidence_buckets(prob, y_true, out_dir, model_name="xgb", thr=0.5):
+        prob = np.asarray(prob).ravel()              # p(injury)
+        pred = (prob >= thr).astype(int)             # предсказанный класс
+        conf = np.maximum(prob, 1.0 - prob)          # УВЕРЕННОСТЬ ОТНОСИТЕЛЬНО ПРЕДСКАЗАННОГО КЛАССА
 
-    bins = np.array([0.0, 0.5, 0.6, 0.8, 1.0 + 1e-9])
-    counts_all = bucket_counts(prob, bins)
-    counts_inj = bucket_counts(prob[pred == 1], bins)
-    counts_noi = bucket_counts(prob[pred == 0], bins)
+        bins  = [0.0, 0.5, 0.6, 0.8, 1.01]
+        labels = ["conf <50%", "conf 50–60%", "conf 60–80%", "conf >80%"]
 
-    labels_all = ["conf <50%", "conf 50–60%", "conf 60–80%", "conf >80%"]
-    labels_inj = ["inj <50%", "inj 50–60%", "inj 60–80%", "inj >80%"]
-    labels_noi = ["no-injury <50%", "no-injury 50–60%", "no-injury 60–80%", "no-injury >80%"]
+        def bucket_counts(mask):
+            h, _ = np.histogram(conf[mask], bins=bins)
+            return h
 
-    fig, axs = plt.subplots(1, 3, figsize=(12, 3))
-    titles = ["xgb — Confidence buckets (all)",
-              "xgb — Injury buckets (pred==1)",
-              "xgb — No-injury buckets (pred==0)"]
-    for ax, cnt, ylbl, ttl in zip(
-        axs,
-        [counts_all, counts_inj, counts_noi],
-        [labels_all, labels_inj, labels_noi],
-        titles,
-    ):
-        y = np.arange(len(ylbl))
-        ax.barh(y, cnt)
-        for yy, v in zip(y, cnt):
-            ax.text(v + 0.5, yy, str(int(v)), va="center", fontsize=8)
-        ax.set_yticks(y); ax.set_yticklabels(ylbl)
-        ax.set_xlabel("Count"); ax.set_title(ttl)
-        ax.invert_yaxis()  # чтобы верхняя полоса была "<50%"
-    fig.tight_layout()
-    fig.savefig(os.path.join(args.out_dir, "confidence_buckets.png"), dpi=150)
-    plt.close(fig)
+        import matplotlib.pyplot as plt
+        fig, axs = plt.subplots(1, 3, figsize=(13.5, 3.2), dpi=150)
+        panels = [
+            (np.ones_like(conf, dtype=bool),     f"{model_name} — Confidence buckets (all)",     axs[0]),
+            (pred == 1,                          f"{model_name} — Injury buckets (pred==1)",     axs[1]),
+            (pred == 0,                          f"{model_name} — No-injury buckets (pred==0)",  axs[2]),
+        ]
+
+        for mask, title, ax in panels:
+            cnts = bucket_counts(mask)
+            bars = ax.barh(range(len(labels)), cnts, height=0.55)
+            ax.set_yticks(range(len(labels)), labels)
+            ax.set_title(title, fontsize=10)
+            ax.set_xlabel("Count")
+            xmax = max(cnts.max(), 1)
+            ax.set_xlim(0, xmax * 1.15)                 # запас справа, чтобы числа не выходили за график
+            ax.bar_label(bars, labels=[str(int(v)) for v in cnts], padding=3, fontsize=9)  # подписи ВНУТРИ/на краю
+            ax.grid(axis="x", alpha=0.2)
+
+        fig.tight_layout()
+        fig.savefig(os.path.join(out_dir, "confidence_buckets.png"), dpi=150)
+        plt.close(fig)
+
+    save_confidence_buckets(prob, yte, args.out_dir, model_name="xgb", thr=0.5)  # или thr=твой_порог
 
     # save model + importances
     booster = clf.get_booster()
