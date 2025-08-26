@@ -136,6 +136,20 @@ def main():
 
     Xtr, Xte = X[train_idx], X[test_idx]
     ytr, yte = y[train_idx], y[test_idx]
+    
+    # --- Сохранить списки файлов/стемов для контроля сплита ---
+    cols_keep = [c for c in [fname_feat, "basename", "stem"] if c in DF.columns]
+    train_tbl = DF.iloc[train_idx][cols_keep + ["origin", "label"]].copy()
+    test_tbl  = DF.iloc[test_idx ][cols_keep + ["origin", "label"]].copy()
+    train_tbl["split"] = "train"; test_tbl["split"] = "test"
+
+    # единый файл и по отдельности
+    spl_all = pd.concat([train_tbl, test_tbl], axis=0, ignore_index=True)
+    spl_all.to_csv(os.path.join(args.out_dir, "split_all.csv"), index=False)
+    train_tbl.to_csv(os.path.join(args.out_dir, "split_train.csv"), index=False)
+    test_tbl.to_csv(os.path.join(args.out_dir, "split_test.csv"), index=False)
+    print(f"[split] списки сохранены в {args.out_dir}/split_*.csv")
+
 
     print(f"[split] train={len(ytr)}  test={len(yte)}  groups_train={DF.loc[train_idx,'origin'].nunique()}  groups_test={DF.loc[test_idx,'origin'].nunique()}")
 
