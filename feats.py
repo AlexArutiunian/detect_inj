@@ -3,37 +3,22 @@
 
 """
 Экстрактор фич из .npy c расширенными динамическими признаками.
-
-На каждую координату {x,y,z} каждого сустава считаем базовые статфичи:
-mean, std, min, max, ptp, median, q25, q75, iqr, mad, skew, kurt, rms, ac1
-+ коэффициенты: cov=std/|mean|, iqr_over_range=iqr/(ptp+eps)
-
-Дополнительно:
-- magnitude по суставу: ||(x,y,z)|| и его статфичи
-- скорость (первая разность) и ускорение (вторая разность) для осей и magnitude
-- zero-crossing rate (zcr) для скорости (каждой оси и magnitude)
-- межосевые корреляции corr(x,y), corr(y,z), corr(x,z)
-
-Выход: CSV: file, basename, stem, n_frames, n_joints, ...фичи...
-Зависимости: numpy, pandas, tqdm
+Добавлено: --max_len и --frame_pick для ограничения числа кадров перед расчётом фичей.
 """
 
-import os
-import json
-import argparse
+import os, json, argparse, random
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
-
+# ---------- helpers ----------
 def _sanitize_names(names: List[str]) -> List[str]:
     out = []
     for i, s in enumerate(names):
-        s = str(s).strip()
-        s = s.replace(" ", "_").replace("/", "_")
+        s = str(s).strip().replace(" ", "_").replace("/", "_")
         out.append(s if s else f"j{i}")
     return out
 
@@ -58,24 +43,37 @@ def load_npy_to_TxNx3(path: str, n_from_schema: Optional[int]) -> np.ndarray:
         raise ValueError(f"Unexpected array shape {A.shape}. Ожидалось (T,N,3) или (T,3*N).")
     return np.nan_to_num(A, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
 
+def select_frames(A: np.ndarray, max_len: int, mode: str = "uniform") -> np.ndarray:
+    """Ограничить число кадров до max_len (если нужно) перед расчётом фичей."""
+    if max_len is None or max_len <= 0 or A.shape[0] <= max_len:
+        return A
+    T = A.shape[0]
+    if mode == "head":
+        return A[:max_len]
+    if mode == "tail":
+        return A[-max_len:]
+    if mode == "center":
+        start = max(0, (T - max_len) // 2)
+        return A[start:start + max_len]
+    if mode == "random":
+        start = random.randint(0, T - max_len)
+        return A[start:start + max_len]
+    # uniform
+    idx = np.linspace(0, T - 1, num=max_len, dtype=int)
+    return A[idx]
+
 def _basic_stats(x: np.ndarray) -> dict:
     x = x.astype(np.float32, copy=False)
     n = x.size
-    m  = float(np.mean(x))
-    sd = float(np.std(x))
-    mn = float(np.min(x))
-    mx = float(np.max(x))
-    pt = float(np.ptp(x))
+    m  = float(np.mean(x)); sd = float(np.std(x))
+    mn = float(np.min(x));  mx = float(np.max(x)); pt = float(np.ptp(x))
     med = float(np.median(x))
-    q25 = float(np.percentile(x, 25))
-    q75 = float(np.percentile(x, 75))
-    iqr = float(q75 - q25)
-    mad = float(np.median(np.abs(x - med)))
+    q25 = float(np.percentile(x, 25)); q75 = float(np.percentile(x, 75))
+    iqr = float(q75 - q25); mad = float(np.median(np.abs(x - med)))
     rms = float(np.sqrt(np.mean(x * x)))
     if sd > 0:
         z = (x - m) / sd
-        sk = float(np.mean(z ** 3))
-        ku = float(np.mean(z ** 4) - 3.0)
+        sk = float(np.mean(z ** 3)); ku = float(np.mean(z ** 4) - 3.0)
     else:
         sk, ku = 0.0, 0.0
     if n > 1:
@@ -93,33 +91,21 @@ def _basic_stats(x: np.ndarray) -> dict:
     }
 
 def _zcr(x: np.ndarray) -> float:
-    """Zero-crossing rate для времени: доля смен знака."""
-    if x.size < 2:
-        return 0.0
-    s = np.sign(x)
-    s[s == 0] = 1  # чтобы нули не портили смену знака
+    if x.size < 2: return 0.0
+    s = np.sign(x); s[s == 0] = 1
     return float(np.mean(s[1:] != s[:-1]))
 
 def _diff(x: np.ndarray, order: int = 1) -> np.ndarray:
-    if order == 1:
-        return np.diff(x, n=1)
-    elif order == 2:
-        return np.diff(x, n=2)
-    else:
-        raise ValueError("order must be 1 or 2")
+    return np.diff(x, n=order)
 
 def _safe_corr(a: np.ndarray, b: np.ndarray) -> float:
-    if a.size < 2 or b.size < 2:
-        return 0.0
+    if a.size < 2 or b.size < 2: return 0.0
     sd_a, sd_b = np.std(a), np.std(b)
-    if sd_a == 0 or sd_b == 0:
-        return 0.0
+    if sd_a == 0 or sd_b == 0: return 0.0
     c = np.corrcoef(a, b)
-    v = float(c[0, 1]) if np.isfinite(c).all() else 0.0
-    return v
+    return float(c[0, 1]) if np.isfinite(c).all() else 0.0
 
 def _add_stats(out: dict, prefix: str, x: np.ndarray):
-    """Добавить базовые статфичи + расширения."""
     st = _basic_stats(x)
     for k, v in st.items():
         out[f"{prefix}_{k}"] = float(v)
@@ -127,65 +113,35 @@ def _add_stats(out: dict, prefix: str, x: np.ndarray):
 def extract_features(A: np.ndarray, joint_names: List[str]) -> dict:
     T, N, _ = A.shape
     out = {"n_frames": int(T), "n_joints": int(N)}
-    axes = ["x", "y", "z"]
-
     for j in range(N):
         name = joint_names[j]
-        x = A[:, j, 0]
-        y = A[:, j, 1]
-        z = A[:, j, 2]
-
-        # Базовые по осям
+        x, y, z = A[:, j, 0], A[:, j, 1], A[:, j, 2]
         _add_stats(out, f"{name}_x", x)
         _add_stats(out, f"{name}_y", y)
         _add_stats(out, f"{name}_z", z)
-
-        # Межосевые корреляции
         out[f"{name}_xy_corr"] = _safe_corr(x, y)
         out[f"{name}_yz_corr"] = _safe_corr(y, z)
         out[f"{name}_xz_corr"] = _safe_corr(x, z)
-
-        # Magnitude положения
-        mag = np.sqrt(x*x + y*y + z*z)
-        _add_stats(out, f"{name}_mag", mag)
-
-        # Скорость (первая разность) по осям и magnitude
-        vx, vy, vz = _diff(x, 1), _diff(y, 1), _diff(z, 1)
-        vmag = _diff(mag, 1)
-
-        _add_stats(out, f"{name}_vx", vx)
-        _add_stats(out, f"{name}_vy", vy)
-        _add_stats(out, f"{name}_vz", vz)
-        _add_stats(out, f"{name}_vmag", vmag)
-
-        # ZCR для скорости (показатель «дёрганости»)
-        out[f"{name}_vx_zcr"] = _zcr(vx)
-        out[f"{name}_vy_zcr"] = _zcr(vy)
-        out[f"{name}_vz_zcr"] = _zcr(vz)
-        out[f"{name}_vmag_zcr"] = _zcr(vmag)
-
-        # Ускорение (вторая разность) по осям и magnitude
-        ax, ay, az = _diff(x, 2), _diff(y, 2), _diff(z, 2)
-        amag = _diff(mag, 2)
-
-        _add_stats(out, f"{name}_ax", ax)
-        _add_stats(out, f"{name}_ay", ay)
-        _add_stats(out, f"{name}_az", az)
-        _add_stats(out, f"{name}_amag", amag)
-
+        mag = np.sqrt(x*x + y*y + z*z); _add_stats(out, f"{name}_mag", mag)
+        vx, vy, vz = _diff(x, 1), _diff(y, 1), _diff(z, 1); vmag = _diff(mag, 1)
+        _add_stats(out, f"{name}_vx", vx); _add_stats(out, f"{name}_vy", vy); _add_stats(out, f"{name}_vz", vz); _add_stats(out, f"{name}_vmag", vmag)
+        out[f"{name}_vx_zcr"] = _zcr(vx); out[f"{name}_vy_zcr"] = _zcr(vy); out[f"{name}_vz_zcr"] = _zcr(vz); out[f"{name}_vmag_zcr"] = _zcr(vmag)
+        ax, ay, az = _diff(x, 2), _diff(y, 2), _diff(z, 2); amag = _diff(mag, 2)
+        _add_stats(out, f"{name}_ax", ax); _add_stats(out, f"{name}_ay", ay); _add_stats(out, f"{name}_az", az); _add_stats(out, f"{name}_amag", amag)
     return out
 
+# ---------- main ----------
 def main():
     ap = argparse.ArgumentParser(description="Экстрактор фич из .npy (расширенная статистика + динамика)")
     ap.add_argument("--data_dir", required=True, help="Папка с .npy (рекурсивно)")
     ap.add_argument("--out_csv",  required=True, help="Путь к итоговому CSV")
     ap.add_argument("--schema",   default=None,  help="schema_joints.json (опционально)")
+    ap.add_argument("--max_len", type=int, default=0, help="макс. число кадров; 0 = без ограничения")
+    ap.add_argument("--frame_pick", choices=["uniform","head","tail","center","random"],
+                    default="uniform", help="стратегия отбора кадров при обрезке")
     args = ap.parse_args()
 
-    data_dir = Path(args.data_dir)
-    out_csv  = Path(args.out_csv)
-    schema_path = args.schema
-
+    data_dir = Path(args.data_dir); out_csv = Path(args.out_csv); schema_path = args.schema
     files = sorted(data_dir.rglob("*.npy"))
     if not files:
         raise SystemExit(f"[err] В {data_dir} не найдено .npy")
@@ -194,15 +150,12 @@ def main():
     for p in tqdm(files, desc="Extract"):
         try:
             A_raw = np.load(p, allow_pickle=False)
-            if A_raw.ndim == 3 and A_raw.shape[2] == 3:
-                N_detect = A_raw.shape[1]
-            elif A_raw.ndim == 2 and A_raw.shape[1] % 3 == 0:
-                N_detect = A_raw.shape[1] // 3
-            else:
-                raise ValueError(f"Unexpected shape {A_raw.shape}")
-
+            if A_raw.ndim == 3 and A_raw.shape[2] == 3: N_detect = A_raw.shape[1]
+            elif A_raw.ndim == 2 and A_raw.shape[1] % 3 == 0: N_detect = A_raw.shape[1] // 3
+            else: raise ValueError(f"Unexpected shape {A_raw.shape}")
             names = load_schema(schema_path, N_detect)
             A = load_npy_to_TxNx3(str(p), len(names))
+            A = select_frames(A, args.max_len, args.frame_pick)  # <-- ограничение длины
             feats = extract_features(A, names)
             feats.update({"file": str(p.resolve()), "basename": p.name, "stem": p.stem})
             rows.append(feats)
