@@ -48,6 +48,10 @@ def select_frames(A: np.ndarray, max_len: int, mode: str = "uniform") -> np.ndar
     if max_len is None or max_len <= 0 or A.shape[0] <= max_len:
         return A
     T = A.shape[0]
+    if args.max_len and args.max_len > 0 and T > (args.max_len + args.len_slack):
+        idx = pick_indices(T, args.max_len, args.frame_pick)
+        A = A[idx]   # (T', N, 3) — порядок времени сохраняется
+
     if mode == "head":
         return A[:max_len]
     if mode == "tail":
@@ -94,6 +98,14 @@ def _zcr(x: np.ndarray) -> float:
     if x.size < 2: return 0.0
     s = np.sign(x); s[s == 0] = 1
     return float(np.mean(s[1:] != s[:-1]))
+def pick_indices(T, k, mode="uniform"):
+    if k <= 0 or T <= k: return np.arange(T, dtype=int)
+    if mode == "uniform": return np.round(np.linspace(0, T-1, k)).astype(int)
+    if mode == "head":    return np.arange(0, k, dtype=int)
+    if mode == "tail":    return np.arange(T-k, T, dtype=int)
+    if mode == "center":  s = max(0, (T-k)//2); return np.arange(s, s+k, dtype=int)
+    if mode == "random":  s = np.random.randint(0, max(1, T-k+1)); return np.arange(s, s+k, dtype=int)
+    return np.round(np.linspace(0, T-1, k)).astype(int)
 
 def _diff(x: np.ndarray, order: int = 1) -> np.ndarray:
     return np.diff(x, n=order)
@@ -139,6 +151,9 @@ def main():
     ap.add_argument("--max_len", type=int, default=0, help="макс. число кадров; 0 = без ограничения")
     ap.add_argument("--frame_pick", choices=["uniform","head","tail","center","random"],
                     default="uniform", help="стратегия отбора кадров при обрезке")
+    ap.add_argument("--len_slack", type=int, default=500,
+                help="Сжимать только если T > max_len + len_slack")
+
     args = ap.parse_args()
 
     data_dir = Path(args.data_dir); out_csv = Path(args.out_csv); schema_path = args.schema
