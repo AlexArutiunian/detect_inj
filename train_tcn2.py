@@ -384,6 +384,44 @@ def _parse_int_list(s: str, default):
     parts = str(s).replace(";", ",").replace(" ", ",").split(",")
     vals = [int(p) for p in parts if p.strip() != ""]
     return tuple(vals) if vals else tuple(default)
+def save_confidence_buckets(prob, y_true, out_dir, model_name="tcn", thr=0.5):
+    prob = np.asarray(prob).ravel()
+    pred = (prob >= thr).astype(int)
+    # уверенность относительно предсказанного класса
+    conf = np.maximum(prob, 1.0 - prob)
+
+    bins = [0.0, 0.5, 0.6, 0.8, 1.0000001]
+    labels = ["conf <50%", "50–60%", "60–80%", ">80%"]
+
+    def bucket_counts(mask):
+        h, _ = np.histogram(conf[mask], bins=bins)
+        return h
+
+    fig, axs = plt.subplots(1, 3, figsize=(13.5, 3.2), dpi=150)
+    panels = [
+        (np.ones_like(conf, dtype=bool), f"{model_name} — all", axs[0]),
+        (pred == 1,                        f"{model_name} — predicted: injury", axs[1]),
+        (pred == 0,                        f"{model_name} — predicted: no-injury", axs[2]),
+    ]
+
+    for mask, title, ax in panels:
+        cnts = bucket_counts(mask)
+        bars = ax.barh(range(len(labels)), cnts, height=0.55)
+        ax.set_yticks(range(len(labels)), labels)
+        ax.set_title(title, fontsize=10)
+        ax.set_xlabel("Count")
+        xmax = max(1, int(cnts.max()))
+        ax.set_xlim(0, xmax * 1.25)  # запас справа, чтобы числа не упирались в край
+        # подписи у правого края каждой полосы
+        for i, b in enumerate(bars):
+            v = int(cnts[i])
+            ax.text(v + 0.02 * xmax, b.get_y() + b.get_height() / 2, str(v),
+                    va="center", fontsize=9, clip_on=False)
+        ax.grid(axis="x", alpha=0.2)
+
+    fig.tight_layout()
+    fig.savefig(os.path.join(out_dir, "confidence_buckets.png"), dpi=150)
+    plt.close(fig)
 
 # ---------------------- main ----------------------
 def main():
@@ -563,6 +601,9 @@ def main():
     prob_test = model.predict(test_ds, verbose=0).reshape(-1).astype(np.float32)
     y_test    = labels_all[idx_test]
     pred_test = (prob_test >= thr).astype(np.int32)
+    
+    save_confidence_buckets(prob_test, y_test, args.out_dir, model_name="tcn", thr=thr)
+
 
     dev_pred  = (prob_dev >= thr).astype(np.int32)
     dev_metrics  = compute_metrics(y_dev, dev_pred, prob_dev)
