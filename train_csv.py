@@ -99,9 +99,9 @@ def main():
 
     # 4) X, y
     y = DF["label"].astype("int32").to_numpy()
-    X_df = X_df.drop(columns=["n_frames"], errors="ignore")
+    
     X_df = DF.select_dtypes(include=[np.number]).drop(columns=["label"], errors="ignore")
-
+    X_df = X_df.drop(columns=["n_frames"], errors="ignore")
     # --- опционально сузить признаки по total_gain
     if args.importance_csv and os.path.exists(args.importance_csv):
         imp = pd.read_csv(args.importance_csv)
