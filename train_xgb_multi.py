@@ -142,6 +142,7 @@ def main():
             raise SystemExit("[err] в features.csv нет 'label'; укажите --labels_csv (filename,label)")
         L = pd.read_csv(args.labels_csv)
         fname_lab = args.fname_in_labels or next((c for c in ("filename","file","path","basename","stem") if c in L.columns), None)
+        print(fname_lab)
         if fname_lab is None:
             raise SystemExit("[err] не нашёл колонку имени файла в labels_csv (ожидал filename/file/path/basename/stem)")
         label_col = args.label_col or ("label" if "label" in L.columns else None)
