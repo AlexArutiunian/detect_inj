@@ -255,6 +255,15 @@ def main():
     pd.concat([train_tbl, test_tbl], axis=0, ignore_index=True).to_csv(os.path.join(args.out_dir, "split_all.csv"), index=False)
     train_tbl.to_csv(os.path.join(args.out_dir, "split_train.csv"), index=False)
     test_tbl.to_csv(os.path.join(args.out_dir, "split_test.csv"), index=False)
+    
+    # ===== 5.1) Кол-во классов берём из train
+    classes_in_train = np.unique(ytr)
+    num_class = int(classes_in_train.size)
+
+    # убеждаемся, что метки в трейне идут подряд 0..K-1
+    assert classes_in_train.min() == 0 and classes_in_train.max() == num_class - 1, \
+        f"Train labels must be 0..K-1, got {classes_in_train}"
+    print(f"[info] num_class used: {num_class}")
 
 
     # ===== 6) XGBoost
