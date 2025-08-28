@@ -17,6 +17,15 @@ matplotlib.use("Agg")  # headless
 import matplotlib.pyplot as plt
 from sklearn.metrics import ConfusionMatrixDisplay, roc_curve, auc
 from sklearn.preprocessing import label_binarize
+import re
+try:
+    from sklearn.model_selection import StratifiedGroupKFold
+    HAS_SGKF = True
+except Exception:
+    from sklearn.model_selection import GroupShuffleSplit
+    HAS_SGKF = False
+import xgboost as xgb  # уже есть
+
 # ========= plotting helpers =========
 def save_confusion_matrix(cm, class_names, out_path, title="Confusion Matrix (test)"):
     fig, ax = plt.subplots(figsize=(6, 5), dpi=150)
@@ -166,6 +175,18 @@ def main():
     else:
         label_to_zero = {int(v): int(v-1) for v in labels_sorted}
     DF["_y"] = DF["label"].astype(int).map(label_to_zero).astype("int32")
+    
+        # --- origin для группового сплита: имя без суффиксов _chunk### / _### в конце
+    origin_source = "stem" if "stem" in DF.columns else fname_feat  # fname_feat найден раньше из features_csv
+    def to_origin(v: str) -> str:
+        name = os.path.basename(str(v))
+        st = os.path.splitext(name)[0].lower()
+        # убираем ..._chunk000 / ..._chunk12 / ..._000
+        st = re.sub(r"(?:_chunk\d+|_\d+)$", "", st)
+        return st
+
+    DF["origin"] = DF[origin_source].astype(str).map(to_origin)
+
 
     # ===== 4) X, y
     y_all = DF["_y"].to_numpy()
@@ -173,55 +194,68 @@ def main():
     feature_names = list(X_all.columns)
     X_all = X_all.to_numpy(dtype=np.float32)
 
-    # ===== 5) Robust stratified split so that TRAIN contains ALL classes
-    #   - keep classes with <2 samples entirely in train (drop from test)
+    # ===== 5) Групповой стратифицированный split, без утечки кусков одного файла
+    y_all = DF["_y"].to_numpy()
+    X_all = DF.select_dtypes(include=[np.number]).drop(columns=["label","_y"], errors="ignore")
+    feature_names = list(X_all.columns)
+    X_all = X_all.to_numpy(dtype=np.float32)
+    groups_all = DF["origin"].values
+    idx_all = np.arange(len(y_all))
+
+    # редкие классы (<2 объектов) полностью в train
     counts = pd.Series(y_all).value_counts().sort_index()
     rare_classes = counts[counts < 2].index.tolist()
     mask_rare = np.isin(y_all, rare_classes)
-    X_rare, y_rare = X_all[mask_rare], y_all[mask_rare]
-    X_rest, y_rest = X_all[~mask_rare], y_all[~mask_rare]
+    idx_rare = idx_all[mask_rare]
+    idx_rest = idx_all[~mask_rare]
 
-    if len(y_rest) == 0:
+    if len(idx_rest) == 0:
         raise SystemExit("[err] все классы слишком редкие (<2). Увеличьте данные или объедините классы.")
 
-    # первичный стратифицированный сплит на «нормальной» части
-    best = None
-    rng = np.random.RandomState(args.seed)
-    for attempt in range(50):  # несколько попыток, чтобы train покрывал все классы y_rest
-        Xtr_r, Xte_r, ytr_r, yte_r = train_test_split(
-            X_rest, y_rest, test_size=args.test_size, random_state=rng.randint(0, 10_000), stratify=y_rest
-        )
-        if set(np.unique(ytr_r)) == set(np.unique(y_rest)):
-            best = (Xtr_r, Xte_r, ytr_r, yte_r); break
-    if best is None:
-        # fallback: KFold, берём первый сплит с полным покрытием в train
-        skf = StratifiedKFold(n_splits=int(1/args.test_size) if args.test_size<0.5 else 5, shuffle=True, random_state=args.seed)
-        for tr_idx, te_idx in skf.split(X_rest, y_rest):
-            ytr_r = y_rest[tr_idx]
-            if set(np.unique(ytr_r)) == set(np.unique(y_rest)):
-                Xtr_r, Xte_r = X_rest[tr_idx], X_rest[te_idx]
-                ytr_r, yte_r = y_rest[tr_idx], y_rest[te_idx]
-                best = (Xtr_r, Xte_r, ytr_r, yte_r); break
-    if best is None:
-        raise SystemExit("[err] не удалось сформировать train с полным набором классов. Объедините редкие классы.")
+    X_rest, y_rest = X_all[idx_rest], y_all[idx_rest]
+    groups_rest = groups_all[idx_rest]
 
-    Xtr, Xte, ytr, yte = best
+    if HAS_SGKF:
+        n_splits = max(2, min(10, int(round(1.0/args.test_size)) if 0.05 <= args.test_size <= 0.5 else 5))
+        sgkf = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=args.seed)
+        tr_r, te_r = next(sgkf.split(X_rest, y_rest, groups_rest))
+    else:
+        print("[warn] StratifiedGroupKFold недоступен — GroupShuffleSplit (без строгой стратификации).")
+        gss = GroupShuffleSplit(n_splits=1, test_size=args.test_size, random_state=args.seed)
+        tr_r, te_r = next(gss.split(X_rest, y_rest, groups_rest))
 
-    # добавляем редкие полностью в train
-    if len(y_rare):
-        Xtr = np.vstack([Xtr, X_rare])
-        ytr = np.concatenate([ytr, y_rare])
+    # глобальные индексы
+    g_tr = idx_rest[tr_r]
+    g_te = idx_rest[te_r]
 
-    # финальная проверка: все классы из train присутствуют в train (очевидно) и eval_set не содержит новых
-    if not set(np.unique(yte)).issubset(set(np.unique(ytr))):
-        # выкинем из test те редкие классы, которых нет в train
-        mask_keep = np.isin(yte, np.unique(ytr))
-        Xte, yte = Xte[mask_keep], yte[mask_keep]
+    # редкие классы — только в train
+    if len(idx_rare):
+        g_tr = np.concatenate([g_tr, idx_rare])
 
-    num_class = len(np.unique(ytr))
-    print(f"[info] classes in train: {sorted(np.unique(ytr).tolist())}")
-    print(f"[info] classes in test : {sorted(np.unique(yte).tolist())}")
-    print(f"[info] num_class used  : {num_class}")
+    # проверка отсутствия пересечения групп
+    inter = set(DF.iloc[g_tr]["origin"]) & set(DF.iloc[g_te]["origin"])
+    if inter:
+        raise SystemExit(f"[err] Найдены пересечения групп между train/test: {sorted(list(inter))[:5]} ...")
+
+    # в тесте не должно быть классов, отсутствующих в train
+    if not set(np.unique(y_all[g_te])).issubset(set(np.unique(y_all[g_tr]))):
+        keep_mask = np.isin(y_all[g_te], np.unique(y_all[g_tr]))
+        g_te = g_te[keep_mask]
+
+    Xtr, Xte = X_all[g_tr], X_all[g_te]
+    ytr, yte = y_all[g_tr], y_all[g_te]
+
+    print(f"[split] train={len(ytr)}  test={len(yte)}  "
+        f"groups_train={DF.iloc[g_tr]['origin'].nunique()}  groups_test={DF.iloc[g_te]['origin'].nunique()}")
+
+    # (опц.) сохраняем списки сплита для контроля
+    cols_keep = [c for c in [fname_feat, "basename", "stem"] if c in DF.columns]
+    train_tbl = DF.iloc[g_tr][cols_keep + ["origin", "_y", "label"]].copy(); train_tbl["split"] = "train"
+    test_tbl  = DF.iloc[g_te][cols_keep + ["origin", "_y", "label"]].copy();  test_tbl["split"]  = "test"
+    pd.concat([train_tbl, test_tbl], axis=0, ignore_index=True).to_csv(os.path.join(args.out_dir, "split_all.csv"), index=False)
+    train_tbl.to_csv(os.path.join(args.out_dir, "split_train.csv"), index=False)
+    test_tbl.to_csv(os.path.join(args.out_dir, "split_test.csv"), index=False)
+
 
     # ===== 6) XGBoost
     clf = xgb.XGBClassifier(
@@ -240,12 +274,15 @@ def main():
         n_jobs=0,
     )
 
+    monitor = xgb.callback.EvaluationMonitor(period=25)  # печать каждые 25 итераций
     clf.fit(
         Xtr, ytr,
         eval_set=[(Xtr, ytr), (Xte, yte)],
         verbose=False,
-        early_stopping_rounds=100
+        early_stopping_rounds=100,
+        callbacks=[monitor]
     )
+
 
     # ===== 7) Metrics
     prob = clf.predict_proba(Xte)
