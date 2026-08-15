@@ -92,8 +92,8 @@ def compute_grid(n_imgs, rows=None, cols=None):
 def main():
     parser = argparse.ArgumentParser(description="Build collage from images.")
     parser.add_argument(
-        "--input_dir", type=str, default="outputs_run/rf",
-        help="Базовая папка: относительные имена из --images ищутся здесь (default: outputs_run/rf)"
+        "--input_dir", type=str, default="artifacts/outputs/run/rf",
+        help="Базовая папка: относительные имена из --images ищутся здесь (default: artifacts/outputs/run/rf)"
     )
     parser.add_argument(
         "--images", nargs="*", default=["cm_test.png", "roc_test.png", "pr_test.png", "f1_dev.png"],
