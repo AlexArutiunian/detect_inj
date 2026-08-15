@@ -5,7 +5,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 echo "[1/3] Compile Python files"
-python -m py_compile src/*.py legacy/python/*.py
+python -m py_compile src/*.py legacy/python/*.py multiclass/*.py
 
 echo "[2/3] Check core repository files"
 for path in \
@@ -14,10 +14,11 @@ for path in \
   src/train.py \
   src/predict.py \
   schema_joints.json \
-  shema_joints_full_body.json \
+  schema_joints_full_body.json \
   data/metadata/walk_data_meta_upd.csv \
   data/metadata/run_data_meta_upd.csv \
-  data/processed/run_npy; do
+  data/processed/run_npy \
+  multiclass; do
   if [[ ! -e "$path" ]]; then
     echo "Missing: $path" >&2
     exit 1
