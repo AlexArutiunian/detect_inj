@@ -49,6 +49,18 @@ gdown 1CDlCb95Xuy5A3ZWUkuBM2cjf1o4F99zY
 unzip walking.zip
 ```
 
+## Representative results
+
+TCN gives the strongest ROC-AUC among the stored deep-model test runs: 0.749 on running data and 0.778 on walking data.
+
+### Running — TCN
+
+![TCN running metrics](artifacts/outputs/run/kaggle/working/metrics_tcn.png)
+
+### Walking — TCN
+
+![TCN walking metrics](artifacts/outputs/walk/kaggle/working/metrics_tcn.png)
+
 ## Train
 
 ### Classical models
