@@ -24,6 +24,14 @@ pip install -r requirements.txt
 
 Run commands from the repository root.
 
+### Repository check
+
+Before training or inference, verify Python syntax and required repository assets:
+
+```bash
+bash checks/repository.sh
+```
+
 ## Dataset
 
 Running dataset:
@@ -115,11 +123,12 @@ python src/predict.py --model_dir artifacts/models/classic_walk/rf --motion_key 
 │   ├── models/          # saved trained models
 │   └── outputs/         # retained run/walk experiment outputs
 ├── ce/                  # feature-extraction artifacts kept in place for compatibility
-├── multi/               # multiclass experiment assets
+├── multiclass/          # separate multiclass experiment assets
+├── checks/              # repository integrity checks
 ├── docs/                # generated/reference documentation
 ├── legacy/              # retained old copies and non-runtime files
 ├── schema_joints.json
-├── shema_joints_full_body.json
+├── schema_joints_full_body.json
 ├── requirements.txt
 └── README.md
 ```
