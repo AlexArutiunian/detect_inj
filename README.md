@@ -58,6 +58,14 @@ The strongest stored overall results are produced by classical machine-learning 
 - **Running:** Random Forest — ROC-AUC **0.809**, accuracy **0.820**, F1 **0.884**.
 - **Walking:** XGBoost — ROC-AUC **0.816**, accuracy **0.856**, F1 **0.914**.
 
+#### Running — Random Forest
+
+![Random Forest running metrics](docs/figures/classic_run_rf.svg)
+
+#### Walking — XGBoost
+
+![XGBoost walking metrics](docs/figures/classic_walk_xgb.svg)
+
 ### Best deep-model results — TCN
 
 Among the stored deep-model test runs, TCN gives the strongest ROC-AUC on both datasets: **0.749** on running data and **0.778** on walking data.
